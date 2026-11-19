@@ -28,7 +28,12 @@ Update this line as milestones complete. Work on the current milestone only. The
 - Python 3.12 (pinned, decision 0005; the design says 3.11+), Typer, Pydantic, `kubernetes` client, `prometheus-api-client`, pytest. Managed with `uv`; open a fresh shell so `~/.local/bin/uv` and Homebrew `kubectl` come first on PATH.
 - The core project uses local kind only. No cloud and no cloud credentials unless I explicitly activate the EKS portability stretch goal, which happens only after the core project is complete.
 
-**Context guard — check before every mutating Kubernetes command.** Verify that `kubectl config current-context` is the SafeOps kind context and the target namespace is the SafeOps testbed namespace. If either is not true, stop and tell me. Never run a destructive Kubernetes command against any other context or namespace. Other contexts will exist on this machine; "we only use kind" is intent, not a guarantee.
+**Context guard — check before every mutating Kubernetes command** (decisions 0002 and 0006).
+
+- **Explicit context, from config.** Every `kubectl` and `helm` command passes `--context` (Helm: `--kube-context`) with `kube_context` taken from `config/cluster.yaml`. Never read or rely on `kubectl config current-context`. `minikube` may stay the current context, and should: a stray command in another terminal must not land on the SafeOps cluster.
+- **Runtime is the default and covers only the testbed namespace.** Fault injection, reset, snapshots, the executor, and everything else that runs per run may mutate only the `namespace` from `config/cluster.yaml` (`testbed`). Nothing cluster-scoped, and no other namespace, `chaos_namespace` included.
+- **Bootstrap is separately scoped and opt-in.** Only `cluster-up` and `cluster-down` may use it. It permits the SafeOps kind cluster itself, `testbed`, `chaos_namespace`, and exactly the cluster-scoped resources recorded in 0006 for the pinned Chaos Mesh chart. It is not cluster-admin.
+- If the context or the target is outside the phase's scope, stop and tell me. Never run a destructive Kubernetes command against any other context or namespace. Other contexts will exist on this machine; "we only use kind" is intent, not a guarantee.
 
 **Secrets.** The LLM API key comes from an environment variable. Never write a key into a file, test, commit, or log. Never print API keys, Kubernetes tokens, Authorization headers, or Secret contents to terminal output, run records, or tests. Do not read Kubernetes Secrets to debug something — SafeOps structurally has no access to them and no milestone requires it.
 

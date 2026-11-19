@@ -11,6 +11,8 @@
 safeops run --fault bad-deployment-config --seed 0 --trial 0
 ```
 
+**The design document is wrong here, and stays wrong until Revision 6.** §14 still says bare `safeops run` reaches the first stub, which contradicts the required options. The design doc is frozen until after the Fall pilot. The §14 wording gets corrected in Revision 6, with the other post-pilot corrections. This note exists so the contradiction isn't rediscovered as a new bug in the meantime.
+
 It must terminate at `EnvironmentManager.reset_environment()` with `NotImplementedStage`. It prints exactly one line to stderr, with no traceback, and exits non-zero. `tests/test_cli.py::test_milestone1_acceptance_command` and `tests/test_run_sequence.py::test_milestone1_first_stub_is_reset_environment` pin this. Both are scoped to Milestone 1 and get revisited when Milestone 3 implements reset.
 
 ## Stubs
@@ -25,6 +27,14 @@ It must terminate at `EnvironmentManager.reset_environment()` with `NotImplement
 - **Static only:** it inspects classes, never instances, and constructs no component. It initializes no Kubernetes client, contacts no LLM provider, and has no side effects. Two tests guard this:
   - one makes component construction fail and checks that the dry-run still succeeds;
   - one runs the dry-run in a fresh interpreter and checks that no cluster or provider client library (`kubernetes`, `prometheus_api_client`, `anthropic`, `openai`, `httpx`, `requests`, `urllib3`) was imported, which also catches side effects at import time.
+- **That import check is a denylist.** It only catches the libraries on its list (`_CLIENT_LIBRARIES` in `tests/test_cli.py`). The list grows whenever a client dependency is added, and adding to it is part of that dependency's decision entry every time.
+
+### Dry-run import policy (architectural constraint)
+
+`safeops run --dry-run` must not import Kubernetes or provider client libraries that are reachable through the run-sequence modules. This policy is kept as it is.
+
+- **Constraint on all later milestones, starting with Milestone 2:** no module-scope client import in anything reachable from `RUN_SEQUENCE`. That covers the stage owners' modules and everything they import. Either import the client lazily inside the implementation method, or put client code behind a module the dry-run never imports (for example, an adapter module that only the implementation method imports).
+- **The test is the constraint, not an obstacle to it.** Don't weaken, skip, narrow or remove `test_dry_run_loads_no_cluster_or_provider_client` to make a milestone pass. If a design genuinely can't meet this, raise it as a decision, the same as any other change to the measurement or safety path.
 - **No experiment arguments:** combining it with `--fault`, `--seed` or `--trial` is a usage error.
 - **Output:** it prints `RUN_SEQUENCE` (`safeops/experiment/sequence.py`). Each stage's status comes from the actual method's stub marker, so the listing reflects real implementation state. A test runs the runner with recording doubles on **all three paths**: gate-eligible and executed, gate-eligible and escalated, and not gate-eligible. On each path the call order must equal `RUN_SEQUENCE` minus the stages whose "when" label excludes them, and every call must bind to the callee's real signature. So neither the listing nor its branch labels can drift from the code.
 - **Last line:** it names the *first stub in sequence order*. It doesn't claim "a real run stops here", because a stub inside a branch is reached only on runs that take that branch.

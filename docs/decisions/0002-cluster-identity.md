@@ -1,6 +1,6 @@
 # 0002 — Cluster identity: `kind-safeops` / `testbed`
 
-**Status:** Accepted (2026-11-18)
+**Status:** Accepted (2026-11-18). Amended by 0006: the `testbed`-only rule below is the **runtime** guard. Cluster bootstrap (`cluster-up`, `cluster-down`) has its own separately scoped guard.
 **Design refs:** §4, §11.1; CLAUDE.md "Context guard"
 
 ## Decision

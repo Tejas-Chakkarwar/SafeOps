@@ -5,9 +5,11 @@
 # Changing this file changes the experimental condition (CLAUDE.md, config/).
 
 cluster_name: safeops        # kind cluster name
-kube_context: kind-safeops   # kind always prefixes contexts with "kind-"
-namespace: testbed           # SafeOps testbed namespace
+kube_context: kind-safeops   # passed explicitly as --context; current-context is never read (0006)
+namespace: testbed           # SafeOps testbed namespace; the only namespace the runtime guard allows (0006)
 
-# Fault backend pin (decision 0003, F1). make cluster-up passes this to
-# `helm install --version` starting at Milestone 2.
+# Fault backend (decisions 0003 and 0006). make cluster-up passes the version to
+# `helm install --version` and installs into chaos_namespace, starting at Milestone 2.
+# chaos_namespace is reachable only through the bootstrap guard, never at runtime.
+chaos_namespace: chaos-mesh
 chaos_mesh_version: 2.8.8
