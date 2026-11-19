@@ -200,7 +200,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "typer", specifier = ">=0.15" }]
+requires-dist = [{ name = "typer", specifier = ">=0.29.2" }]
 
 [package.metadata.requires-dev]
 dev = [

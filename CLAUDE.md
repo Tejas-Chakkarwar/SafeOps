@@ -8,8 +8,15 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 
 ## Current milestone
 
-> **Milestone 1 — repo scaffold, CLI, stubs.**
-> Done when `safeops run` executes top to bottom and fails at the first stub with a readable error.
+> **Milestone 2 — testbed + `topology.yaml` + workload generator.**
+> Done when `make cluster-up` is healthy, the steady-state success rate is measurable, and the ownership map resolves every resource.
+>
+> Also lands in Milestone 2, already decided:
+> - context guard reading `config/cluster.yaml`, tested against a wrong context and a wrong namespace (decision 0002)
+> - Chaos Mesh installed at the version pinned in `config/cluster.yaml`, with one controller-manager replica (decision 0003, F1 and F2)
+> - the `cpu_millis` and `memory_mib` ranges applied as real container requests and limits, each inside its `safe_range` (decision 0003, F4)
+
+Completed: Milestone 1 (`8cd8986`, review fixes `2f32bcb`). Acceptance command and rationale are in decision 0004.
 
 Update this line as milestones complete. Work on the current milestone only. The design document lists 17; do not run ahead. Milestone N's acceptance criterion must pass before N+1 starts.
 
@@ -18,7 +25,7 @@ Update this line as milestones complete. Work on the current milestone only. The
 ## Environment and cluster safety
 
 - macOS, Docker Desktop, local `kind` cluster.
-- Python 3.11+, Typer, Pydantic, `kubernetes` client, `prometheus-api-client`, pytest.
+- Python 3.12 (pinned, decision 0005; the design says 3.11+), Typer, Pydantic, `kubernetes` client, `prometheus-api-client`, pytest. Managed with `uv`; open a fresh shell so `~/.local/bin/uv` and Homebrew `kubectl` come first on PATH.
 - The core project uses local kind only. No cloud and no cloud credentials unless I explicitly activate the EKS portability stretch goal, which happens only after the core project is complete.
 
 **Context guard — check before every mutating Kubernetes command.** Verify that `kubectl config current-context` is the SafeOps kind context and the target namespace is the SafeOps testbed namespace. If either is not true, stop and tell me. Never run a destructive Kubernetes command against any other context or namespace. Other contexts will exist on this machine; "we only use kind" is intent, not a guarantee.

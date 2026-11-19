@@ -5,7 +5,7 @@ description = "Risk-aware remediation for AI incident-response agents in Kuberne
 requires-python = ">=3.12,<3.13"
 # Runtime dependencies are added only when a milestone first needs them (decision 0005).
 dependencies = [
-    "typer>=0.15",
+    "typer>=0.29.2",  # lowest version tested; also provides pydantic transitively
 ]
 
 [project.scripts]
