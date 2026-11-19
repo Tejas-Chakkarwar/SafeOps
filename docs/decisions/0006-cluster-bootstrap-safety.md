@@ -74,3 +74,47 @@ Rendered on 2026-11-19:
 - runtime raw calls can only reach the workload-generator proxy.
 
 **Workload proxy.** The workload-generator proxy (decision 0009) is not a Kubernetes-object mutation, so `check_object` doesn't govern it. `WorkloadProxy` has its own capability check instead (namespace, Service, operation ∈ {stats, control}).
+
+## Amendment, 2026-11-19: Milestone 2 adversarial review fixes
+
+Every fix below has a regression test in `tests/test_m2_review.py`, labelled with its finding ID. Before the fix, each test reproduced the problem.
+
+**The wrapper can no longer be pointed elsewhere (G1–G4).**
+- `Kubectl.read` refuses any caller argument that would override the explicit identity: `--context`, `--kubeconfig`, `--cluster`, `--user`, `--server` / `-s`, `--token`, `--as*`, client certificate and TLS flags. Both `--flag value` and `--flag=value` forms are refused.
+- The reason is that kubectl uses the *last* occurrence of a flag. That was confirmed live: a later `--context` silently won over ours.
+- `read` also refuses `--raw`, so raw paths only go through `Kubectl.raw` and its runtime path check.
+- `read` allows only read-only subcommands: `auth can-i` and `rollout status`. `auth reconcile` writes RBAC.
+
+**Scope comes from the kind, never from the object (G5/G6).**
+- `Kubectl.apply` classifies each object as cluster-scoped from the built-in kind list plus whatever the live API server reports (`api-resources --namespaced=false`, asked once per `Kubectl`).
+- The caller no longer supplies that list.
+- A cluster-scoped kind that carries `metadata.namespace: testbed` is treated as cluster-scoped, so runtime refuses it. Kubernetes ignores that field for such kinds, so trusting it would have let runtime write cluster-wide.
+
+**Bootstrap scope is classified against the live API (B1).**
+- `render-scope` runs offline, so it classifies with the built-in list plus the scope declared by CRDs in the same render.
+- `cluster-up` then re-classifies every rendered object against the live API's cluster-scoped and namespaced kinds, and refuses:
+  - if the result differs from the recorded scope;
+  - if a kind is unknown to the API server and not defined by a CRD in the render.
+- So a cluster-scoped kind missing from the built-in list can no longer slip through unrecorded.
+
+**Charts are pulled once and pinned by content (B3).**
+- `helm pull` downloads each chart exactly once per `cluster-up`.
+- `helm template` and `helm install` both use that same archive.
+- Its sha256 is recorded in `config/bootstrap_scope.yaml` as `chart_sha256`:
+  - chaos-mesh 2.8.8: `sha256:35f3cade…`
+  - prometheus 29.47.2: `sha256:ed5e5fc1…`
+- A republished chart under the same version now refuses.
+
+**Credential files are private from their first byte.** The harness kubeconfig is created with `O_EXCL` and mode 0600, instead of being written and then chmod'ed. The `.safeops/` directory is 0700.
+
+**The bootstrap-phase check catches every spelling (T1).** The AST check now also catches `Phase("bootstrap")`, `Phase["BOOTSTRAP"]`, and any other `Phase(...)` call outside `safeops/cluster.py` and `safeops/bootstrap.py`. A self-test proves the detector can fail.
+
+## Amendment, 2026-11-19: second review (credential routing, cluster identity)
+
+The regression tests are in the "second review" section of `tests/test_m2_review.py`.
+
+- **C1: runtime refuses the admin credential however it's passed.** `Kubectl(cfg, Phase.RUNTIME, kubeconfig=...)` raises `CredentialError` if the path is the admin kubeconfig. Before this, the rule held only when no kubeconfig was passed. An AST test also confines `kubeconfig_path`, the admin path, to `safeops/cluster.py` and `safeops/bootstrap.py`.
+- **C3: the context must really be the kind cluster.** The context name alone proves nothing, because a stale or copied kubeconfig could call anything `kind-safeops`. Before its first command, every `Kubectl`, for both phases and both credentials:
+  - resolves the API server the `kube_context` context points at;
+  - requires it to be a loopback address that Docker publishes for `<cluster_name>-control-plane` (`docker port … 6443/tcp`).
+  - Anything else refuses, and nothing runs. Tests can opt out with `verify_identity=False`, but only together with a fake runner.

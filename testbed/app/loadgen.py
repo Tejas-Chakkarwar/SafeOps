@@ -43,6 +43,7 @@ _state: dict = {
     "path": None,
     "dispatched_total": 0,
     "stop": None,
+    "generation": 0,  # bumped on every start; a stale scheduler thread can't touch a newer run
 }
 _windows: dict[str, Window] = {}
 _collecting: Window | None = None
@@ -65,7 +66,9 @@ def _perform(attempt: Attempt, url: str, deadline_s: float) -> None:
         ATTEMPTS.labels("success" if ok else "failure").inc()
 
 
-def _schedule(rate_rps: float, deadline_s: float, url: str, stop: threading.Event) -> None:
+def _schedule(
+    rate_rps: float, deadline_s: float, url: str, stop: threading.Event, generation: int
+) -> None:
     global _collecting
     start = time.monotonic()
     for seq in itertools.count():
@@ -73,10 +76,12 @@ def _schedule(rate_rps: float, deadline_s: float, url: str, stop: threading.Even
         delay = due - time.monotonic()
         if delay > 0 and stop.wait(delay):
             return
-        if stop.is_set():
-            return
         attempt = Attempt(seq=seq, due=due, dispatched=time.monotonic())
         with _lock:
+            # Checked under the lock: a thread that passed a stop check just before a
+            # stop+start must not admit into the next run's window (review M2).
+            if stop.is_set() or _state["generation"] != generation:
+                return
             _state["dispatched_total"] += 1
             if _collecting is not None:
                 _collecting.admit(attempt)
@@ -104,9 +109,12 @@ def control(body: dict, query: dict) -> Response:
             ):
                 return Response(400, {"error": "start needs rate_rps > 0, deadline_s > 0, path"})
             stop = threading.Event()
+            _state["generation"] += 1
             _state.update(running=True, rate_rps=rate, deadline_s=deadline, path=path, stop=stop)
             threading.Thread(
-                target=_schedule, args=(rate, deadline, GATEWAY_BASE_URL + path, stop), daemon=True
+                target=_schedule,
+                args=(rate, deadline, GATEWAY_BASE_URL + path, stop, _state["generation"]),
+                daemon=True,
             ).start()
             log("info", "load started", rate_rps=rate, deadline_s=deadline, path=path)
             return Response(200, {"running": True})
@@ -148,6 +156,17 @@ def stats(body: dict, query: dict) -> Response:
         return Response(200, window.summary(now))
 
 
+def _freeze_closed_windows() -> None:
+    """Freeze each window the moment it closes, not when someone happens to read it (M1)."""
+    while True:
+        time.sleep(0.1)
+        now = time.monotonic()
+        with _lock:
+            for window in _windows.values():
+                window.summary(now)  # computes and freezes once complete; no-op otherwise
+
+
+threading.Thread(target=_freeze_closed_windows, daemon=True, name="window-freezer").start()
 app.ready.set()
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@ from typing import NamedTuple
 
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
+from app.httpbody import read_body
+
 SERVICE = os.environ.get("SERVICE_NAME", "unknown")
 
 _LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40}
@@ -117,28 +119,8 @@ class App:
                 self.end_headers()
                 self.wfile.write(payload)
 
-            def _read_body(self, limit: int = 1 << 20) -> bytes:
-                """Request body, with Content-Length or chunked transfer encoding.
-
-                The API-server service proxy re-streams request bodies chunked, so the
-                harness's PUT /control arrives without a Content-Length (decision 0009).
-                """
-                if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-                    data = b""
-                    while True:
-                        size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
-                        if size == 0:
-                            while self.rfile.readline() not in (b"\r\n", b"\n", b""):
-                                pass  # discard trailers
-                            return data
-                        data += self.rfile.read(size)
-                        self.rfile.readline()  # CRLF after each chunk
-                        if len(data) > limit:
-                            raise ValueError("body too large")
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > limit:
-                    raise ValueError("body too large")
-                return self.rfile.read(length) if length else b""
+            def _read_body(self) -> bytes:
+                return read_body(self.headers, self.rfile)
 
             def _dispatch(self, method: str) -> None:
                 parsed = urllib.parse.urlsplit(self.path)

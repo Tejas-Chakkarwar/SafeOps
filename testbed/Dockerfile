@@ -12,7 +12,7 @@ WORKDIR /srv
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
 COPY requirements-base.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements-base.txt
-COPY app/__init__.py app/common.py app/
+COPY app/__init__.py app/common.py app/httpbody.py app/
 
 FROM base AS testbed
 COPY requirements-testbed.txt .

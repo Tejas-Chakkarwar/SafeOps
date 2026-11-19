@@ -13,6 +13,8 @@ Rules:
   record was written, so every attempt's outcome is fixed by then and the last requests
   are counted consistently. The settle margin only covers the gap between a response
   arriving and its outcome being recorded. It never extends the deadline.
+- Once complete, the summary is computed once and frozen. The generator freezes each
+  window as soon as it closes, whether or not anyone is reading it.
 - If the generator can't schedule all `size` attempts (it was stopped, for example),
   that is a measurement failure, never a smaller denominator.
 """
@@ -60,6 +62,7 @@ class Window:
     settle_s: float = 0.5
     attempts: list[Attempt] = field(default_factory=list)
     failure: str | None = None
+    _frozen: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.size <= 0:
@@ -94,6 +97,14 @@ class Window:
         return COMPLETE if now >= last_dispatch + self.deadline_s + self.settle_s else DRAINING
 
     def summary(self, now: float) -> dict:
+        """The window's summary. Once complete, it is computed exactly once and frozen.
+
+        Without the freeze, an outcome recorded after close (a response that arrived in
+        time but whose recording lagged past the settle margin) would change the numbers
+        between two reads of the same closed window (Milestone 2 review, M1).
+        """
+        if self._frozen is not None:
+            return dict(self._frozen)
         state = self.state(now)
         out: dict = {
             "window_id": self.window_id,
@@ -124,4 +135,5 @@ class Window:
             p95_latency_ms=None if p95 is None else round(p95 * 1000, 2),
             max_dispatch_lag_ms=round(max(a.dispatched - a.due for a in self.attempts) * 1000, 2),
         )
+        self._frozen = dict(out)
         return out

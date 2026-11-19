@@ -31,9 +31,78 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CLUSTER_CONFIG_PATH = REPO_ROOT / "config" / "cluster.yaml"
 
 # Read-only kubectl verbs that `Kubectl.read` accepts. Anything that mutates goes
-# through a dedicated, guarded method instead.
-_READ_VERBS = frozenset({"get", "wait", "auth", "api-resources", "version"})
-_READ_SUBCOMMANDS = {"rollout": frozenset({"status"})}
+# through a dedicated, guarded method instead. Verbs with subcommands are limited to the
+# listed read-only ones (`auth reconcile` writes RBAC, `rollout restart` mutates).
+_READ_VERBS = frozenset({"get", "wait", "api-resources", "version"})
+_READ_SUBCOMMANDS = {"rollout": frozenset({"status"}), "auth": frozenset({"can-i"})}
+
+# Flags that would override the explicit kubeconfig, context or identity. kubectl uses the
+# *last* occurrence of a flag, so a caller-supplied one silently wins over ours. They are
+# refused in any caller argument, in both `--flag value` and `--flag=value` form.
+# `--raw` is refused too, so raw API paths can only go through `Kubectl.raw` and its check.
+_FORBIDDEN_FLAGS = frozenset(
+    {
+        "--kubeconfig",
+        "--context",
+        "--cluster",
+        "--user",
+        "--server",
+        "-s",
+        "--token",
+        "--as",
+        "--as-group",
+        "--as-uid",
+        "--username",
+        "--password",
+        "--certificate-authority",
+        "--client-certificate",
+        "--client-key",
+        "--insecure-skip-tls-verify",
+        "--tls-server-name",
+        "--raw",
+    }
+)
+
+# Built-in cluster-scoped kinds. `Kubectl` adds whatever else the live API server reports
+# as cluster-scoped (`kubectl api-resources --namespaced=false`), so classification never
+# depends on the caller, and a cluster-scoped custom kind is not mistaken for a namespaced one.
+CLUSTER_SCOPED_KINDS = frozenset(
+    {
+        "APIService",
+        "CertificateSigningRequest",
+        "ClusterRole",
+        "ClusterRoleBinding",
+        "CSIDriver",
+        "CSINode",
+        "CustomResourceDefinition",
+        "FlowSchema",
+        "IngressClass",
+        "MutatingAdmissionPolicy",
+        "MutatingAdmissionPolicyBinding",
+        "MutatingWebhookConfiguration",
+        "Namespace",
+        "Node",
+        "PersistentVolume",
+        "PriorityClass",
+        "PriorityLevelConfiguration",
+        "RuntimeClass",
+        "StorageClass",
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding",
+        "ValidatingWebhookConfiguration",
+        "VolumeAttachment",
+    }
+)
+
+
+def _check_caller_args(args: Iterable[str]) -> None:
+    for arg in args:
+        flag = arg.split("=", 1)[0]
+        if flag in _FORBIDDEN_FLAGS:
+            raise GuardError(
+                f"argument {flag!r} would override the explicit kubeconfig, context,"
+                " identity or raw path; refusing"
+            )
 
 
 class GuardError(Exception):
@@ -205,16 +274,68 @@ class Kubectl:
         phase: Phase,
         runner: Runner = subprocess.run,
         kubeconfig: Path | None = None,
+        verify_identity: bool = True,
     ) -> None:
         self.cfg = cfg
         self.phase = phase
         self._run = runner
+        if kubeconfig is not None and phase is Phase.RUNTIME:
+            # Runtime never uses the admin credential, however it is passed in (review C1).
+            if kubeconfig.resolve() == cfg.kubeconfig_path.resolve():
+                raise CredentialError(
+                    "runtime was handed the admin kubeconfig; runtime never falls back to"
+                    " the admin kubeconfig"
+                )
         self.kubeconfig = kubeconfig if kubeconfig is not None else kubeconfig_for(cfg, phase)
+        self._cluster_scoped: frozenset[str] | None = None
+        self._identity_verified = not verify_identity
 
     def base_args(self) -> list[str]:
         return ["kubectl", "--kubeconfig", str(self.kubeconfig), "--context", self.cfg.kube_context]
 
+    def _verify_identity(self) -> None:
+        """The context must really be the SafeOps kind cluster (review C3).
+
+        The context name alone proves nothing: a stale or copied kubeconfig could call
+        anything `kind-safeops`. Before the first command, check that the context's API
+        server is the loopback port Docker publishes for this cluster's kind node.
+        """
+        if self._identity_verified:
+            return
+        import yaml
+
+        try:
+            kc = yaml.safe_load(Path(self.kubeconfig).read_text())
+            ctx = next(c["context"] for c in kc["contexts"] if c["name"] == self.cfg.kube_context)
+            server = next(
+                c["cluster"]["server"] for c in kc["clusters"] if c["name"] == ctx["cluster"]
+            )
+        except Exception as exc:
+            raise CredentialError(
+                f"{Path(self.kubeconfig).name} has no usable {self.cfg.kube_context!r} context"
+            ) from exc
+        node = f"{self.cfg.cluster_name}-control-plane"
+        proc = self._run(
+            ["docker", "port", node, "6443/tcp"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        published = {
+            f"https://{line.strip()}"
+            for line in (proc.stdout or "").splitlines()
+            if line.strip().startswith("127.0.0.1:")
+        }
+        if proc.returncode != 0 or server not in published:
+            raise GuardError(
+                f"context {self.cfg.kube_context!r} points at {server}, which is not the API"
+                f" server Docker publishes for kind node {node!r}; refusing to run anything"
+            )
+        self._identity_verified = True
+
     def _exec(self, args: list[str], stdin: str | None = None, timeout: float = 120) -> str:
+        self._verify_identity()
         proc = self._run(
             self.base_args() + args,
             input=stdin,
@@ -235,33 +356,54 @@ class Kubectl:
         return proc.stdout
 
     def read(self, *args: str, timeout: float = 120) -> str:
-        """Run a read-only kubectl command."""
+        """Run a read-only kubectl command. Caller arguments can't override the identity."""
         verb = args[0] if args else ""
         allowed_sub = _READ_SUBCOMMANDS.get(verb)
-        if verb not in _READ_VERBS and not (
-            allowed_sub and len(args) > 1 and args[1] in allowed_sub
-        ):
+        if allowed_sub is not None:
+            if len(args) < 2 or args[1] not in allowed_sub:
+                raise GuardError(f"kubectl {' '.join(args[:2])!r} is not a read-only command")
+        elif verb not in _READ_VERBS:
             raise GuardError(f"kubectl {verb!r} is not a read-only command")
+        _check_caller_args(args)
         return self._exec(list(args), timeout=timeout)
 
     def get_json(self, *args: str) -> dict:
         return json.loads(self.read("get", *args, "-o", "json"))
 
+    def cluster_scoped_kinds(self) -> frozenset[str]:
+        """Built-in cluster-scoped kinds plus every kind the live API server reports as
+        cluster-scoped. Asked once per Kubectl; the caller never supplies it."""
+        if self._cluster_scoped is None:
+            out = self._exec(["api-resources", "--namespaced=false", "--no-headers"])
+            live = {line.split()[-1] for line in out.splitlines() if line.strip()}
+            self._cluster_scoped = CLUSTER_SCOPED_KINDS | frozenset(live)
+        return self._cluster_scoped
+
     def apply(
         self,
         objects: Iterable[dict],
         cluster_scope: frozenset[tuple[str, str]] = frozenset(),
-        cluster_scoped_kinds: frozenset[str] = frozenset(),
     ) -> None:
-        """Server-side apply after checking every object against the guard."""
+        """Server-side apply after checking every object against the guard.
+
+        Scope comes from the kind, never from the object: a cluster-scoped kind is treated
+        as cluster-scoped even if it carries a metadata.namespace (Kubernetes ignores that
+        field for such kinds, so trusting it would let runtime write cluster-wide).
+        """
         import yaml
 
         objects = list(objects)
+        cluster_kinds = self.cluster_scoped_kinds()
         for obj in objects:
             kind, meta = obj["kind"], obj.get("metadata", {})
-            namespace = None if kind in cluster_scoped_kinds else meta.get("namespace")
-            if namespace is None and kind not in cluster_scoped_kinds:
-                raise GuardError(f"{kind}/{meta.get('name')} has no namespace; refusing to default")
+            if kind in cluster_kinds:
+                namespace = None
+            else:
+                namespace = meta.get("namespace")
+                if namespace is None:
+                    raise GuardError(
+                        f"{kind}/{meta.get('name')} has no namespace; refusing to default"
+                    )
             check_object(
                 self.cfg,
                 self.phase,
@@ -321,6 +463,9 @@ class WorkloadProxy:
     OPERATIONS = {"stats": ("GET", "/stats"), "control": ("PUT", "/control")}
 
     def __init__(self, cfg: ClusterConfig, kubectl: Kubectl | None = None) -> None:
+        if kubectl is not None and kubectl.phase is not Phase.RUNTIME:
+            # The evaluator path belongs to the harness identity only (review C2).
+            raise GuardError("the workload proxy only runs with the runtime (harness) credential")
         self.cfg = cfg
         self._kubectl = kubectl
 

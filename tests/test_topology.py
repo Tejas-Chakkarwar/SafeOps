@@ -113,9 +113,20 @@ def _live_testbed() -> list[dict]:
 def test_ownership_resolves_complete_testbed() -> None:
     items = _live_testbed() + [
         _obj("ConfigMap", "kube-root-ca.crt"),  # created by Kubernetes in every namespace
-        _obj("ConfigMap", "something-controller-made", ownerReferences=[{"kind": "X"}]),
     ]
     assert ownership_report(TOPO, items) == []
+
+
+def test_owner_referenced_objects_cannot_hide() -> None:
+    """Milestone 2 review, B2: an owner reference must not exempt a projected-kind object."""
+    items = _live_testbed() + [
+        _obj("Service", "rogue-svc", ownerReferences=[{"kind": "Deployment", "name": "x"}]),
+        _obj("Deployment", "rogue-dep", ownerReferences=[{"kind": "Whatever", "name": "y"}]),
+    ]
+    assert ownership_report(TOPO, items) == [
+        "Service/rogue-svc is in the cluster but has no topology entry",
+        "Deployment/rogue-dep is in the cluster but has no topology entry",
+    ]
 
 
 def test_ownership_flags_unmapped_object() -> None:

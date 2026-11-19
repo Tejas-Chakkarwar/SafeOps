@@ -76,3 +76,11 @@ Each service holds `CACHE_MB` (64, set in the pod template) of touched, resident
 ## Layout
 
 `testbed/` holds the app source, Dockerfile and pinned requirements. `manifests/{system,testbed,workload,helm}` hold the Kubernetes YAML and Helm values, with `${UPPER_CASE}` placeholders filled strictly from `config/cluster.yaml`; an unknown placeholder is an error. `kind/cluster.yaml` is a single control-plane node.
+
+## Amendment, 2026-11-19: every running image is recorded by digest (second review, P1)
+
+- **The gap:** the Chaos Mesh and Prometheus charts reference their images by tag (for example `ghcr.io/chaos-mesh/chaos-mesh:v2.8.8`, `quay.io/prometheus/prometheus:v3.16.0`). The charts themselves are pinned by sha256 (0006), but a re-pushed image tag would silently change the fault backend or the agent's telemetry.
+- **The fix:** `cluster-up` now writes `.safeops/images.json` as:
+  - `{"built": …}`: the SafeOps images, with all three digests;
+  - `{"running": {image: [imageID…]}}`: every container and init container in every SafeOps namespace, as the pods report it.
+- **For Milestone 5:** run-record provenance takes third-party image digests from `running`. Pinning chart images by digest is possible through chart values; it's deferred unless a digest is ever seen to drift between rebuilds.

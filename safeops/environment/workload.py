@@ -28,6 +28,12 @@ class SteadyStateMeasurementFailed(SteadyStateError):
     """The window couldn't be measured: not all attempts scheduled, generator lost, timed out."""
 
 
+class WorkloadGeneratorBusy(SteadyStateMeasurementFailed):
+    """The generator is already running: another run is using it, or a previous run died
+    without stopping it. Never stopped automatically, since that could clobber a
+    concurrent run. `safeops workload-stop` clears it (decision 0009)."""
+
+
 class SteadyStateNotReached(SteadyStateError):
     """The window was measured, but too few of its scheduled attempts succeeded."""
 
@@ -104,6 +110,28 @@ def check_steady_state(steady_state: SteadyState) -> None:
         )
 
 
+def _inconsistency(summary: dict, s: WorkloadSettings) -> str | None:
+    """Why a 'complete' window summary can't be right, or None if it's consistent."""
+
+    def is_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    size, scheduled = summary.get("size"), summary.get("scheduled")
+    succeeded, failed = summary.get("succeeded"), summary.get("failed")
+    if size != s.window_attempts:
+        return f"window size {size!r}, configured {s.window_attempts}"
+    if scheduled != size:
+        return f"scheduled {scheduled!r} of {size}"
+    if not (is_int(succeeded) and is_int(failed)):
+        return "succeeded/failed missing or not integers"
+    if not 0 <= succeeded <= size or succeeded + failed != size:
+        return f"succeeded {succeeded} + failed {failed} != size {size}"
+    if summary.get("deadline_s") != s.attempt_deadline_s:
+        got = summary.get("deadline_s")
+        return f"measured with deadline {got!r}s, configured {s.attempt_deadline_s}s"
+    return None
+
+
 class WorkloadGenerator:
     """Harness control of the in-cluster workload generator. Construction has no side effects."""
 
@@ -135,71 +163,98 @@ class WorkloadGenerator:
 
     def start_workload(self) -> None:
         """Start open-loop load against gateway."""
+        from safeops.cluster import CommandError
+
         s = self.settings
-        self._proxy().control(
-            {
-                "action": "start",
-                "rate_rps": s.rate_rps,
-                "deadline_s": s.attempt_deadline_s,
-                "path": s.target_path,
-            }
-        )
+        try:
+            self._proxy().control(
+                {
+                    "action": "start",
+                    "rate_rps": s.rate_rps,
+                    "deadline_s": s.attempt_deadline_s,
+                    "path": s.target_path,
+                }
+            )
+        except CommandError as exc:
+            if "Conflict" in str(exc) or "already running" in str(exc):
+                raise WorkloadGeneratorBusy(
+                    "workload generator is already running (another run, or a previous run"
+                    " that died); run `safeops workload-stop` if no other run is active"
+                ) from exc
+            raise
         self._started_at = self._clock()
+
+    def _failed(self, window_id, scheduled, reason: str) -> SteadyState:
+        s = self.settings
+        return SteadyState(
+            window_id,
+            "failed",
+            s.window_attempts,
+            scheduled,
+            None,
+            s.min_successes,
+            None,
+            None,
+            reason,
+        )
 
     def verify_steady_state(self) -> SteadyState:
         """Measure one fixed-denominator window after the warmup. Doesn't judge it.
 
         The runner's _require_steady_state hook and the CLI apply check_steady_state().
+        The generator's summary isn't trusted: every count is cross-checked, and a summary
+        that can't be right becomes a measurement failure, never a baseline (review W1-W4).
+        Losing the generator or its window mid-measurement is also a measurement failure (W6).
         """
+        from safeops.cluster import CommandError
+
         s = self.settings
         if self._started_at is None:
             raise SteadyStateMeasurementFailed("verify_steady_state called before start_workload")
         remaining = self._started_at + s.warmup_s - self._clock()
         if remaining > 0:
             self._sleep(remaining)
-        window_id = self._proxy().control({"action": "measure", "attempts": s.window_attempts})[
-            "window_id"
-        ]
-        deadline = self._clock() + s.window_poll_timeout_s
-        while True:
-            summary = self._proxy().stats(window_id)
-            if summary.get("state") in ("complete", "failed"):
-                break
-            if self._clock() > deadline:
-                return SteadyState(
-                    window_id,
-                    "timeout",
-                    s.window_attempts,
-                    int(summary.get("scheduled", 0)),
-                    None,
-                    s.min_successes,
-                    None,
-                    None,
-                    f"window not closed after {s.window_poll_timeout_s}s",
-                )
-            self._sleep(s.window_poll_interval_s)
-        if int(summary.get("size", -1)) != s.window_attempts:
-            return SteadyState(
-                window_id,
-                "failed",
-                s.window_attempts,
-                int(summary.get("scheduled", 0)),
-                None,
-                s.min_successes,
-                None,
-                None,
-                "generator reported a different window size",
-            )
+        try:
+            window_id = self._proxy().control({"action": "measure", "attempts": s.window_attempts})[
+                "window_id"
+            ]
+            deadline = self._clock() + s.window_poll_timeout_s
+            while True:
+                summary = self._proxy().stats(window_id)
+                if summary.get("state") in ("complete", "failed"):
+                    break
+                if self._clock() > deadline:
+                    return SteadyState(
+                        window_id,
+                        "timeout",
+                        s.window_attempts,
+                        int(summary.get("scheduled", 0)),
+                        None,
+                        s.min_successes,
+                        None,
+                        None,
+                        f"window not closed after {s.window_poll_timeout_s}s",
+                    )
+                self._sleep(s.window_poll_interval_s)
+        except CommandError as exc:
+            return self._failed(None, 0, f"generator or window lost during measurement: {exc}")
+
+        scheduled = summary.get("scheduled")
+        if summary.get("state") == "failed":
+            return self._failed(window_id, int(scheduled or 0), summary.get("failure") or "failed")
+        problem = _inconsistency(summary, s)
+        if problem is not None:
+            return self._failed(window_id, int(scheduled or 0), f"inconsistent summary: {problem}")
         return SteadyState(
             window_id=window_id,
-            state=summary["state"],
+            state="complete",
             size=s.window_attempts,
-            scheduled=int(summary.get("scheduled", 0)),
-            succeeded=summary.get("succeeded"),
+            scheduled=scheduled,
+            succeeded=summary["succeeded"],
             min_successes=s.min_successes,
             success_rate=summary.get("success_rate"),
             p95_latency_ms=summary.get("p95_latency_ms"),
-            failure=summary.get("failure"),
+            failure=None,
         )
 
     def stop_workload(self) -> None:

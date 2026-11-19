@@ -175,6 +175,8 @@ def test_generator_drives_start_measure_stop_and_waits_for_warmup() -> None:
         "size": 300,
         "scheduled": 300,
         "succeeded": 299,
+        "failed": 1,
+        "deadline_s": 1.0,
         "success_rate": 299 / 300,
         "p95_latency_ms": 12.0,
     }

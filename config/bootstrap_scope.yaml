@@ -6,6 +6,7 @@ charts:
   chaos-mesh:
     chart: chaos-mesh
     version: 2.8.8
+    chart_sha256: sha256:35f3caded3d33428d0864eb6d6ece97a5d859a1c0a6e49020fb4d07dd3676bdf
     namespace: chaos-mesh
     cluster_scoped:
     - kind: ClusterRole
@@ -87,6 +88,7 @@ charts:
   prometheus:
     chart: prometheus
     version: 29.47.2
+    chart_sha256: sha256:ed5e5fc1f051637f6dad1306c30feba2a1cba3644ccdd1df5c0af0e42662ea1a
     namespace: safeops-monitoring
     cluster_scoped:
     - kind: ClusterRole

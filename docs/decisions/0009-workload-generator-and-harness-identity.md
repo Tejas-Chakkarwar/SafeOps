@@ -80,3 +80,39 @@ Prometheus may show workload metrics to the agent (`loadgen_attempts_total`, `lo
 ## CLI
 
 `safeops steady-state` (also `make steady-state`) starts the load, measures one window, stops the load (always, in `finally`), and prints the summary. Exit codes: 0 means the baseline passed; 4 means no valid baseline; 5 means a guard refusal, a missing or expired credential, or a failed cluster command.
+
+## Amendment, 2026-11-19: Milestone 2 adversarial review fixes
+
+**The harness doesn't trust the generator's summary (W1–W4).**
+- A `complete` window counts as measured only if all of these hold:
+  - `size` equals `window_attempts`;
+  - `scheduled` equals `size`;
+  - `succeeded` and `failed` are integers (not bools);
+  - `0 ≤ succeeded ≤ size`;
+  - `succeeded + failed = size`;
+  - the window's `deadline_s` equals `attempt_deadline_s`.
+- Anything else is a **measurement failure** ("inconsistent summary"), never a baseline.
+- Before the fix, the harness accepted 301 successes out of 300, counts that didn't add up, and a window measured with a 5-second deadline.
+
+**A lost generator or window is a measurement failure (W6).** A generator restart mid-window, or any other `CommandError` while measuring, now gives `SteadyStateMeasurementFailed`, not a generic command error. It's still a discardable pre-run failure, but now in the right bucket for discard reporting.
+
+**A busy generator fails loudly and is never stopped automatically (W5).**
+- `start` answering 409 raises `WorkloadGeneratorBusy`, a subclass of `SteadyStateMeasurementFailed`, telling you to run `safeops workload-stop`.
+- Auto-stopping could clobber a concurrent run that shares the generator.
+- `safeops workload-stop` is the manual recovery after a run that died without stopping it.
+
+**The body parser is testable.** Chunked and `Content-Length` request-body parsing moved into the stdlib-only `testbed/app/httpbody.py`, which is copied into both images through the base stage. `tests/test_m2_review.py` now tests it offline: chunk extensions, trailers, truncation, missing CRLF, the size cap, and bad lengths.
+
+## Amendment, 2026-11-19: second review
+
+- **C2: the evaluator path is harness-only in code, not just by default.** `WorkloadProxy` refuses any `Kubectl` that isn't runtime-phase, so it can't run with the admin credential.
+- **M1: a closed window is frozen.** `Window.summary` computes a complete window exactly once and returns that frozen result forever after. The generator also freezes every window the moment it closes, in a 100 ms ticker, so the number doesn't depend on when the harness reads it. Before this, a response that arrived in time but was recorded after close changed a closed window's count between two reads, from 2 to 3 in the probe.
+- **M2: runs can't bleed into each other.** Every `start` bumps a run counter. A scheduler thread admits an attempt only if, under the lock, its stop flag is still clear and its counter is still current. So a stale thread from the previous run can't put one attempt into the next run's window.
+- **M3: the system under test can't reach its evaluator.**
+  - NetworkPolicy `workload-generator-ingress` (in `safeops-workload`) admits ingress to the generator only from `safeops-monitoring`, for the Prometheus scrape, on port 8080.
+  - The harness's path is unaffected. It goes through the API-server proxy, the API server runs on the node, and kindnet admits node-originated traffic.
+  - Verified live on 2026-11-19:
+    - with the policy, a `testbed` pod's connection was blocked;
+    - the harness proxy kept working, with and without a node-IP rule, so no node-IP rule is needed;
+    - the Prometheus target stayed up.
+  - `tests/cluster/test_live.py::test_testbed_pods_cannot_reach_the_evaluator` keeps checking this, so a CNI that behaves differently fails loudly.

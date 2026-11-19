@@ -68,6 +68,13 @@ scrapeConfigs:
         target_label: __address__
       - source_labels: [__meta_kubernetes_pod_name]
         target_label: pod
+    # Keep only the generator's workload metrics. Its own HTTP server metrics count the
+    # harness's /stats polls and /control calls, which would show the agent when the
+    # evaluator is measuring (Milestone 2 review, L6; decision 0010).
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        action: keep
+        regex: loadgen_.*
 
   safeops-cadvisor:                       # container CPU/memory and memory-pressure signals, testbed only
     enabled: true

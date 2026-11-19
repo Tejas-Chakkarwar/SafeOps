@@ -70,6 +70,7 @@ make test            # offline pytest; never touches a cluster
 make cluster-test    # live RBAC and harness-path tests; needs make cluster-up
 make lint
 safeops steady-state # start load, measure one 300-attempt window, stop (decision 0009)
+safeops workload-stop # stop a generator a dead run left running; never while a run is active
 safeops run --fault <id> --seed <n> --trial <i>
 safeops replay       # offline gate replay over cohort G
 safeops analyze      # metrics, funnel, curves

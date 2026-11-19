@@ -47,6 +47,8 @@ It must terminate at `EnvironmentManager.reset_environment()` with `NotImplement
 | 0 | success (including `--dry-run`) |
 | 2 | usage error (Typer/Click convention): missing or invalid options |
 | 3 | `NotImplementedStage`: the command reached a stub |
+| 4 | no valid steady-state baseline (`safeops steady-state`; decision 0009) |
+| 5 | guard refusal, missing or expired credential, or failed cluster command (decision 0009) |
 
 A separate code for "reached a stub" lets scripts tell "not built yet" apart from "called wrongly".
 

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from safeops import manifests
 from safeops.cluster import (
+    CLUSTER_SCOPED_KINDS,
     REPO_ROOT,
     ClusterConfig,
     CommandError,
@@ -36,37 +37,6 @@ from safeops.topology import load_topology, ownership_report
 SCOPE_PATH = REPO_ROOT / "config" / "bootstrap_scope.yaml"
 KIND_CONFIG = REPO_ROOT / "kind" / "cluster.yaml"
 HELM_VALUES = REPO_ROOT / "manifests" / "helm"
-
-# Built-in cluster-scoped kinds, for classifying rendered manifests offline. Bootstrap
-# cross-checks this against the live API (`kubectl api-resources --namespaced=false`)
-# before installing anything, so a kind missing from this list is caught, not guessed.
-CLUSTER_SCOPED_KINDS = frozenset(
-    {
-        "APIService",
-        "CertificateSigningRequest",
-        "ClusterRole",
-        "ClusterRoleBinding",
-        "CSIDriver",
-        "CSINode",
-        "CustomResourceDefinition",
-        "FlowSchema",
-        "IngressClass",
-        "MutatingAdmissionPolicy",
-        "MutatingAdmissionPolicyBinding",
-        "MutatingWebhookConfiguration",
-        "Namespace",
-        "Node",
-        "PersistentVolume",
-        "PriorityClass",
-        "PriorityLevelConfiguration",
-        "RuntimeClass",
-        "StorageClass",
-        "ValidatingAdmissionPolicy",
-        "ValidatingAdmissionPolicyBinding",
-        "ValidatingWebhookConfiguration",
-        "VolumeAttachment",
-    }
-)
 
 # Images are irrelevant to scope rendering; any valid reference will do.
 _UNBUILT = {"testbed": "safeops-testbed:unbuilt", "loadgen": "safeops-loadgen:unbuilt"}
@@ -126,18 +96,51 @@ def _render_values(cfg: ClusterConfig, release: str, spec: dict) -> Path:
     return out
 
 
-def _helm_template(cfg: ClusterConfig, release: str, spec: dict) -> list[dict]:
+def pull_charts(cfg: ClusterConfig) -> dict[str, Path]:
+    """Download each pinned chart exactly once. Template and install both use this file,
+    so what is checked is byte-for-byte what is installed (its sha256 is recorded)."""
+    _private_state_dir(cfg)
+    out_dir = cfg.kubeconfig_path.parent / "charts"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    pulled = {}
+    for release, spec in _charts(cfg).items():
+        dest = out_dir / release
+        dest.mkdir()
+        _tool(
+            [
+                "helm",
+                "pull",
+                spec["chart"],
+                "--repo",
+                spec["repo"],
+                "--version",
+                spec["version"],
+                "-d",
+                str(dest),
+            ]
+        )
+        archives = list(dest.glob("*.tgz"))
+        if len(archives) != 1:
+            raise CommandError(f"helm pull {spec['chart']} produced {len(archives)} archives")
+        pulled[release] = archives[0]
+    return pulled
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _helm_template(cfg: ClusterConfig, release: str, spec: dict, chart: Path) -> list[dict]:
     import yaml
 
     args = [
         "helm",
         "template",
         release,
-        spec["chart"],
-        "--repo",
-        spec["repo"],
-        "--version",
-        spec["version"],
+        str(chart),
         "--namespace",
         spec["namespace"],
         "-f",
@@ -148,17 +151,42 @@ def _helm_template(cfg: ClusterConfig, release: str, spec: dict) -> list[dict]:
     return [d for d in yaml.safe_load_all(_tool(args)) if d]
 
 
-def _cluster_scoped(objects: list[dict], release_namespace: str | None) -> list[dict]:
-    """Cluster-scoped (kind, name) pairs. Refuses namespaced objects outside the release ns."""
+def _cluster_scoped(
+    objects: list[dict],
+    release_namespace: str | None,
+    cluster_kinds: frozenset[str] = CLUSTER_SCOPED_KINDS,
+    namespaced_kinds: frozenset[str] | None = None,
+) -> list[dict]:
+    """Cluster-scoped (kind, name) pairs among rendered objects.
+
+    Classification: built-in or live cluster-scoped kinds, plus kinds whose CRD in the
+    same render says scope: Cluster. With `namespaced_kinds` (live, at cluster-up), a
+    kind that is neither known namespaced, known cluster-scoped, nor defined by a CRD in
+    the render is refused instead of guessed. Offline (render-scope) there is no live API
+    to ask, so cluster-up re-classifies against the live API and refuses on any difference.
+    Namespaced objects must target their release namespace.
+    """
+    crd_scope = {
+        o["spec"]["names"]["kind"]: o["spec"].get("scope")
+        for o in objects
+        if o.get("kind") == "CustomResourceDefinition"
+    }
     found = set()
     for obj in objects:
         kind, meta = obj["kind"], obj.get("metadata", {})
-        if kind in CLUSTER_SCOPED_KINDS:
+        if kind in cluster_kinds or crd_scope.get(kind) == "Cluster":
             found.add((kind, meta["name"]))
-        elif release_namespace is not None and meta.get("namespace") not in (
-            None,
-            release_namespace,
+            continue
+        if (
+            namespaced_kinds is not None
+            and kind not in namespaced_kinds
+            and crd_scope.get(kind) != "Namespaced"
         ):
+            raise GuardError(
+                f"{kind}/{meta['name']}: kind unknown to the API server;"
+                " refusing to guess its scope"
+            )
+        if release_namespace is not None and meta.get("namespace") not in (None, release_namespace):
             raise GuardError(
                 f"{kind}/{meta['name']} targets namespace {meta.get('namespace')!r},"
                 f" outside its release namespace {release_namespace!r}"
@@ -176,20 +204,28 @@ def _safeops_objects(cfg: ClusterConfig, images: dict[str, str]) -> dict[str, li
     }
 
 
-def compute_scope(cfg: ClusterConfig) -> dict:
-    charts = {}
+def compute_scope(
+    cfg: ClusterConfig,
+    charts: dict[str, Path],
+    cluster_kinds: frozenset[str] = CLUSTER_SCOPED_KINDS,
+    namespaced_kinds: frozenset[str] | None = None,
+) -> dict:
+    out = {}
     for release, spec in _charts(cfg).items():
-        charts[release] = {
+        objects = _helm_template(cfg, release, spec, charts[release])
+        out[release] = {
             "chart": spec["chart"],
             "version": spec["version"],
+            "chart_sha256": _sha256(charts[release]),
             "namespace": spec["namespace"],
             "cluster_scoped": _cluster_scoped(
-                _helm_template(cfg, release, spec), spec["namespace"]
+                objects, spec["namespace"], cluster_kinds, namespaced_kinds
             ),
         }
     ours = _safeops_objects(cfg, _UNBUILT)
-    safeops = {"cluster_scoped": _cluster_scoped([o for g in ours.values() for o in g], None)}
-    return {"charts": charts, "safeops_manifests": safeops}
+    flat = [o for g in ours.values() for o in g]
+    safeops = {"cluster_scoped": _cluster_scoped(flat, None, cluster_kinds, namespaced_kinds)}
+    return {"charts": out, "safeops_manifests": safeops}
 
 
 def _scope_header() -> str:
@@ -205,21 +241,32 @@ def render_scope() -> None:
     import yaml
 
     cfg = load_cluster_config()
-    SCOPE_PATH.write_text(_scope_header() + yaml.safe_dump(compute_scope(cfg), sort_keys=False))
+    scope = compute_scope(cfg, pull_charts(cfg))
+    SCOPE_PATH.write_text(_scope_header() + yaml.safe_dump(scope, sort_keys=False))
     print(f"wrote {SCOPE_PATH.relative_to(REPO_ROOT)}")
 
 
-def verified_scope(cfg: ClusterConfig) -> frozenset[tuple[str, str]]:
+def verified_scope(
+    cfg: ClusterConfig,
+    charts: dict[str, Path],
+    cluster_kinds: frozenset[str] = CLUSTER_SCOPED_KINDS,
+    namespaced_kinds: frozenset[str] | None = None,
+) -> frozenset[tuple[str, str]]:
+    """Re-render and compare with the recorded scope, chart sha256 included.
+
+    Any difference refuses.
+    """
     import yaml
 
     if not SCOPE_PATH.is_file():
         raise GuardError("config/bootstrap_scope.yaml missing; run `make bootstrap-scope`")
     recorded = yaml.safe_load(SCOPE_PATH.read_text())
-    current = compute_scope(cfg)
+    current = compute_scope(cfg, charts, cluster_kinds, namespaced_kinds)
     if recorded != current:
         raise GuardError(
-            "rendered bootstrap scope differs from config/bootstrap_scope.yaml;"
-            " re-run `make bootstrap-scope`, review the diff, and amend 0006"
+            "rendered bootstrap scope (or a chart's sha256) differs from"
+            " config/bootstrap_scope.yaml; re-run `make bootstrap-scope`, review the diff,"
+            " and amend 0006"
         )
     pairs = {
         (o["kind"], o["name"]) for c in current["charts"].values() for o in c["cluster_scoped"]
@@ -300,6 +347,20 @@ def _archive_digests(archive: Path) -> dict[str, str]:
 # --- harness credential --------------------------------------------------------------
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Create or replace a file that is 0600 from its first byte, never briefly world-readable."""
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+
+
+def _private_state_dir(cfg: ClusterConfig) -> None:
+    state = cfg.kubeconfig_path.parent
+    state.mkdir(parents=True, exist_ok=True)
+    os.chmod(state, 0o700)
+
+
 def issue_harness_credential(cfg: ClusterConfig, k: Kubectl) -> dict:
     """Time-limited TokenRequest token for experiment-controller (decision 0009)."""
     import yaml
@@ -326,9 +387,7 @@ def issue_harness_credential(cfg: ClusterConfig, k: Kubectl) -> dict:
             }
         ],
     }
-    path = cfg.harness_kubeconfig_path
-    path.write_text(yaml.safe_dump(kubeconfig))
-    os.chmod(path, 0o600)
+    _write_private(cfg.harness_kubeconfig_path, yaml.safe_dump(kubeconfig))
     meta = {
         "service_account": f"{cfg.system_namespace}/experiment-controller",
         "kind": "time-limited TokenRequest ServiceAccount token (no boundObjectRef)",
@@ -446,6 +505,19 @@ def pod_image_digests(cfg: ClusterConfig, k: Kubectl) -> dict[str, set[str]]:
     return seen
 
 
+def pod_image_digests_all(cfg: ClusterConfig, k: Kubectl) -> dict[str, list[str]]:
+    """image reference -> sorted imageIDs, across every SafeOps namespace."""
+    seen: dict[str, set[str]] = {}
+    for ns in cfg.bootstrap_namespaces:
+        for pod in k.get_json("pods", "-n", ns)["items"]:
+            statuses = pod.get("status", {})
+            for cs in statuses.get("containerStatuses", []) + statuses.get(
+                "initContainerStatuses", []
+            ):
+                seen.setdefault(cs["image"], set()).add(cs.get("imageID", ""))
+    return {image: sorted(ids) for image, ids in sorted(seen.items())}
+
+
 def memory_report(cfg: ClusterConfig) -> str:
     node = f"{cfg.cluster_name}-control-plane"
     out = _tool(
@@ -471,15 +543,16 @@ def _preflight(cfg: ClusterConfig) -> None:
 def up() -> None:
     cfg = load_cluster_config()
     _preflight(cfg)
-    _say("rendering pinned charts and checking the recorded bootstrap scope")
-    scope = verified_scope(cfg)
+    _say("pulling pinned charts once and checking the recorded bootstrap scope")
+    charts = pull_charts(cfg)
+    verified_scope(cfg, charts)  # offline classification, before anything is created
 
     _say("building images (reproducible)")
     images = build_images(cfg)
     refs = {name: info["ref"] for name, info in images.items()}
 
     _say(f"creating kind cluster {cfg.cluster_name} ({cfg.kind_node_image.split('@')[0]})")
-    cfg.kubeconfig_path.parent.mkdir(parents=True, exist_ok=True)
+    _private_state_dir(cfg)
     _tool(
         [
             "kind",
@@ -500,12 +573,17 @@ def up() -> None:
     os.chmod(cfg.kubeconfig_path, 0o600)
     k = Kubectl(cfg, Phase.BOOTSTRAP)
 
-    live = {
-        line.split()[-1]
-        for line in k.read("api-resources", "--namespaced=false", "--no-headers").splitlines()
-        if line.strip()
-    }
-    unknown = {kind for kind, _ in scope} - live
+    def _kinds(namespaced: bool) -> frozenset[str]:
+        out = k.read(
+            "api-resources", f"--namespaced={'true' if namespaced else 'false'}", "--no-headers"
+        )
+        return frozenset(line.split()[-1] for line in out.splitlines() if line.strip())
+
+    live_cluster, live_namespaced = _kinds(False), _kinds(True)
+    # Re-classify every rendered object against the live API: a cluster-scoped kind the
+    # built-in list doesn't know would change the scope here, and the comparison refuses.
+    scope = verified_scope(cfg, charts, CLUSTER_SCOPED_KINDS | live_cluster, live_namespaced)
+    unknown = {kind for kind, _ in scope} - live_cluster
     if unknown:
         raise GuardError(
             f"recorded cluster-scoped kinds unknown to the API server: {sorted(unknown)}"
@@ -520,7 +598,7 @@ def up() -> None:
     namespaces = [o for o in ours["system"] if o["kind"] == "Namespace"]
     identity = [o for o in ours["system"] if o["kind"] != "Namespace"]
     for batch in (namespaces, identity):  # namespaces must exist before what lives in them
-        k.apply(batch, cluster_scope=scope, cluster_scoped_kinds=CLUSTER_SCOPED_KINDS)
+        k.apply(batch, cluster_scope=scope)
 
     for release, spec in _charts(cfg).items():
         _say(f"installing {release} {spec['version']} into {spec['namespace']}")
@@ -528,11 +606,7 @@ def up() -> None:
             "helm",
             "install",
             release,
-            spec["chart"],
-            "--repo",
-            spec["repo"],
-            "--version",
-            spec["version"],
+            str(charts[release]),  # the exact archive whose sha256 was just verified
             "--namespace",
             spec["namespace"],
             "--kubeconfig",
@@ -596,7 +670,11 @@ def up() -> None:
                 f"running pods for {info['ref']} report {sorted(ids)}, not the built"
                 f" index digest {info['index_digest']}"
             )
-    (cfg.kubeconfig_path.parent / "images.json").write_text(json.dumps(images, indent=2))
+    # Every running image, third-party included, by the digest pods report (review P1).
+    # Chart images are referenced by tag, so this is what records what actually ran.
+    running_images = pod_image_digests_all(cfg, k)
+    record = {"built": images, "running": running_images}
+    (cfg.kubeconfig_path.parent / "images.json").write_text(json.dumps(record, indent=2))
 
     _say("healthy")
     print(
@@ -611,6 +689,9 @@ def up() -> None:
     print(f"  rbac:        proxy to {cfg.workload_service} allowed; everything else denied")
     running = state.get("running")
     print(f"  workload:    generator reachable via the harness path (running={running})")
+    print(
+        f"  running:     {len(running_images)} images recorded with digests in .safeops/images.json"
+    )
     print(f"  node memory: {memory_report(cfg)}")
 
 
@@ -632,7 +713,8 @@ def down() -> None:
         cfg.kubeconfig_path.parent / "images.json",
     ):
         path.unlink(missing_ok=True)
-    shutil.rmtree(cfg.kubeconfig_path.parent / "images", ignore_errors=True)
+    for sub in ("images", "charts", "render"):
+        shutil.rmtree(cfg.kubeconfig_path.parent / sub, ignore_errors=True)
 
 
 def main(argv: list[str]) -> int:

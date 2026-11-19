@@ -27,6 +27,7 @@ IMAGE_INPUTS = {
         "requirements-testbed.txt",
         "app/__init__.py",
         "app/common.py",
+        "app/httpbody.py",
         "app/service.py",
     ),
     "loadgen": (
@@ -35,6 +36,7 @@ IMAGE_INPUTS = {
         "requirements-base.txt",
         "app/__init__.py",
         "app/common.py",
+        "app/httpbody.py",
         "app/window.py",
         "app/loadgen.py",
     ),

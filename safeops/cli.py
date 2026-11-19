@@ -122,6 +122,22 @@ def steady_state() -> None:
     typer.echo("  baseline: PASS")
 
 
+@app.command("workload-stop")
+def workload_stop() -> None:
+    """Stop the workload generator, e.g. after a run died without stopping it.
+
+    Never run this while another run is using the generator (decision 0009).
+    """
+    from safeops.cluster import CommandError, CredentialError, GuardError
+    from safeops.environment.workload import WorkloadGenerator
+
+    try:
+        WorkloadGenerator().stop_workload()
+    except (CredentialError, GuardError, CommandError) as exc:
+        _fail("workload-stop", str(exc), EXIT_CLUSTER)
+    typer.echo("safeops workload-stop: generator stopped")
+
+
 @app.command()
 def replay() -> None:
     """Offline gate replay over cohort G."""

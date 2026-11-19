@@ -168,9 +168,12 @@ _AUTO_CREATED = frozenset({("ConfigMap", "kube-root-ca.crt")})
 def ownership_report(topology: ServiceTopology, items: list[dict]) -> list[str]:
     """Problems resolving live testbed objects against the ownership map, in both directions.
 
-    `items` are live objects of PROJECTED_KINDS from the testbed namespace. Objects that
-    Kubernetes or a controller created on its own (ownerReferences set, or kube-root-ca.crt)
-    are skipped, because the snapshot ignores controller-created objects (§11.1).
+    `items` are live objects of PROJECTED_KINDS from the testbed namespace. Only objects
+    Kubernetes creates in every namespace on its own (kube-root-ca.crt) are skipped. An
+    object with ownerReferences is *not* skipped: §11.1 ignores controller-created
+    ReplicaSets and Pods, which aren't projected kinds anyway, and a projected-kind object
+    carrying an owner reference is still an application resource that must be accounted
+    for. Skipping it would let a rogue Service or Deployment hide (Milestone 2 review, B2).
     An empty list means every object resolves to an entry and every entry exists.
     """
     problems: list[str] = []
@@ -180,7 +183,7 @@ def ownership_report(topology: ServiceTopology, items: list[dict]) -> list[str]:
         name = meta["name"]
         if kind not in PROJECTED_KINDS:
             continue
-        if (kind, name) in _AUTO_CREATED or meta.get("ownerReferences"):
+        if (kind, name) in _AUTO_CREATED:
             continue
         seen.add((kind, name))
         if topology.resource(kind, name) is None:

@@ -149,3 +149,39 @@ def test_ownership_map_resolves_the_live_testbed() -> None:
     from safeops.bootstrap import ownership_check
 
     ownership_check(CFG, Kubectl(CFG, Phase.BOOTSTRAP))
+
+
+def test_testbed_pods_cannot_reach_the_evaluator() -> None:
+    """Milestone 2 review, M3: the system under test can't talk to its own evaluator, while
+    the harness proxy (above) and the Prometheus scrape (cluster-up) still work."""
+    probe = (
+        "import urllib.request\n"
+        "try:\n"
+        f"    urllib.request.urlopen('http://{CFG.workload_service}.{CFG.workload_namespace}.svc:"
+        f"{CFG.workload_service_port}/stats', timeout=3)\n"
+        "    print('REACHED')\n"
+        "except Exception as e:\n"
+        "    print('BLOCKED', type(e).__name__)\n"
+    )
+    proc = subprocess.run(
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(CFG.kubeconfig_path),
+            "--context",
+            CFG.kube_context,
+            "exec",
+            "-n",
+            CFG.namespace,
+            "deploy/payment",
+            "--",
+            "python",
+            "-c",
+            probe,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert "BLOCKED" in proc.stdout, proc.stdout + proc.stderr

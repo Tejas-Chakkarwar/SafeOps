@@ -153,13 +153,44 @@ def test_recorded_bootstrap_scope_has_no_cluster_admin_grants() -> None:
 # --- the bootstrap phase is reachable only from the bootstrap module ------------------------
 
 
+def _bootstrap_phase_uses(source: str) -> bool:
+    """Any way of reaching the bootstrap phase: Phase.BOOTSTRAP, Phase("bootstrap"),
+    Phase["BOOTSTRAP"], or the literal "bootstrap" passed to Phase."""
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Attribute) and node.attr == "BOOTSTRAP":
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None)) == "Phase"
+        ):
+            return True
+        if isinstance(node, ast.Subscript) and getattr(node.value, "id", None) == "Phase":
+            return True
+    return False
+
+
 def test_only_bootstrap_module_uses_bootstrap_phase() -> None:
-    users = set()
-    for path in (REPO_ROOT / "safeops").rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Attribute) and node.attr == "BOOTSTRAP":
-                users.add(path.relative_to(REPO_ROOT).as_posix())
+    users = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in (REPO_ROOT / "safeops").rglob("*.py")
+        if _bootstrap_phase_uses(path.read_text())
+    }
     assert users == {"safeops/bootstrap.py", "safeops/cluster.py"}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "x = Phase.BOOTSTRAP",
+        'x = Phase("bootstrap")',
+        'x = Phase["BOOTSTRAP"]',
+        'x = cluster.Phase("bootstrap")',
+    ],
+)
+def test_bootstrap_phase_detector_catches_every_spelling(source: str) -> None:
+    """Milestone 2 review, T1: the detector itself must be able to fail."""
+    assert _bootstrap_phase_uses(source)
+    assert not _bootstrap_phase_uses("x = Phase.RUNTIME")
 
 
 # --- kubectl wrapper ------------------------------------------------------------------------
@@ -167,7 +198,9 @@ def test_only_bootstrap_module_uses_bootstrap_phase() -> None:
 
 def test_every_command_passes_kubeconfig_and_context_explicitly(tmp_path: Path) -> None:
     rec = Recorder(stdout="{}")
-    k = Kubectl(_cfg(tmp_path), Phase.RUNTIME, runner=rec, kubeconfig=tmp_path / "kc")
+    k = Kubectl(
+        _cfg(tmp_path), Phase.RUNTIME, runner=rec, kubeconfig=tmp_path / "kc", verify_identity=False
+    )
     k.read("get", "pods", "-n", "testbed")
     assert rec.calls[0][:5] == [
         "kubectl",
@@ -191,32 +224,54 @@ def test_every_command_passes_kubeconfig_and_context_explicitly(tmp_path: Path) 
     ],
 )
 def test_read_refuses_mutating_verbs(tmp_path: Path, args) -> None:
-    k = Kubectl(_cfg(tmp_path), Phase.RUNTIME, runner=Recorder(), kubeconfig=tmp_path / "kc")
+    k = Kubectl(
+        _cfg(tmp_path),
+        Phase.RUNTIME,
+        runner=Recorder(),
+        kubeconfig=tmp_path / "kc",
+        verify_identity=False,
+    )
     with pytest.raises(GuardError):
         k.read(*args)
 
 
 def test_apply_checks_every_object_before_running(tmp_path: Path) -> None:
     rec = Recorder()
-    k = Kubectl(_cfg(tmp_path), Phase.RUNTIME, runner=rec, kubeconfig=tmp_path / "kc")
+    k = Kubectl(
+        _cfg(tmp_path), Phase.RUNTIME, runner=rec, kubeconfig=tmp_path / "kc", verify_identity=False
+    )
     objs = [
         {"kind": "ConfigMap", "metadata": {"name": "a", "namespace": "testbed"}},
         {"kind": "ConfigMap", "metadata": {"name": "b", "namespace": "kube-system"}},
     ]
     with pytest.raises(GuardError):
         k.apply(objs)
-    assert rec.calls == []  # nothing ran, not even the allowed object
+    assert not [
+        c for c in rec.calls if "apply" in c
+    ]  # nothing applied, not even the allowed object
 
 
 def test_apply_refuses_objects_without_namespace(tmp_path: Path) -> None:
-    k = Kubectl(_cfg(tmp_path), Phase.RUNTIME, runner=Recorder(), kubeconfig=tmp_path / "kc")
+    k = Kubectl(
+        _cfg(tmp_path),
+        Phase.RUNTIME,
+        runner=Recorder(),
+        kubeconfig=tmp_path / "kc",
+        verify_identity=False,
+    )
     with pytest.raises(GuardError):
         k.apply([{"kind": "ConfigMap", "metadata": {"name": "a"}}])
 
 
 def test_runtime_raw_calls_only_reach_the_workload_proxy(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
-    k = Kubectl(cfg, Phase.RUNTIME, runner=Recorder(stdout="{}"), kubeconfig=tmp_path / "kc")
+    k = Kubectl(
+        cfg,
+        Phase.RUNTIME,
+        runner=Recorder(stdout="{}"),
+        kubeconfig=tmp_path / "kc",
+        verify_identity=False,
+    )
     ok = f"/api/v1/namespaces/{cfg.workload_namespace}/services/{cfg.workload_service}/proxy/stats"
     k.raw("GET", ok)
     for bad in [
@@ -230,7 +285,9 @@ def test_runtime_raw_calls_only_reach_the_workload_proxy(tmp_path: Path) -> None
 
 def test_unauthorized_is_a_credential_error_not_a_retry(tmp_path: Path) -> None:
     rec = Recorder(returncode=1, stderr="error: You must be logged in to the server (Unauthorized)")
-    k = Kubectl(_cfg(tmp_path), Phase.RUNTIME, runner=rec, kubeconfig=tmp_path / "kc")
+    k = Kubectl(
+        _cfg(tmp_path), Phase.RUNTIME, runner=rec, kubeconfig=tmp_path / "kc", verify_identity=False
+    )
     with pytest.raises(CredentialError, match="never falls back"):
         k.read("get", "pods")
     assert len(rec.calls) == 1
@@ -267,7 +324,13 @@ def test_bootstrap_uses_admin_kubeconfig(tmp_path: Path) -> None:
 
 
 def test_runtime_cannot_issue_tokens(tmp_path: Path) -> None:
-    k = Kubectl(_cfg(tmp_path), Phase.RUNTIME, runner=Recorder(), kubeconfig=tmp_path / "kc")
+    k = Kubectl(
+        _cfg(tmp_path),
+        Phase.RUNTIME,
+        runner=Recorder(),
+        kubeconfig=tmp_path / "kc",
+        verify_identity=False,
+    )
     with pytest.raises(GuardError):
         k.create_token("experiment-controller", "safeops-system", 3600)
 
@@ -335,7 +398,10 @@ def test_proxy_capability_refuses_odd_queries(query: str) -> None:
 def test_proxy_methods_are_get_for_stats_and_put_for_control(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     rec = Recorder(stdout='{"ok": true}')
-    proxy = WorkloadProxy(cfg, Kubectl(cfg, Phase.RUNTIME, runner=rec, kubeconfig=tmp_path / "kc"))
+    proxy = WorkloadProxy(
+        cfg,
+        Kubectl(cfg, Phase.RUNTIME, runner=rec, kubeconfig=tmp_path / "kc", verify_identity=False),
+    )
     proxy.stats("w3")
     proxy.control({"action": "stop"})
     assert rec.calls[0][5:7] == ["get", "--raw"] and rec.calls[0][7].endswith("/stats?window=w3")

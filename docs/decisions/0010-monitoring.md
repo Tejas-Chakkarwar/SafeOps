@@ -38,3 +38,9 @@ Scrape configuration defines what the agent can observe. "We used the chart defa
 ## Bootstrap scope
 
 The chart's cluster-scoped objects (ClusterRole and ClusterRoleBinding `prometheus-server`, needed for service discovery and node cAdvisor access) are recorded in `config/bootstrap_scope.yaml`, per the procedure in 0006.
+
+## Amendment, 2026-11-19: no harness traffic in the agent's telemetry (review L6)
+
+- **The leak:** the `safeops-workload-generator` job also scraped the generator's own HTTP server metrics. `http_requests_total{service="workload-generator", route="/stats" | "/control"}` counted the harness's polls and control calls, so the agent could have seen when the evaluator was measuring. That's evaluator-path traffic in the agent's sensory input.
+- **The fix:** the job now has `metric_relabel_configs` keeping only `__name__ =~ "loadgen_.*"`, which is workload telemetry and nothing about the harness.
+- **Test:** `tests/test_m2_review.py` asserts it.
