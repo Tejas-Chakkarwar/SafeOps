@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: sync test lint format cluster-up cluster-down cluster-test bootstrap-scope steady-state
+.PHONY: sync test lint format cluster-up cluster-down cluster-test bootstrap-scope steady-state desired-state
 
 sync:
 	$(UV) sync
@@ -35,3 +35,7 @@ cluster-test:
 
 steady-state:
 	$(UV) run safeops steady-state
+
+# Regenerate config/desired_state.yaml from manifests/testbed + topology (decision 0013).
+desired-state:
+	$(UV) run python -m safeops.environment.desired write

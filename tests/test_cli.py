@@ -18,14 +18,19 @@ ACCEPTANCE_ARGS = ["run", "--fault", "bad-deployment-config", "--seed", "0", "--
 cli = CliRunner()
 
 
-def test_milestone1_acceptance_command() -> None:
-    """decision 0004: stops at reset_environment with one readable line, no traceback."""
+def test_run_stops_readably_at_the_first_real_stub(monkeypatch, offline_runner_factory) -> None:
+    """decision 0004 (updated at Milestone 3): `safeops run` executes every implemented
+    stage, here faked so no cluster is touched, and stops at the first stub with one
+    readable line and no traceback. At Milestone 1 that stub was reset_environment."""
+    from safeops.experiment.sequence import first_stub
+
+    monkeypatch.setattr(runner_module, "build_runner", offline_runner_factory)
+    stage = first_stub()
     result = cli.invoke(app, ACCEPTANCE_ARGS)
     assert result.exit_code == EXIT_NOT_IMPLEMENTED
-    lines = result.stderr.strip().splitlines()
-    assert lines == [
-        "safeops run: EnvironmentManager.reset_environment is not implemented yet "
-        "(Milestone 3). Run unit: fault_id=bad-deployment-config, fault_seed=0, trial_index=0."
+    assert result.stderr.strip().splitlines() == [
+        f"safeops run: {stage.qualname} is not implemented yet (Milestone {stage.milestone})."
+        " Run unit: fault_id=bad-deployment-config, fault_seed=0, trial_index=0."
     ]
     assert "Traceback" not in result.output
 
@@ -57,8 +62,11 @@ def test_dry_run_lists_every_stage_and_runs_nothing(monkeypatch: pytest.MonkeyPa
     for stage in RUN_SEQUENCE:
         assert stage.qualname in result.stdout
     assert f"{len(RUN_SEQUENCE)} stages" in result.stdout
+    from safeops.experiment.sequence import first_stub
+
+    stage = first_stub()
     assert (
-        "First stub in sequence order: EnvironmentManager.reset_environment (Milestone 3)."
+        f"First stub in sequence order: {stage.qualname} (Milestone {stage.milestone})."
         in result.stdout
     )
 
@@ -110,7 +118,6 @@ def test_dry_run_takes_no_experiment_arguments(extra: list[str]) -> None:
     [
         ("replay", "replay_cohort", 13),
         ("analyze", "analyze", 15),
-        ("snapshot", "EnvironmentManager.capture_snapshot", 3),
     ],
 )
 def test_unimplemented_commands_fail_readably(command: str, stage: str, milestone: int) -> None:

@@ -49,6 +49,7 @@ It must terminate at `EnvironmentManager.reset_environment()` with `NotImplement
 | 3 | `NotImplementedStage`: the command reached a stub |
 | 4 | no valid steady-state baseline (`safeops steady-state`; decision 0009) |
 | 5 | guard refusal, missing or expired credential, or failed cluster command (decision 0009) |
+| 6 | the environment did not verify clean: `safeops verify` / `safeops reset` (decision 0013) |
 
 A separate code for "reached a stub" lets scripts tell "not built yet" apart from "called wrongly".
 

@@ -443,7 +443,16 @@ def rbac_checks(cfg: ClusterConfig) -> list[str]:
         ("get", f"services/{svc}", None, wl, False),
         ("get", "services/gateway-svc", "proxy", cfg.namespace, False),
         ("get", "secrets", None, cfg.namespace, False),
-        ("get", "pods", None, cfg.namespace, False),  # testbed rights arrive at Milestone 3
+        # Milestone 3 testbed lifecycle rights (decision 0013)
+        ("list", "pods", None, cfg.namespace, True),
+        ("delete", "deployments.apps", None, cfg.namespace, True),
+        ("update", "statefulsets.apps", None, cfg.namespace, True),
+        ("delete", "networkchaos.chaos-mesh.org", None, cfg.namespace, True),
+        ("create", "networkchaos.chaos-mesh.org", None, cfg.namespace, False),  # Milestone 4
+        ("create", "pods", "exec", cfg.namespace, False),
+        ("delete", "pods", None, cfg.namespace, False),
+        ("list", "deployments.apps", None, cfg.chaos_namespace, False),
+        ("list", "deployments.apps", None, "kube-system", False),
     ]
     failures = []
     for verb, resource, sub, ns, want in expect:

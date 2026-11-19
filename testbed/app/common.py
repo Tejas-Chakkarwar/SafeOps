@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -164,5 +165,14 @@ class App:
 
         server = ThreadingHTTPServer(("0.0.0.0", port), RequestHandler)
         server.daemon_threads = True
+
+        # The process is PID 1 in its container, and PID 1 ignores SIGTERM by default, so
+        # without this every pod deletion waited out the full 30 s grace period (found at
+        # Milestone 3, decision 0013). Exit promptly and cleanly instead.
+        def _terminate(signum, frame):
+            log("info", "terminating", signal=signum)
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _terminate)
         log("info", "listening", port=port)
         server.serve_forever()

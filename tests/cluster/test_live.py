@@ -106,7 +106,8 @@ def test_harness_is_denied_everywhere_else() -> None:
         f"{CFG.prometheus_service_port}/proxy/api/v1/targets",
         f"/api/v1/namespaces/{CFG.namespace}/services/gateway-svc/proxy/checkout",
         f"/api/v1/namespaces/{CFG.namespace}/secrets",
-        f"/api/v1/namespaces/{CFG.namespace}/pods",
+        f"/api/v1/namespaces/{CFG.chaos_namespace}/pods",
+        "/api/v1/namespaces/kube-system/pods",
     ]:
         proc = _harness_raw_get(path)
         assert proc.returncode != 0 and "forbidden" in proc.stderr.lower(), path

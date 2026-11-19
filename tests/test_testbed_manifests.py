@@ -157,10 +157,11 @@ def test_experiment_controller_rbac_is_exactly_proxy_get_update_by_name() -> Non
         "experiment-controller",
         CFG.system_namespace,
     )
-    roles = [o for o in system if o["kind"] in ("Role", "ClusterRole")]
-    assert len(roles) == 1 and roles[0]["kind"] == "Role"
-    assert roles[0]["metadata"]["namespace"] == CFG.workload_namespace
-    assert roles[0]["rules"] == [
+    roles = {o["metadata"]["name"]: o for o in system if o["kind"] in ("Role", "ClusterRole")}
+    assert {r["kind"] for r in roles.values()} == {"Role"}  # namespaced only, never cluster-wide
+    proxy = roles["experiment-controller-workload-proxy"]
+    assert proxy["metadata"]["namespace"] == CFG.workload_namespace
+    assert proxy["rules"] == [
         {
             "apiGroups": [""],
             "resources": ["services/proxy"],
@@ -168,6 +169,24 @@ def test_experiment_controller_rbac_is_exactly_proxy_get_update_by_name() -> Non
             "verbs": ["get", "update"],
         }
     ]
+    lifecycle = roles["experiment-controller-testbed-lifecycle"]  # Milestone 3 (decision 0013)
+    assert lifecycle["metadata"]["namespace"] == CFG.namespace
+    granted = {
+        (g, r, v)
+        for rule in lifecycle["rules"]
+        for g in rule["apiGroups"]
+        for r in rule["resources"]
+        for v in rule["verbs"]
+    }
+    assert not [
+        x for x in granted if "secrets" in x[1] or "/" in x[1]
+    ]  # no Secrets, no subresources
+    assert ("", "pods", "delete") not in granted and (
+        "chaos-mesh.org",
+        "*",
+        "create",
+    ) not in granted
+    assert len(roles) == 2
     assert not [o for o in system if o["kind"] == "ClusterRoleBinding"]
 
 

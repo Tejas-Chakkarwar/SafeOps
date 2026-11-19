@@ -1,0 +1,350 @@
+# Desired testbed state (decision 0013): the canonical snapshot a clean testbed must
+# match. Generated from manifests/testbed and config/topology.yaml by
+# `make desired-state`. Do not edit by hand. tests/test_snapshot.py fails on drift.
+projection_version: 1
+resources:
+  ConfigMap/db-pool-config:
+    approved_keys_sha256: ae93d104e5984424977736d9302130506f47e4b32e92ee59dd211798d9c99b05
+    missing_approved_keys: []
+    numeric:
+      connection_timeout_ms: 2000.0
+      max_pool_size: 10.0
+  ConfigMap/orders-config:
+    approved_keys_sha256: 36ee425db4db0aba154c5e8985edd45487819da5fc7ffb989f3c78229c1cce27
+    missing_approved_keys: []
+    numeric: {}
+  Deployment/gateway:
+    containers:
+    - env:
+      - name: SERVICE_NAME
+        value: gateway
+      - name: LOG_LEVEL
+        value: info
+      - name: CACHE_MB
+        value: '64'
+      - name: ORDERS_URL
+        value: http://orders-svc:8080
+      - name: ORDERS_TIMEOUT_MS
+        value: '800'
+      envFrom: []
+      image: safeops-testbed:f94176c42488
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: null
+          path: /healthz
+          port: http
+          scheme: HTTP
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        successThreshold: 1
+        timeoutSeconds: 1
+      name: gateway
+      readinessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: null
+          path: /readyz
+          port: http
+          scheme: HTTP
+        initialDelaySeconds: 0
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 1
+      resources:
+        limits:
+          cpu_millis: 500
+          memory_mib: 512
+        requests:
+          cpu_millis: 100
+          memory_mib: 256
+    replicas: 2
+    volumes: []
+  Deployment/inventory:
+    containers:
+    - env:
+      - name: SERVICE_NAME
+        value: inventory
+      - name: LOG_LEVEL
+        value: info
+      - name: CACHE_MB
+        value: '64'
+      - name: WORK_MS
+        value: '5'
+      envFrom: []
+      image: safeops-testbed:f94176c42488
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: null
+          path: /healthz
+          port: http
+          scheme: HTTP
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        successThreshold: 1
+        timeoutSeconds: 1
+      name: inventory
+      readinessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: null
+          path: /readyz
+          port: http
+          scheme: HTTP
+        initialDelaySeconds: 0
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 1
+      resources:
+        limits:
+          cpu_millis: 500
+          memory_mib: 512
+        requests:
+          cpu_millis: 100
+          memory_mib: 256
+    replicas: 2
+    volumes: []
+  Deployment/orders:
+    containers:
+    - env:
+      - name: SERVICE_NAME
+        value: orders
+      - name: CACHE_MB
+        value: '64'
+      - name: INVENTORY_URL
+        value: http://inventory-svc:8080
+      - name: PAYMENT_URL
+        value: http://payment-svc:8080
+      - name: UPSTREAM_TIMEOUT_MS
+        value: '300'
+      - name: DB_HOST
+        value: postgres-svc
+      - name: DB_NAME
+        value: orders
+      - name: DB_USER
+        value: orders
+      - name: DB_PASSWORD
+        secretKeyRef:
+          key: password
+          name: postgres-credentials
+          optional: false
+      - configMapKeyRef:
+          key: log_level
+          name: orders-config
+          optional: false
+        name: LOG_LEVEL
+      - configMapKeyRef:
+          key: max_pool_size
+          name: db-pool-config
+          optional: false
+        name: DB_MAX_POOL_SIZE
+      - configMapKeyRef:
+          key: connection_timeout_ms
+          name: db-pool-config
+          optional: false
+        name: DB_CONNECTION_TIMEOUT_MS
+      envFrom: []
+      image: safeops-testbed:f94176c42488
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: null
+          path: /healthz
+          port: http
+          scheme: HTTP
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        successThreshold: 1
+        timeoutSeconds: 1
+      name: orders
+      readinessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: null
+          path: /readyz
+          port: http
+          scheme: HTTP
+        initialDelaySeconds: 0
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 1
+      resources:
+        limits:
+          cpu_millis: 500
+          memory_mib: 512
+        requests:
+          cpu_millis: 100
+          memory_mib: 256
+    replicas: 2
+    volumes: []
+  Deployment/payment:
+    containers:
+    - env:
+      - name: SERVICE_NAME
+        value: payment
+      - name: LOG_LEVEL
+        value: info
+      - name: CACHE_MB
+        value: '64'
+      - name: WORK_MS
+        value: '5'
+      envFrom: []
+      image: safeops-testbed:f94176c42488
+      livenessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: null
+          path: /healthz
+          port: http
+          scheme: HTTP
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        successThreshold: 1
+        timeoutSeconds: 1
+      name: payment
+      readinessProbe:
+        failureThreshold: 3
+        httpGet:
+          host: null
+          path: /readyz
+          port: http
+          scheme: HTTP
+        initialDelaySeconds: 0
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 1
+      resources:
+        limits:
+          cpu_millis: 500
+          memory_mib: 512
+        requests:
+          cpu_millis: 100
+          memory_mib: 256
+    replicas: 2
+    volumes: []
+  PersistentVolumeClaim/data-postgres-0:
+    bound: true
+  Service/gateway-svc:
+    endpoint_owner_services:
+    - gateway
+    headless: false
+    ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: http
+    ready_endpoint_count: 2
+    selector:
+      app: gateway
+    type: ClusterIP
+  Service/inventory-svc:
+    endpoint_owner_services:
+    - inventory
+    headless: false
+    ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: http
+    ready_endpoint_count: 2
+    selector:
+      app: inventory
+    type: ClusterIP
+  Service/orders-svc:
+    endpoint_owner_services:
+    - orders
+    headless: false
+    ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: http
+    ready_endpoint_count: 2
+    selector:
+      app: orders
+    type: ClusterIP
+  Service/payment-svc:
+    endpoint_owner_services:
+    - payment
+    headless: false
+    ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: http
+    ready_endpoint_count: 2
+    selector:
+      app: payment
+    type: ClusterIP
+  Service/postgres-svc:
+    endpoint_owner_services:
+    - postgres
+    headless: true
+    ports:
+    - name: postgres
+      port: 5432
+      protocol: TCP
+      targetPort: postgres
+    ready_endpoint_count: 1
+    selector:
+      app: postgres
+    type: ClusterIP
+  StatefulSet/postgres:
+    containers:
+    - env:
+      - name: POSTGRES_DB
+        value: orders
+      - name: POSTGRES_USER
+        value: orders
+      - name: POSTGRES_PASSWORD
+        secretKeyRef:
+          key: password
+          name: postgres-credentials
+          optional: false
+      - name: PGDATA
+        value: /var/lib/postgresql/data/pgdata
+      envFrom: []
+      image: postgres:16-alpine@sha256:1d5b02d3a9941fbd52437db4107f8c52d6297dac553ca1e5c299ebb3756b4857
+      livenessProbe:
+        exec:
+          command:
+          - pg_isready
+          - -U
+          - orders
+          - -d
+          - orders
+        failureThreshold: 6
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        successThreshold: 1
+        timeoutSeconds: 1
+      name: postgres
+      readinessProbe:
+        exec:
+          command:
+          - pg_isready
+          - -U
+          - orders
+          - -d
+          - orders
+        failureThreshold: 3
+        initialDelaySeconds: 0
+        periodSeconds: 5
+        successThreshold: 1
+        timeoutSeconds: 1
+      resources:
+        limits:
+          cpu_millis: 1000
+          memory_mib: 512
+        requests:
+          cpu_millis: 100
+          memory_mib: 256
+    replicas: 1
+    serviceName: postgres-svc
+    volumeClaimTemplates:
+    - accessModes:
+      - ReadWriteOnce
+      name: data
+      storage_mib: 1024
+    volumes: []

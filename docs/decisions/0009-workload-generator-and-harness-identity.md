@@ -117,3 +117,7 @@ Prometheus may show workload metrics to the agent (`loadgen_attempts_total`, `lo
     - the harness proxy kept working, with and without a node-IP rule, so no node-IP rule is needed;
     - the Prometheus target stayed up.
   - `tests/cluster/test_live.py::test_testbed_pods_cannot_reach_the_evaluator` keeps checking this, so a CNI that behaves differently fails loudly.
+
+## Amendment, 2026-11-19 (Milestone 3): testbed lifecycle rights
+
+As planned above, `experiment-controller` gained its `testbed` rights at Milestone 3, through Role `experiment-controller-testbed-lifecycle`. The exact verbs and the reasons are in decision 0013. There's still no Secret access, no `pods/exec`, and no chaos creation. The proxy Role in `safeops-workload` is unchanged.

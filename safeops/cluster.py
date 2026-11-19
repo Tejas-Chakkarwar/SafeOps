@@ -147,6 +147,12 @@ class ClusterConfig:
     prometheus_service_port: int
 
     @property
+    def state_dir(self) -> Path:
+        """The gitignored local state directory (.safeops/). Code that only needs a place
+        for state files uses this, never the admin kubeconfig path itself."""
+        return self.kubeconfig_path.parent
+
+    @property
     def bootstrap_namespaces(self) -> tuple[str, ...]:
         return (
             self.namespace,
@@ -379,20 +385,12 @@ class Kubectl:
             self._cluster_scoped = CLUSTER_SCOPED_KINDS | frozenset(live)
         return self._cluster_scoped
 
-    def apply(
-        self,
-        objects: Iterable[dict],
-        cluster_scope: frozenset[tuple[str, str]] = frozenset(),
+    def _check_objects(
+        self, objects: list[dict], cluster_scope: frozenset[tuple[str, str]]
     ) -> None:
-        """Server-side apply after checking every object against the guard.
-
-        Scope comes from the kind, never from the object: a cluster-scoped kind is treated
-        as cluster-scoped even if it carries a metadata.namespace (Kubernetes ignores that
-        field for such kinds, so trusting it would let runtime write cluster-wide).
-        """
-        import yaml
-
-        objects = list(objects)
+        """Guard every object before anything runs. Scope comes from the kind, never from
+        the object: a cluster-scoped kind is cluster-scoped even if it carries a
+        metadata.namespace (Kubernetes ignores that field for such kinds)."""
         cluster_kinds = self.cluster_scoped_kinds()
         for obj in objects:
             kind, meta = obj["kind"], obj.get("metadata", {})
@@ -412,9 +410,60 @@ class Kubectl:
                 namespace=namespace,
                 cluster_scope=cluster_scope,
             )
+
+    def _mutate(self, verb_args: list[str], objects, cluster_scope) -> None:
+        import yaml
+
+        objects = list(objects)
+        self._check_objects(objects, cluster_scope)
+        self._exec(verb_args + ["-f", "-"], stdin=yaml.safe_dump_all(objects, sort_keys=False))
+
+    def apply(
+        self, objects: Iterable[dict], cluster_scope: frozenset[tuple[str, str]] = frozenset()
+    ) -> None:
+        """Server-side apply after checking every object against the guard."""
+        self._mutate(["apply", "--server-side", "--field-manager=safeops"], objects, cluster_scope)
+
+    def create(
+        self, objects: Iterable[dict], cluster_scope: frozenset[tuple[str, str]] = frozenset()
+    ) -> None:
+        """Create objects after checking every one against the guard."""
+        self._mutate(["create"], objects, cluster_scope)
+
+    def replace(
+        self, objects: Iterable[dict], cluster_scope: frozenset[tuple[str, str]] = frozenset()
+    ) -> None:
+        """Replace (PUT) whole objects after the guard check: fields set by anyone else are
+        dropped, which server-side apply would keep."""
+        self._mutate(["replace"], objects, cluster_scope)
+
+    def delete(
+        self, resource: str, kind: str, name: str, namespace: str, timeout_s: int = 180
+    ) -> None:
+        """Delete one namespaced object and wait for it (and, foreground, its dependents) to
+        be gone. `resource` is the kubectl resource name (e.g. deployment,
+        networkchaos.chaos-mesh.org); `kind` is what the guard checks."""
+        import re
+
+        if not re.fullmatch(r"[a-z0-9]+(\.[a-z0-9-]+)*", resource):
+            raise GuardError(f"invalid resource name {resource!r}")
+        if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", name):
+            raise GuardError(f"invalid object name {name!r}")
+        if kind in self.cluster_scoped_kinds():
+            raise GuardError(f"delete of cluster-scoped {kind}/{name} is not supported here")
+        check_object(self.cfg, self.phase, kind=kind, name=name, namespace=namespace)
         self._exec(
-            ["apply", "--server-side", "--field-manager=safeops", "-f", "-"],
-            stdin=yaml.safe_dump_all(objects, sort_keys=False),
+            [
+                "delete",
+                f"{resource}/{name}",
+                "-n",
+                namespace,
+                "--ignore-not-found",
+                "--wait=true",
+                "--cascade=foreground",
+                f"--timeout={timeout_s}s",
+            ],
+            timeout=timeout_s + 30,
         )
 
     def create_token(self, service_account: str, namespace: str, duration_s: int) -> str:

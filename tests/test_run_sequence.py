@@ -9,7 +9,7 @@ import typing
 
 import pytest
 
-from safeops.experiment.runner import ExperimentRunner, RunUnit, build_runner
+from safeops.experiment.runner import ExperimentRunner, RunUnit
 from safeops.experiment.sequence import EXECUTE_ONLY, RUN_SEQUENCE, VALID_ONLY, first_stub
 from safeops.stubs import NotImplementedStage
 
@@ -104,17 +104,19 @@ def test_every_stage_resolves_to_a_real_method() -> None:
         assert stage.milestone is None or 2 <= stage.milestone <= 17, stage.qualname
 
 
-def test_real_runner_stops_at_first_stub_in_sequence_order() -> None:
+def test_runner_stops_at_first_stub_in_sequence_order(offline_runner_factory) -> None:
+    """Implemented cluster stages are faked (offline); the first remaining stub raises."""
     expected = first_stub()
     assert expected is not None
     with pytest.raises(NotImplementedStage) as exc:
-        build_runner().run(UNIT)
+        offline_runner_factory().run(UNIT)
     assert exc.value.stage == expected.qualname
     assert exc.value.milestone == expected.milestone
 
 
-def test_milestone1_first_stub_is_reset_environment() -> None:
-    """Milestone 1 acceptance (decision 0004). Revisit when Milestone 3 implements reset."""
+def test_milestone3_first_stub_is_fault_injection() -> None:
+    """After Milestone 3 every lifecycle stage is real; the next stub is Milestone 4's injector.
+    (At Milestone 1 it was reset_environment; decision 0004.)"""
     stage = first_stub()
     assert stage is not None
-    assert (stage.qualname, stage.milestone) == ("EnvironmentManager.reset_environment", 3)
+    assert (stage.qualname, stage.milestone) == ("FaultInjector.inject", 4)

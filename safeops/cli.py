@@ -14,6 +14,7 @@ EXIT_USAGE = 2
 EXIT_NOT_IMPLEMENTED = 3
 EXIT_STEADY_STATE = 4  # no valid steady-state baseline
 EXIT_CLUSTER = 5  # guard refusal, missing or expired credential, failed cluster command
+EXIT_DIRTY = 6  # the environment did not verify clean (decision 0013)
 
 # pretty_exceptions_show_locals=False: a traceback must never dump local variables,
 # because they may later hold API keys or tokens (CLAUDE.md, Secrets).
@@ -154,12 +155,69 @@ def analyze() -> None:
     _run_stage("analyze", analyze_runs)
 
 
+def _cluster_errors():
+    from safeops.cluster import CommandError, CredentialError, GuardError
+    from safeops.environment.manager import EnvironmentStateError
+
+    return (CredentialError, GuardError, CommandError, EnvironmentStateError)
+
+
 @app.command()
 def snapshot() -> None:
-    """Capture and inspect a canonical snapshot of the testbed."""
+    """Print the canonical snapshot of the testbed (JSON) and its digest."""
     from safeops.environment.manager import EnvironmentManager
 
-    _run_stage("snapshot", EnvironmentManager().capture_snapshot)
+    try:
+        snap = EnvironmentManager().capture_snapshot()
+    except _cluster_errors() as exc:
+        _fail("snapshot", str(exc), EXIT_CLUSTER)
+    typer.echo(snap.to_json())
+    typer.echo(f"digest: {snap.digest()}", err=True)
+
+
+def _report(command: str, result) -> None:
+    if result.clean:
+        typer.echo("  verify: CLEAN")
+        return
+    typer.echo(f"  verify: DIRTY ({len(result.problems)} problems)")
+    for problem in result.problems[:25]:
+        typer.echo(f"    - {problem}")
+    _fail(command, "environment is not clean", EXIT_DIRTY)
+
+
+@app.command()
+def verify() -> None:
+    """Check the testbed against config/desired_state.yaml, including node-level residue."""
+    from safeops.environment.manager import EnvironmentManager
+
+    try:
+        result = EnvironmentManager().verify_clean_state()
+    except _cluster_errors() as exc:
+        _fail("verify", str(exc), EXIT_CLUSTER)
+    _report("verify", result)
+
+
+@app.command()
+def reset(
+    times: Annotated[
+        int, typer.Option("--times", min=1, help="Repeat reset -> verify N times.")
+    ] = 1,
+) -> None:
+    """Reset the testbed to desired state, then verify it independently."""
+    import time as _time
+
+    from safeops.environment.manager import EnvironmentManager
+
+    env = EnvironmentManager()
+    for i in range(1, times + 1):
+        started = _time.monotonic()
+        try:
+            env.reset_environment()
+            result = env.verify_clean_state()
+        except _cluster_errors() as exc:
+            _fail("reset", f"iteration {i}: {exc}", EXIT_CLUSTER)
+        typer.echo(f"safeops reset: iteration {i}/{times} in {_time.monotonic() - started:.1f}s")
+        _report("reset", result)
 
 
 if __name__ == "__main__":

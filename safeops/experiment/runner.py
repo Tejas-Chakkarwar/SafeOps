@@ -15,7 +15,8 @@ from dataclasses import dataclass
 
 from safeops.agent.loop import Agent
 from safeops.agent.parser import ProposalParser
-from safeops.environment.manager import EnvironmentManager
+from safeops.cluster import CommandError
+from safeops.environment.manager import CleanStateResult, EnvironmentManager, QuarantineFailed
 from safeops.environment.workload import WorkloadGenerator, check_steady_state
 from safeops.executor.executor import ActionExecutor
 from safeops.experiment.records import RunRecordWriter
@@ -27,6 +28,11 @@ from safeops.gate.shadow import ShadowGateScorer
 from safeops.stubs import stub
 from safeops.verify.effectiveness import EffectivenessVerifier
 from safeops.verify.harm import HarmChecker
+
+
+class PreRunDiscard(Exception):
+    """The environment wasn't clean before the run. The run is discarded and counted
+    (§11.1), and the worker was quarantined and rebuilt."""
 
 
 @dataclass(frozen=True)
@@ -69,6 +75,7 @@ class ExperimentRunner:
         self.effectiveness = effectiveness
         self.harm = harm
         self.records = records
+        self._halt: Exception | None = None
 
     def run(self, unit: RunUnit) -> None:
         env = self.environment
@@ -108,8 +115,12 @@ class ExperimentRunner:
         self.workload.stop_workload()
 
         # Post-run. A completed run is kept even if this reset fails (§11.1).
-        env.reset_environment()
-        reset_verified = self._post_run_clean(env.verify_clean_state())
+        try:
+            env.reset_environment()
+            post_clean = env.verify_clean_state()
+        except CommandError as exc:  # infrastructure failure during reset: keep the run
+            post_clean = CleanStateResult(False, (f"post-run reset failed: {exc}",))
+        reset_verified = self._post_run_clean(post_clean)
         self.records.finalize(
             unit=unit,
             steady_state=steady_state,
@@ -127,12 +138,23 @@ class ExperimentRunner:
             harm=harm,
             reset_verified=reset_verified,
         )
+        if self._halt is not None:  # the record is written first; then the worker halts
+            raise self._halt
 
     # Runner hooks: points where the runner interprets a stage's result.
 
-    @stub(milestone=3)
     def _require_pre_run_clean(self, clean_state) -> None:
-        """If not clean: discard the run, count it, quarantine (§5, §11.1)."""
+        """If not clean: quarantine and rebuild, then discard the run (§5, §11.1).
+
+        A rebuild that fails raises QuarantineFailed: the worker halts.
+        """
+        if clean_state.clean:
+            return
+        reason = "; ".join(clean_state.problems[:10])
+        self.environment.quarantine_and_rebuild(reason=f"pre-run: {reason}")
+        raise PreRunDiscard(
+            f"environment not clean before the run; discarded and rebuilt: {reason}"
+        )
 
     def _require_steady_state(self, steady_state) -> None:
         """Stop the run if no valid steady-state baseline was measured (decision 0009).
@@ -162,9 +184,22 @@ class ExperimentRunner:
     def _executed_action(self, action, execution):
         """Return the action the harm checker should judge, given the execution status."""
 
-    @stub(milestone=3)
     def _post_run_clean(self, clean_state) -> bool:
-        """Return reset_verified. On failure, keep the run and quarantine (§11.1)."""
+        """Return reset_verified. On failure, keep the run and quarantine (§11.1).
+
+        A completed run is never discarded for a failed cleanup: the hardest runs to clean
+        up are the ones where the agent did the most damage. If the rebuild also fails,
+        the run's record is still written; then the worker halts.
+        """
+        if clean_state.clean:
+            return True
+        try:
+            self.environment.quarantine_and_rebuild(
+                reason="post-run: " + "; ".join(clean_state.problems[:10])
+            )
+        except QuarantineFailed as exc:
+            self._halt = exc
+        return False
 
 
 def build_runner() -> ExperimentRunner:
