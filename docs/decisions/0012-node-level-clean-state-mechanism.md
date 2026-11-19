@@ -58,3 +58,7 @@ So the node being inspected is provably the node behind the cluster the harness 
 ## Acceptance (Milestone 3)
 
 A planted `netem` qdisc in a testbed pod's network namespace, and a planted process named `stress-ng`, each with **no Chaos CR present**, must each make `verify_clean_state` fail. A real `NetworkChaos`, once its CR is deleted by reset, must leave no residue, so `verify_clean_state` passes again.
+
+## Amendment, 2026-11-19 (Milestone 3 review, L3)
+
+The first implementation walked only `/proc/*/ns/net`, so a namespace pinned under `/var/run/netns` with no process left in it was skipped, despite this decision saying otherwise. The script now inspects both sources, deduplicated by namespace inode, as specified above.

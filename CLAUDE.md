@@ -69,7 +69,8 @@ make lint
 safeops steady-state # start load, measure one 300-attempt window, stop (decision 0009)
 safeops workload-stop # stop a generator a dead run left running; never while a run is active
 safeops reset [--times N] # reset the testbed to desired state, then verify (decision 0013)
-safeops verify       # clean-state check: desired state + chaos objects + node residue
+safeops verify       # clean-state check: desired state + inventory + chaos objects + node residue
+safeops quarantine-clear # lift a quarantine after fixing its cause; only if verify is clean
 make desired-state   # regenerate config/desired_state.yaml after changing manifests/topology
 safeops run --fault <id> --seed <n> --trial <i>
 safeops replay       # offline gate replay over cohort G

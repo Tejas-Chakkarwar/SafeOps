@@ -89,3 +89,53 @@ The first live reset took 135 s. The testbed processes run as PID 1, and PID 1 i
 - `safeops verify` checks the current state.
 - `safeops reset [--times N]` runs reset, then verify, N times.
 - Exit codes: 0 means clean; **6** means not clean; 5 means a guard, credential or cluster error.
+
+## Amendment, 2026-11-19: Milestone 3 adversarial review
+
+Each fix below has a regression test in `tests/test_m3_review.py`; H1, H2 and L5 also have live tests in `tests/cluster/test_lifecycle_live.py`.
+
+**H1: nothing in the testbed is invisible.**
+- **The finding:** a NetworkPolicy cutting off `orders`, a ResourceQuota, a bare pod and an extra Secret were all planted live, and verify said CLEAN every time. Reset didn't remove them, so they would have survived every reset: every later run would fail its steady state, and quarantine would never trigger.
+- **The fix:** verify now also takes an **inventory** of every other kind the testbed could hold (`INVENTORY` in `manager.py`): pods, ReplicaSets, ControllerRevisions, ServiceAccounts, NetworkPolicies, ResourceQuotas, LimitRanges, HPAs, PDBs, Jobs, CronJobs, Ingresses, Roles and RoleBindings.
+- **What's expected:**
+  - pods owned, through their ReplicaSet, by a desired Deployment or a desired StatefulSet;
+  - ReplicaSets and ControllerRevisions owned by desired workloads;
+  - the `default` ServiceAccount;
+  - SafeOps' own testbed RBAC objects, taken from the system manifests.
+
+  Anything else is `unexpected object in the testbed`.
+- **What reset deletes:** stray objects of the configuration kinds (NetworkPolicy, ResourceQuota, LimitRange, HPA, PDB, Job, CronJob, Ingress, extra ServiceAccounts).
+- **What it leaves to quarantine:** stray pods, ReplicaSets, ControllerRevisions and RBAC objects. Verify flags them, which leads to quarantine, so the harness never needs pod-delete or RBAC-delete rights.
+- **Residual:** Secrets are not inventoried, because no SafeOps identity reads Secrets. An extra Secret stays invisible. Nothing in SafeOps creates Secrets in the testbed except bootstrap, which creates `postgres-credentials`.
+
+**H2: Pod Security baseline on `testbed` and `safeops-workload`.**
+- **The finding:** the harness could create a Deployment whose pod was privileged, with `hostPID`, `hostNetwork` and the node's root filesystem mounted (proven by server dry-run). That's root on the node, which reaches the whole cluster.
+- **The fix:** both namespaces now carry `pod-security.kubernetes.io/enforce: baseline`, and every testbed pod, Postgres included, meets it. Admission rejects privileged pods even for the admin credential, and the harness's Deployment path gets "would violate PodSecurity", so its pods are never admitted. Chaos Mesh's privileged daemon runs in `chaos-mesh`, which is unaffected.
+
+**M1: verify fails closed on everything except guard and credential errors.** Before, only `CommandError` was caught. An odd quantity (`ValueError`) or a malformed object (`KeyError`) crashed verify instead of reporting dirty.
+
+**M2: a failed pre-run reset is handled like a failed post-run reset.** A `CommandError` from the pre-run reset or verify becomes a dirty result: quarantine, then `PreRunDiscard`.
+
+**M3: the record is always written.** A rebuild that times out or crashes becomes `QuarantineFailed`, with the marker kept. `_post_run_clean` catches *any* quarantine failure, so the run's record is finalized before the worker halts.
+
+**L1:** a non-finite numeric value (`NaN`, `inf`) is kept as `non-finite:<raw>` text, so a state never differs from itself.
+
+**L2:** a halted runner refuses to start another run.
+
+**L3:** the node check also inspects namespaces pinned under `/var/run/netns`, matching decision 0012.
+
+**L4:** `safeops quarantine-clear` lifts a quarantine after an operator fixes the cause, but only if verify is clean at that moment.
+
+**L5:** reset now replaces (PUT) the Postgres StatefulSet on every reset, not only on projected drift, so unprojected drift can't persist. It's a no-op when nothing changed: same generation, and the pod isn't restarted (verified live). Its PVC is still never touched.
+
+### Open for Milestone 4 (M4): when the runner's own snapshots are taken
+
+The runner captures the **pre-fault** and **post-fault** snapshots with no stabilization window; only the post-action snapshot waits. §11.1 says endpoint fields are captured only after stabilization.
+
+The post-fault snapshot is the harm baseline, so a fault that triggers a rollout would freeze a mid-rollout endpoint count into it. And some faults never stabilize, such as a bad image tag.
+
+**Decide at Milestone 4, per fault:**
+- **Option A:** wait for a bounded stabilization window before the pre-fault and post-fault snapshots, and flag a timeout.
+- **Option B:** declare in each fault spec whether its post-fault state is expected to stabilize.
+
+Not changed here.

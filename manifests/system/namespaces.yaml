@@ -3,7 +3,15 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: ${TESTBED_NAMESPACE}
-  labels: {app.kubernetes.io/part-of: safeops, safeops.io/role: system-under-test}
+  labels:
+    app.kubernetes.io/part-of: safeops
+    safeops.io/role: system-under-test
+    # Pod Security "baseline" (Milestone 3 review, H2): no privileged, hostPID,
+    # hostNetwork or hostPath pods, so no identity that may create workloads here can
+    # reach the node. All testbed pods, Postgres included, meet it. Chaos Mesh's
+    # privileged daemon runs in its own namespace.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
 ---
 apiVersion: v1
 kind: Namespace
@@ -15,7 +23,11 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: ${WORKLOAD_NAMESPACE}
-  labels: {app.kubernetes.io/part-of: safeops, safeops.io/role: measurement}
+  labels:
+    app.kubernetes.io/part-of: safeops
+    safeops.io/role: measurement
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
 ---
 apiVersion: v1
 kind: Namespace

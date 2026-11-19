@@ -60,6 +60,30 @@ rules:
   - apiGroups: ["chaos-mesh.org"]
     resources: ["*"]
     verbs: ["get", "list", "watch", "delete"]  # reset removes chaos; injecting it is Milestone 4
+  # Inventory (Milestone 3 review, H1): verify must see every other kind the testbed could
+  # hold. Reset may delete stray objects of these configuration kinds...
+  - apiGroups: [""]
+    resources: ["serviceaccounts", "resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "delete"]
+  # ...but only reads these. Stray ones are flagged, which leads to quarantine.
+  - apiGroups: ["apps"]
+    resources: ["controllerrevisions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

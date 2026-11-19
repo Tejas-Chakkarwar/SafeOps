@@ -453,6 +453,13 @@ def rbac_checks(cfg: ClusterConfig) -> list[str]:
         ("delete", "pods", None, cfg.namespace, False),
         ("list", "deployments.apps", None, cfg.chaos_namespace, False),
         ("list", "deployments.apps", None, "kube-system", False),
+        # Milestone 3 review, H1: inventory reads; deletes only for configuration kinds
+        ("list", "networkpolicies.networking.k8s.io", None, cfg.namespace, True),
+        ("delete", "networkpolicies.networking.k8s.io", None, cfg.namespace, True),
+        ("list", "roles.rbac.authorization.k8s.io", None, cfg.namespace, True),
+        ("delete", "roles.rbac.authorization.k8s.io", None, cfg.namespace, False),
+        ("create", "roles.rbac.authorization.k8s.io", None, cfg.namespace, False),
+        ("get", "secrets", None, cfg.system_namespace, False),
     ]
     failures = []
     for verb, resource, sub, ns, want in expect:

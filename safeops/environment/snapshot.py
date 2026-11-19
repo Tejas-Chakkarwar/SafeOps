@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from fractions import Fraction
 
@@ -212,9 +213,13 @@ def configmap(obj: dict, approved_keys: dict | None) -> dict:
         if "hard_range" in rule:
             raw = data.get(key)
             try:
-                numeric[key] = float(raw) if raw is not None else None
+                value = float(raw) if raw is not None else None
             except ValueError:
-                numeric[key] = f"unparseable:{raw}"
+                value = f"unparseable:{raw}"
+            if isinstance(value, float) and not math.isfinite(value):
+                # NaN != NaN would make identical states diff (review L1); keep it as text.
+                value = f"non-finite:{raw}"
+            numeric[key] = value
     return {
         "approved_keys_sha256": hashlib.sha256(
             json.dumps(present, sort_keys=True).encode()

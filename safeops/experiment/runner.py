@@ -80,9 +80,17 @@ class ExperimentRunner:
     def run(self, unit: RunUnit) -> None:
         env = self.environment
 
-        # Pre-run. A failure here is discardable (§7.1, §11.1).
-        env.reset_environment()
-        self._require_pre_run_clean(env.verify_clean_state())
+        if self._halt is not None:  # a failed quarantine halted this worker (review L2)
+            raise self._halt
+
+        # Pre-run. A failure here is discardable (§7.1, §11.1). A reset that fails outright
+        # counts as a dirty environment: quarantine, then discard (review M2).
+        try:
+            env.reset_environment()
+            pre_clean = env.verify_clean_state()
+        except CommandError as exc:
+            pre_clean = CleanStateResult(False, (f"pre-run reset failed: {exc}",))
+        self._require_pre_run_clean(pre_clean)
         self.workload.start_workload()
         steady_state = self.workload.verify_steady_state()
         self._require_steady_state(steady_state)
@@ -197,8 +205,12 @@ class ExperimentRunner:
             self.environment.quarantine_and_rebuild(
                 reason="post-run: " + "; ".join(clean_state.problems[:10])
             )
-        except QuarantineFailed as exc:
-            self._halt = exc
+        except Exception as exc:  # anything at all: the record is written first (review M3)
+            self._halt = (
+                exc
+                if isinstance(exc, QuarantineFailed)
+                else QuarantineFailed(f"quarantine failed: {type(exc).__name__}: {exc}")
+            )
         return False
 
 

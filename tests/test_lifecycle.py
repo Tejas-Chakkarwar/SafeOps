@@ -108,7 +108,11 @@ def test_reset_order_chaos_first_then_extraneous_then_app_tier_recreated(tmp_pat
     assert ("delete", "PersistentVolumeClaim", "stray-claim") in ops
     assert ("delete", "ConfigMap", "kube-root-ca.crt") not in ops  # auto-created, kept
     assert ("delete", "PersistentVolumeClaim", "data-postgres-0") not in ops  # data never touched
-    assert not [o for o in ops if o[1] == "StatefulSet"]  # unchanged -> left alone
+    assert (
+        "replace",
+        "StatefulSet",
+        "postgres",
+    ) in ops  # always PUT; no-op if unchanged (M3 review L5)
     app = [
         (o["kind"], o["metadata"]["name"])
         for o in desired
@@ -208,7 +212,7 @@ def test_verify_fails_closed_when_cluster_reads_fail(tmp_path) -> None:
 
     env.capture_snapshot = broken
     result = env.verify_clean_state()
-    assert not result.clean and "could not be read" in result.problems[0]
+    assert not result.clean and "fail closed" in result.problems[0]
 
 
 def test_verify_flags_unstable_testbed(tmp_path) -> None:

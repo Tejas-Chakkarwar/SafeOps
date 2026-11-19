@@ -196,6 +196,138 @@ def test_real_network_chaos_is_cleared_by_reset(env) -> None:
     assert after.clean, after.problems
 
 
+# --- Milestone 3 review H1: nothing in the testbed is invisible to verify ---
+
+
+def test_stray_objects_are_seen_and_config_ones_removed_by_reset(env) -> None:
+    admin(
+        "apply",
+        "-f",
+        "-",
+        stdin=(
+            "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
+            f"metadata: {{name: m3r-deny-orders, namespace: {NS}}}\n"
+            "spec: {podSelector: {matchLabels: {app: orders}}, policyTypes: [Ingress]}\n"
+        ),
+    )
+    admin("create", "quota", "m3r-quota", "-n", NS, "--hard=pods=50")
+    admin("create", "serviceaccount", "m3r-sa", "-n", NS)
+    admin(
+        "run",
+        "m3r-bare",
+        "-n",
+        NS,
+        "--image=busybox:1.36",
+        "--restart=Never",
+        "--labels=app=m3r",
+        "--command",
+        "--",
+        "sleep",
+        "600",
+    )
+    try:
+        result = env.verify_clean_state()
+        text = "\n".join(result.problems)
+        for expected in [
+            "NetworkPolicy/m3r-deny-orders",
+            "ResourceQuota/m3r-quota",
+            "ServiceAccount/m3r-sa",
+            "Pod/m3r-bare",
+        ]:
+            assert f"{expected}: unexpected object in the testbed" in text, text
+        env.reset_environment()
+        after = env.verify_clean_state()
+        assert [p for p in after.problems if "unexpected" in p] == [
+            "Pod/m3r-bare: unexpected object in the testbed"
+        ]  # pods are left to quarantine
+    finally:
+        admin("delete", "pod", "m3r-bare", "-n", NS, "--ignore-not-found", "--wait=true")
+    assert env.verify_clean_state().clean
+
+
+# --- Milestone 3 review H2: no privileged pods in the testbed ---
+
+PRIVILEGED_POD = (
+    "apiVersion: v1\nkind: Pod\n"
+    f"metadata: {{name: m3r-escape, namespace: {NS}}}\n"
+    "spec:\n  hostPID: true\n  hostNetwork: true\n"
+    "  containers: [{name: c, image: busybox:1.36, securityContext: {privileged: true},\n"
+    "                volumeMounts: [{name: root, mountPath: /host}]}]\n"
+    "  volumes: [{name: root, hostPath: {path: /}}]\n"
+)
+
+
+def test_pod_security_rejects_privileged_pods_even_for_admin() -> None:
+    proc = subprocess.run(
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(CFG.kubeconfig_path),
+            "--context",
+            CFG.kube_context,
+            "create",
+            "--dry-run=server",
+            "-f",
+            "-",
+        ],
+        input=PRIVILEGED_POD,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode != 0 and "violates PodSecurity" in proc.stderr, proc.stderr
+
+
+def test_harness_cannot_get_a_privileged_pod_through_a_deployment() -> None:
+    """The harness may create Deployments, but their pods are admitted under baseline."""
+    deploy = (
+        "apiVersion: apps/v1\nkind: Deployment\n"
+        f"metadata: {{name: m3r-escape, namespace: {NS}}}\n"
+        "spec:\n  selector: {matchLabels: {app: m3r-escape}}\n  template:\n"
+        "    metadata: {labels: {app: m3r-escape}}\n"
+        "    spec:\n      hostPID: true\n"
+        "      containers: [{name: c, image: busybox:1.36, securityContext: {privileged: true}}]\n"
+    )
+    proc = subprocess.run(
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(CFG.harness_kubeconfig_path),
+            "--context",
+            CFG.kube_context,
+            "create",
+            "--dry-run=server",
+            "-f",
+            "-",
+        ],
+        input=deploy,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert "would violate PodSecurity" in proc.stderr, proc.stderr
+
+
+# --- Milestone 3 review L5: reset replaces Postgres every time, and that's a no-op ---
+
+
+def test_statefulset_replace_is_a_no_op_when_nothing_drifted(env) -> None:
+    def sts():
+        return json.loads(admin("get", "statefulset", "postgres", "-n", NS, "-o", "json"))
+
+    def pod_uid():
+        return json.loads(admin("get", "pod", "postgres-0", "-n", NS, "-o", "json"))["metadata"][
+            "uid"
+        ]
+
+    gen, uid = sts()["metadata"]["generation"], pod_uid()
+    env.reset_environment()
+    assert sts()["metadata"]["generation"] == gen and pod_uid() == uid  # no rollout, no restart
+    assert env.verify_clean_state().clean
+
+
 # --- reset -> verify passes 10 times in a row ---
 
 

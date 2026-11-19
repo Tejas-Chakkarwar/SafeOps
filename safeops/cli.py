@@ -197,6 +197,19 @@ def verify() -> None:
     _report("verify", result)
 
 
+@app.command("quarantine-clear")
+def quarantine_clear() -> None:
+    """Lift a quarantine after fixing its cause. Only if the environment verifies clean now."""
+    from safeops.environment.manager import EnvironmentManager
+
+    try:
+        result = EnvironmentManager().clear_quarantine()
+    except _cluster_errors() as exc:
+        _fail("quarantine-clear", str(exc), EXIT_CLUSTER)
+    _report("quarantine-clear", result)
+    typer.echo("safeops quarantine-clear: quarantine lifted")
+
+
 @app.command()
 def reset(
     times: Annotated[

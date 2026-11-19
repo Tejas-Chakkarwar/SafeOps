@@ -43,6 +43,77 @@ class CleanStateResult:
     problems: tuple[str, ...] = ()
 
 
+# Inventory of every other namespaced kind the testbed could hold (Milestone 3 review, H1).
+# The snapshot covers the five projected kinds; this covers the rest, so an object nobody
+# expects (a NetworkPolicy that breaks the app, a quota, a bare pod) is never invisible.
+# resource -> (kind, reset deletes unexpected ones?). Kinds reset may not delete (pods,
+# controller-made objects, RBAC) are flagged by verify, which leads to quarantine.
+# Secrets are deliberately absent: no SafeOps identity reads Secrets (residual, 0013).
+INVENTORY = {
+    "pods": ("Pod", False),
+    "replicasets.apps": ("ReplicaSet", False),
+    "controllerrevisions.apps": ("ControllerRevision", False),
+    "serviceaccounts": ("ServiceAccount", True),
+    "networkpolicies.networking.k8s.io": ("NetworkPolicy", True),
+    "resourcequotas": ("ResourceQuota", True),
+    "limitranges": ("LimitRange", True),
+    "horizontalpodautoscalers.autoscaling": ("HorizontalPodAutoscaler", True),
+    "poddisruptionbudgets.policy": ("PodDisruptionBudget", True),
+    "jobs.batch": ("Job", True),
+    "cronjobs.batch": ("CronJob", True),
+    "ingresses.networking.k8s.io": ("Ingress", True),
+    "roles.rbac.authorization.k8s.io": ("Role", False),
+    "rolebindings.rbac.authorization.k8s.io": ("RoleBinding", False),
+}
+
+
+def _controller(obj: dict) -> tuple[str, str] | None:
+    ref = next(
+        (r for r in obj["metadata"].get("ownerReferences") or [] if r.get("controller")), None
+    )
+    return (ref["kind"], ref["name"]) if ref else None
+
+
+def unexpected_objects(
+    items: dict[str, list[dict]],
+    deployments: set[str],
+    statefulsets: set[str],
+    rbac: set[tuple[str, str]],
+) -> list[tuple[str, str, str, bool]]:
+    """(resource, kind, name, deletable_by_reset) for every inventoried object that the
+    desired state doesn't account for. Pure, for tests.
+
+    Expected: pods owned (via their ReplicaSet) by a desired Deployment or by a desired
+    StatefulSet; ReplicaSets and ControllerRevisions owned by desired workloads; the
+    `default` ServiceAccount; and the RBAC objects SafeOps itself creates in the testbed.
+    Nothing else of these kinds belongs in the testbed.
+    """
+    rs_owner = {rs["metadata"]["name"]: _controller(rs) for rs in items.get("replicasets.apps", [])}
+    out = []
+    for resource, (kind, deletable) in INVENTORY.items():
+        for obj in items.get(resource, []):
+            name, ctrl = obj["metadata"]["name"], _controller(obj)
+            if kind == "Pod":
+                if ctrl and ctrl[0] == "ReplicaSet":
+                    ctrl = rs_owner.get(ctrl[1])
+                ok = ctrl in {("Deployment", d) for d in deployments} | {
+                    ("StatefulSet", s) for s in statefulsets
+                }
+            elif kind == "ReplicaSet":
+                ok = ctrl in {("Deployment", d) for d in deployments}
+            elif kind == "ControllerRevision":
+                ok = ctrl in {("StatefulSet", s) for s in statefulsets}
+            elif kind == "ServiceAccount":
+                ok = name == "default"
+            elif kind in ("Role", "RoleBinding"):
+                ok = (kind, name) in rbac
+            else:
+                ok = False
+            if not ok:
+                out.append((resource, kind, name, deletable))
+    return out
+
+
 def _ready(pod: dict) -> bool:
     if pod["metadata"].get("deletionTimestamp"):
         return False
@@ -189,6 +260,29 @@ class EnvironmentManager:
             for o in manifests.load_objects(f, values)
         ]
 
+    def _rbac_allowlist(self) -> set[tuple[str, str]]:
+        """RBAC objects SafeOps itself creates in the testbed namespace (system manifests)."""
+        from safeops import manifests
+
+        values = manifests.template_values(self.cfg, manifests.image_refs())
+        return {
+            (o["kind"], o["metadata"]["name"])
+            for f in manifests.manifest_files("system")
+            for o in manifests.load_objects(f, values)
+            if o["kind"] in ("Role", "RoleBinding")
+            and o["metadata"].get("namespace") == self.cfg.namespace
+        }
+
+    def _unexpected(self, desired: list[dict] | None = None) -> list[tuple[str, str, str, bool]]:
+        desired = desired if desired is not None else self._desired_objects()
+        items = {resource: self._items(resource) for resource in INVENTORY}
+        return unexpected_objects(
+            items,
+            {o["metadata"]["name"] for o in desired if o["kind"] == "Deployment"},
+            {o["metadata"]["name"] for o in desired if o["kind"] == "StatefulSet"},
+            self._rbac_allowlist(),
+        )
+
     def capture_snapshot(self):
         """Canonical semantic projection of the testbed (§11.1). Never a raw object dump."""
         from safeops.environment import snapshot
@@ -229,10 +323,16 @@ class EnvironmentManager:
         """Restore the testbed namespace to config/desired_state.yaml (decision 0013).
 
         1. Delete every Chaos Mesh object in the testbed, and wait until it's gone.
-        2. Delete every projected-kind object the desired state doesn't contain.
+        2. Delete every projected-kind object the desired state doesn't contain, and every
+           unexpected object of the deletable inventory kinds (NetworkPolicies, quotas,
+           LimitRanges, HPAs, PDBs, Jobs, CronJobs, Ingresses, extra ServiceAccounts).
+           Unexpected pods, ReplicaSets, ControllerRevisions and RBAC objects aren't
+           deleted here: verify flags them, which leads to quarantine.
         3. Recreate the app tier (Deployments, Services, ConfigMaps) from the desired
            manifests, so revision history restarts at 1 every run.
-        4. Postgres: replace the StatefulSet only if it drifted; never touch its PVC or data.
+        4. Postgres: replace (PUT) the StatefulSet with its desired spec every time. That's
+           a no-op when nothing changed, and it removes unprojected drift too. Its PVC and
+           data are never touched.
         5. Wait for the stabilization window.
 
         verify_clean_state() then checks the result independently. Reset never inspects
@@ -247,6 +347,9 @@ class EnvironmentManager:
             k.delete(resource, kind, name, ns)
 
         desired = self._desired_objects()
+        for resource, kind, name, deletable in self._unexpected(desired):
+            if deletable:
+                k.delete(resource, kind, name, ns)
         desired_keys = {(o["kind"], o["metadata"]["name"]) for o in desired}
         expected_pvcs = {
             f"{t['metadata']['name']}-{o['metadata']['name']}-{i}"
@@ -284,8 +387,8 @@ class EnvironmentManager:
             )
             if current is None:
                 k.create([obj])
-            elif snapshot.statefulset(current) != snapshot.statefulset(obj):
-                k.replace([obj])
+            else:
+                k.replace([obj])  # unconditional: unprojected drift goes too (review L5)
 
         self.wait_stabilization_window()
 
@@ -299,7 +402,7 @@ class EnvironmentManager:
         as dirty (fail closed). Guard and credential errors propagate: they're
         misconfiguration, not a dirty environment.
         """
-        from safeops.cluster import CommandError
+        from safeops.cluster import CredentialError, GuardError
         from safeops.environment import snapshot
         from safeops.environment.desired import load_desired_state
         from safeops.environment.node import NodeCheckError
@@ -316,12 +419,23 @@ class EnvironmentManager:
                 f"{kind}/{name} ({resource}) still present"
                 for resource, kind, name in self._chaos_objects()
             ]
-        except CommandError as exc:
-            problems.append(f"cluster state could not be read: {exc}")
+            problems += [
+                f"{kind}/{name}: unexpected object in the testbed"
+                for _, kind, name, _ in self._unexpected()
+            ]
+        except (GuardError, CredentialError):
+            raise
+        except Exception as exc:  # fail closed: anything that can't be evaluated is dirty
+            problems.append(
+                f"cluster state could not be evaluated (fail closed): {type(exc).__name__}: {exc}"
+            )
         try:
             problems += self._nodes().residue()
-        except NodeCheckError as exc:
-            problems.append(f"node-level check could not run (fail closed): {exc}")
+        except (GuardError, CredentialError):
+            raise
+        except Exception as exc:
+            kind = "" if isinstance(exc, NodeCheckError) else f"{type(exc).__name__}: "
+            problems.append(f"node-level check could not run (fail closed): {kind}{exc}")
         return CleanStateResult(clean=not problems, problems=tuple(problems))
 
     # --- quarantine ----------------------------------------------------------------------
@@ -330,9 +444,14 @@ class EnvironmentManager:
         """Recreate the cluster through the real entry points (decision 0006): never
         hand-patched, and never a wider guard."""
         for command in ("down", "up"):
-            proc = subprocess.run(
-                [sys.executable, "-m", "safeops.bootstrap", command], check=False, timeout=1800
-            )
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "safeops.bootstrap", command], check=False, timeout=1800
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise QuarantineFailed(
+                    f"cluster-{command} did not finish during quarantine rebuild: {exc}"
+                ) from exc
             if proc.returncode != 0:
                 raise QuarantineFailed(f"cluster-{command} failed during quarantine rebuild")
 
@@ -352,7 +471,12 @@ class EnvironmentManager:
                 }
             )
         )
-        (self._rebuild or self._default_rebuild)()
+        try:
+            (self._rebuild or self._default_rebuild)()
+        except QuarantineFailed:
+            raise
+        except Exception as exc:  # any rebuild failure halts the worker, marker kept
+            raise QuarantineFailed(f"rebuild failed: {type(exc).__name__}: {exc}") from exc
         # The rebuild issued new credentials: drop clients built from the old ones (never
         # ones a caller injected).
         if not self._injected[0]:
@@ -365,3 +489,11 @@ class EnvironmentManager:
                 "rebuilt environment is still not clean: " + "; ".join(result.problems[:10])
             )
         self._marker.unlink()
+
+    def clear_quarantine(self) -> CleanStateResult:
+        """Lift a quarantine after an operator has fixed the cause (review L4). The marker is
+        removed only if the environment verifies clean right now."""
+        result = self.verify_clean_state()
+        if result.clean:
+            self._marker.unlink(missing_ok=True)
+        return result

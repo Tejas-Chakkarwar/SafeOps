@@ -16,13 +16,22 @@ from collections.abc import Callable
 RESIDUE_QDISCS = ("netem", "tbf")
 RESIDUE_PROCESSES = ("stress-ng", "memStress")
 
-# One representative pid per distinct network namespace, then every qdisc in each. Fixed
-# text: nothing from the caller is interpolated into it.
+# Every network namespace on the node: one representative pid per distinct /proc netns,
+# plus every namespace pinned under /var/run/netns, even one with no process left in it
+# (review L3). Then every qdisc in each, deduplicated. Fixed text: nothing from the caller
+# is interpolated into it.
 _QDISC_SCRIPT = r"""
+{
 for q in /proc/[0-9]*; do n=$(readlink "$q/ns/net" 2>/dev/null) && echo "$n ${q#/proc/}"; done \
   | sort -u -k1,1 | while read -r ns pid; do
       nsenter -t "$pid" -n tc qdisc show 2>/dev/null | sed "s|^|$ns |"
     done
+for f in /var/run/netns/*; do
+  [ -e "$f" ] || continue
+  ino=$(stat -L -c %i "$f" 2>/dev/null) || continue
+  nsenter --net="$f" tc qdisc show 2>/dev/null | sed "s|^|net:[$ino] |"
+done
+} | sort -u
 """
 _PROCESS_SCRIPT = "ps -eo pid=,comm=,args="
 
