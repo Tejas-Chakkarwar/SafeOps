@@ -44,8 +44,8 @@ class Stage:
         return stub_milestone(getattr(self.owner, self.method))
 
 
-_VALID = "valid_action only"
-_EXECUTE = "gate = execute only"
+VALID_ONLY = "valid_action only"
+EXECUTE_ONLY = "gate = execute only"
 
 RUN_SEQUENCE: tuple[Stage, ...] = (
     Stage("reset environment", EnvironmentManager, "reset_environment"),
@@ -64,12 +64,12 @@ RUN_SEQUENCE: tuple[Stage, ...] = (
     Stage("agent investigates", Agent, "investigate"),
     Stage("parse proposal", ProposalParser, "parse"),
     Stage("route on proposal_status", ExperimentRunner, "_gate_eligible_action"),
-    Stage("extract frozen feature vector", RiskFeatureExtractor, "extract", _VALID),
-    Stage("score shadow gates", ShadowGateScorer, "score", _VALID),
-    Stage("gate decides", AlwaysActGate, "decide", _VALID),
-    Stage("route on gate decision", ExperimentRunner, "_should_execute", _VALID),
-    Stage("execute action", ActionExecutor, "apply", _EXECUTE),
-    Stage("determine executed action", ExperimentRunner, "_executed_action", _EXECUTE),
+    Stage("extract frozen feature vector", RiskFeatureExtractor, "extract", VALID_ONLY),
+    Stage("score shadow gates", ShadowGateScorer, "score", VALID_ONLY),
+    Stage("gate decides", AlwaysActGate, "decide", VALID_ONLY),
+    Stage("route on gate decision", ExperimentRunner, "_should_execute", VALID_ONLY),
+    Stage("execute action", ActionExecutor, "apply", EXECUTE_ONLY),
+    Stage("determine executed action", ExperimentRunner, "_executed_action", EXECUTE_ONLY),
     Stage("wait stabilization window", EnvironmentManager, "wait_stabilization_window"),
     Stage("capture post-action snapshot", EnvironmentManager, "capture_snapshot"),
     Stage("verify effectiveness", EffectivenessVerifier, "verify"),
@@ -114,5 +114,9 @@ def render_dry_run(sequence: tuple[Stage, ...] = RUN_SEQUENCE) -> str:
         f"{len(sequence)} stages: {len(sequence) - stubs} implemented, {stubs} stubs.",
     ]
     if first is not None:
-        lines.append(f"A real run stops first at {first.qualname} (Milestone {first.milestone}).")
+        # Sequence order, not "where a real run stops": a stub inside a branch
+        # ("when" column) is only reached on runs that take that branch.
+        lines.append(
+            f"First stub in sequence order: {first.qualname} (Milestone {first.milestone})."
+        )
     return "\n".join(lines)

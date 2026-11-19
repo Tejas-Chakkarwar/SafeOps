@@ -9,6 +9,7 @@ poison every result -- not stubs that refuse to run.
 from __future__ import annotations
 
 import functools
+import inspect
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -38,8 +39,14 @@ def stub(milestone: int) -> Callable[[F], F]:
         )
 
     def decorate(fn: F) -> F:
+        signature = inspect.signature(fn)
+
         @functools.wraps(fn)
         def refuse(*args: Any, **kwargs: Any) -> Any:
+            # A call that doesn't match the declared signature is a wiring bug. Raise
+            # TypeError for it, the way a real implementation would, instead of hiding it
+            # behind "not implemented yet".
+            signature.bind(*args, **kwargs)
             raise NotImplementedStage(fn.__qualname__, milestone)
 
         setattr(refuse, _MARKER, milestone)

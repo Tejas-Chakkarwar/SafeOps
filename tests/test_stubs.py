@@ -22,6 +22,17 @@ def test_stub_refuses_loudly_never_returns() -> None:
     assert str(exc.value) == "Example.check is not implemented yet (Milestone 7)"
 
 
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [((), {}), ((1, 2), {}), ((), {"y": 1})],
+    ids=["too-few", "too-many", "unknown-keyword"],
+)
+def test_stub_rejects_wrong_call_signature(args: tuple, kwargs: dict) -> None:
+    """A wiring bug must surface as TypeError now, not hide behind 'not implemented'."""
+    with pytest.raises(TypeError):
+        Example().check(*args, **kwargs)
+
+
 def test_stub_marker_distinguishes_stub_from_implemented() -> None:
     assert stub_milestone(Example.check) == 7
     assert stub_milestone(Example.implemented) is None

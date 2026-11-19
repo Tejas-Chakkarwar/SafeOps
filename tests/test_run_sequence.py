@@ -1,29 +1,44 @@
-"""RUN_SEQUENCE (the dry-run listing) must match what ExperimentRunner.run actually calls."""
+"""RUN_SEQUENCE (the dry-run listing) must match what ExperimentRunner.run actually calls,
+on every branch, with every call matching the callee's declared signature.
+"""
 
 from __future__ import annotations
+
+import inspect
+import typing
 
 import pytest
 
 from safeops.experiment.runner import ExperimentRunner, RunUnit, build_runner
-from safeops.experiment.sequence import RUN_SEQUENCE, first_stub
+from safeops.experiment.sequence import EXECUTE_ONLY, RUN_SEQUENCE, VALID_ONLY, first_stub
 from safeops.stubs import NotImplementedStage
 
 UNIT = RunUnit(fault_id="bad-deployment-config", fault_seed=0, trial_index=0)
 
+# Constructor argument -> component class, taken from the real type hints.
+COMPONENTS = {
+    name: cls
+    for name, cls in typing.get_type_hints(ExperimentRunner.__init__).items()
+    if name != "return"
+}
+
 
 class _Recorder:
-    """Component doubles that record (Owner, method) and return opaque sentinels."""
+    """Records (Owner, method) calls and checks each call against the real signature."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
-    def double(self, owner: str) -> object:
+    def double(self, owner: type) -> object:
         recorder = self
 
         class Double:
             def __getattr__(self, method: str):
+                real = getattr(owner, method)  # AttributeError if the method doesn't exist
+
                 def call(*args, **kwargs):
-                    recorder.calls.append((owner, method))
+                    inspect.signature(real).bind(None, *args, **kwargs)  # TypeError on mismatch
+                    recorder.calls.append((owner.__name__, method))
                     return (object(), object()) if method == "investigate" else object()
 
                 return call
@@ -31,11 +46,14 @@ class _Recorder:
         return Double()
 
 
-def _traced_runner(recorder: _Recorder) -> ExperimentRunner:
-    """Runner whose hooks record and take the full path (valid_action, execute)."""
+def _traced_runner(recorder: _Recorder, *, eligible: bool, execute: bool) -> ExperimentRunner:
+    """Runner whose hooks record their calls and steer which branch the run takes."""
 
     def hook(name: str, result):
+        real = getattr(ExperimentRunner, name)
+
         def method(self, *args, **kwargs):
+            inspect.signature(real).bind(self, *args, **kwargs)
             recorder.calls.append(("ExperimentRunner", name))
             return result
 
@@ -46,8 +64,8 @@ def _traced_runner(recorder: _Recorder) -> ExperimentRunner:
         "_require_steady_state": None,
         "_require_fault_present": None,
         "_runtime_context": object(),
-        "_gate_eligible_action": object(),
-        "_should_execute": True,
+        "_gate_eligible_action": object() if eligible else None,
+        "_should_execute": execute,
         "_executed_action": object(),
         "_post_run_clean": True,
     }
@@ -56,28 +74,28 @@ def _traced_runner(recorder: _Recorder) -> ExperimentRunner:
         (ExperimentRunner,),
         {name: hook(name, result) for name, result in hooks.items()},
     )
-    components = {
-        "environment": "EnvironmentManager",
-        "workload": "WorkloadGenerator",
-        "injector": "FaultInjector",
-        "alerts": "AlertGenerator",
-        "agent": "Agent",
-        "parser": "ProposalParser",
-        "extractor": "RiskFeatureExtractor",
-        "shadow_gates": "ShadowGateScorer",
-        "gate": "AlwaysActGate",
-        "executor": "ActionExecutor",
-        "effectiveness": "EffectivenessVerifier",
-        "harm": "HarmChecker",
-        "records": "RunRecordWriter",
-    }
-    return traced(**{arg: recorder.double(owner) for arg, owner in components.items()})
+    return traced(**{arg: recorder.double(cls) for arg, cls in COMPONENTS.items()})
 
 
-def test_sequence_matches_runner_call_order() -> None:
+PATHS = {
+    "valid_action-and-execute": (True, True, set()),
+    "valid_action-and-escalate": (True, False, {EXECUTE_ONLY}),
+    "not-gate-eligible": (False, False, {VALID_ONLY, EXECUTE_ONLY}),
+}
+
+
+@pytest.mark.parametrize(("eligible", "execute", "skipped"), PATHS.values(), ids=PATHS.keys())
+def test_sequence_matches_runner_on_every_path(
+    eligible: bool, execute: bool, skipped: set[str]
+) -> None:
     recorder = _Recorder()
-    _traced_runner(recorder).run(UNIT)
-    assert recorder.calls == [(s.owner.__name__, s.method) for s in RUN_SEQUENCE]
+    _traced_runner(recorder, eligible=eligible, execute=execute).run(UNIT)
+    expected = [(s.owner.__name__, s.method) for s in RUN_SEQUENCE if s.when not in skipped]
+    assert recorder.calls == expected
+
+
+def test_branch_labels_are_known() -> None:
+    assert {s.when for s in RUN_SEQUENCE} == {"", VALID_ONLY, EXECUTE_ONLY}
 
 
 def test_every_stage_resolves_to_a_real_method() -> None:

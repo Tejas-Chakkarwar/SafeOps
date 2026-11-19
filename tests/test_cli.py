@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -56,7 +57,45 @@ def test_dry_run_lists_every_stage_and_runs_nothing(monkeypatch: pytest.MonkeyPa
     for stage in RUN_SEQUENCE:
         assert stage.qualname in result.stdout
     assert f"{len(RUN_SEQUENCE)} stages" in result.stdout
-    assert "stops first at EnvironmentManager.reset_environment (Milestone 3)" in result.stdout
+    assert (
+        "First stub in sequence order: EnvironmentManager.reset_environment (Milestone 3)."
+        in result.stdout
+    )
+
+
+# Libraries whose import could open a cluster or provider connection. The dry-run must not
+# load them at all. Run in a fresh interpreter, because this test process may already
+# have imported them through other tests.
+_CLIENT_LIBRARIES = (
+    "kubernetes",
+    "prometheus_api_client",
+    "anthropic",
+    "openai",
+    "httpx",
+    "requests",
+    "urllib3",
+)
+_DRY_RUN_PROBE = f"""
+import sys
+from typer.testing import CliRunner
+from safeops.cli import app
+result = CliRunner().invoke(app, ["run", "--dry-run"])
+assert result.exit_code == 0, result.output
+loaded = sorted(m for m in sys.modules if m.split(".")[0] in {set(_CLIENT_LIBRARIES)!r})
+print(",".join(loaded))
+"""
+
+
+def test_dry_run_loads_no_cluster_or_provider_client() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-c", _DRY_RUN_PROBE],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", f"dry-run imported client libraries: {proc.stdout.strip()}"
 
 
 @pytest.mark.parametrize("extra", [["--fault", "x"], ["--seed", "0"], ["--trial", "0"]])

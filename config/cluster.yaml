@@ -1,6 +1,6 @@
-# SafeOps cluster identity (decision 0002). This is the single source of truth:
-# the context guard and every cluster command read these values from here.
-# Never hardcode them anywhere else.
+# SafeOps cluster identity (decision 0002). This is the single source of truth.
+# Starting at Milestone 2, the context guard and every cluster command read these
+# values from here. Nothing reads them at Milestone 1. Never hardcode them anywhere else.
 #
 # Changing this file changes the experimental condition (CLAUDE.md, config/).
 
