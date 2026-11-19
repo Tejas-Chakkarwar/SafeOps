@@ -33,6 +33,12 @@ class WorkerQuarantined(EnvironmentStateError):
     """A quarantine marker is present; this worker takes no runs until it's rebuilt."""
 
 
+class ConfigurationError(EnvironmentStateError):
+    """SafeOps' own configuration is wrong or stale: desired state, manifests, topology, or
+    images that don't match what cluster-up loaded. Never reported as a dirty environment:
+    a rebuild can't fix it (Milestone 3 second review, R1, R4)."""
+
+
 class QuarantineFailed(EnvironmentStateError):
     """The rebuild didn't produce a clean environment. The worker stays halted."""
 
@@ -62,6 +68,13 @@ INVENTORY = {
     "jobs.batch": ("Job", True),
     "cronjobs.batch": ("CronJob", True),
     "ingresses.networking.k8s.io": ("Ingress", True),
+    # second review, R3: inert kinds that create no pods could otherwise hide
+    "daemonsets.apps": ("DaemonSet", True),
+    "replicationcontrollers": ("ReplicationController", True),
+    "podtemplates": ("PodTemplate", True),
+    "leases.coordination.k8s.io": ("Lease", True),
+    # second review, R5: a hand-made slice can inject endpoints into a Service
+    "endpointslices.discovery.k8s.io": ("EndpointSlice", True),
     "roles.rbac.authorization.k8s.io": ("Role", False),
     "rolebindings.rbac.authorization.k8s.io": ("RoleBinding", False),
 }
@@ -79,13 +92,15 @@ def unexpected_objects(
     deployments: set[str],
     statefulsets: set[str],
     rbac: set[tuple[str, str]],
+    services: set[str] = frozenset(),
 ) -> list[tuple[str, str, str, bool]]:
     """(resource, kind, name, deletable_by_reset) for every inventoried object that the
     desired state doesn't account for. Pure, for tests.
 
     Expected: pods owned (via their ReplicaSet) by a desired Deployment or by a desired
     StatefulSet; ReplicaSets and ControllerRevisions owned by desired workloads; the
-    `default` ServiceAccount; and the RBAC objects SafeOps itself creates in the testbed.
+    `default` ServiceAccount; the RBAC objects SafeOps itself creates in the testbed; and
+    EndpointSlices that the endpointslice controller manages for a desired Service.
     Nothing else of these kinds belongs in the testbed.
     """
     rs_owner = {rs["metadata"]["name"]: _controller(rs) for rs in items.get("replicasets.apps", [])}
@@ -105,6 +120,8 @@ def unexpected_objects(
                 ok = ctrl in {("StatefulSet", s) for s in statefulsets}
             elif kind == "ServiceAccount":
                 ok = name == "default"
+            elif kind == "EndpointSlice":
+                ok = is_controller_slice(obj) and ctrl in {("Service", sv) for sv in services}
             elif kind in ("Role", "RoleBinding"):
                 ok = (kind, name) in rbac
             else:
@@ -112,6 +129,14 @@ def unexpected_objects(
             if not ok:
                 out.append((resource, kind, name, deletable))
     return out
+
+
+SLICE_CONTROLLER = "endpointslice-controller.k8s.io"
+
+
+def is_controller_slice(slice_: dict) -> bool:
+    labels = slice_["metadata"].get("labels") or {}
+    return labels.get("endpointslice.kubernetes.io/managed-by") == SLICE_CONTROLLER
 
 
 def _ready(pod: dict) -> bool:
@@ -154,10 +179,14 @@ def stability_problems(deployments, statefulsets, services, slices, pods) -> lis
         expected = sum(
             1 for p in pods if _ready(p) and _selects(selector, p["metadata"].get("labels"))
         )
+        # Only controller-managed slices: a hand-made one is a stray object (the inventory
+        # flags it at once), not "not yet stable", so it doesn't stall verify for the whole
+        # window (second review, R5). The snapshot still counts every slice.
         got = sum(
             1
             for sl in slices
-            if (sl["metadata"].get("labels") or {}).get("kubernetes.io/service-name") == name
+            if is_controller_slice(sl)
+            and (sl["metadata"].get("labels") or {}).get("kubernetes.io/service-name") == name
             for ep in sl.get("endpoints") or []
             if (ep.get("conditions") or {}).get("ready") is True
         )
@@ -174,6 +203,7 @@ class EnvironmentManager:
         kubectl=None,
         node=None,
         rebuild: Callable[[], None] | None = None,
+        image_check: bool = True,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         stabilization_timeout_s: float = STABILIZATION_TIMEOUT_S,
@@ -182,6 +212,7 @@ class EnvironmentManager:
         self._node = node
         self._injected = (kubectl is not None, node is not None)
         self._rebuild = rebuild
+        self._image_check = image_check
         self._clock = clock
         self._sleep = sleep
         self.stabilization_timeout_s = stabilization_timeout_s
@@ -273,15 +304,57 @@ class EnvironmentManager:
             and o["metadata"].get("namespace") == self.cfg.namespace
         }
 
-    def _unexpected(self, desired: list[dict] | None = None) -> list[tuple[str, str, str, bool]]:
-        desired = desired if desired is not None else self._desired_objects()
+    def _unexpected(self, desired: list[dict], rbac: set[tuple[str, str]]) -> list:
         items = {resource: self._items(resource) for resource in INVENTORY}
         return unexpected_objects(
             items,
             {o["metadata"]["name"] for o in desired if o["kind"] == "Deployment"},
             {o["metadata"]["name"] for o in desired if o["kind"] == "StatefulSet"},
-            self._rbac_allowlist(),
+            rbac,
+            {o["metadata"]["name"] for o in desired if o["kind"] == "Service"},
         )
+
+    def _check_images_loaded(self) -> None:
+        """The images reset will deploy must be the ones cluster-up loaded into kind.
+        Otherwise reset deploys a tag kind doesn't have, ImagePullBackOff, a 120 s timeout,
+        a dirty verify and a futile rebuild follow, with no message saying why (R4)."""
+        from safeops import manifests
+
+        record = self.cfg.state_dir / "images.json"
+        try:
+            built = json.loads(record.read_text())["built"]
+        except (OSError, ValueError, KeyError) as exc:
+            raise ConfigurationError(
+                f"no usable record of the images cluster-up loaded ({record.name});"
+                " run make cluster-up"
+            ) from exc
+        for image, ref in manifests.image_refs().items():
+            loaded = built.get(image, {}).get("ref")
+            if loaded != ref:
+                raise ConfigurationError(
+                    f"testbed source changed since cluster-up: {image} is now {ref}, but kind has"
+                    f" {loaded}; run make cluster-down && make cluster-up"
+                )
+
+    def _configuration(self) -> tuple:
+        """Everything reset and verify compare against. A failure here is misconfiguration
+        (ConfigurationError), never a dirty environment (R1)."""
+        from safeops.environment.desired import load_desired_state
+
+        try:
+            desired_state = load_desired_state()
+            desired_objects = self._desired_objects()
+            rbac = self._rbac_allowlist()
+            _ = self.topology
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            raise ConfigurationError(
+                f"SafeOps configuration could not be loaded: {type(exc).__name__}: {exc}"
+            ) from exc
+        if self._image_check:
+            self._check_images_loaded()
+        return desired_state, desired_objects, rbac
 
     def capture_snapshot(self):
         """Canonical semantic projection of the testbed (§11.1). Never a raw object dump."""
@@ -341,13 +414,13 @@ class EnvironmentManager:
         from safeops.environment import snapshot
 
         self._refuse_if_quarantined()
+        _, desired, rbac = self._configuration()  # before anything is deleted
         k, ns = self._k(), self.cfg.namespace
 
         for resource, kind, name in self._chaos_objects():
             k.delete(resource, kind, name, ns)
 
-        desired = self._desired_objects()
-        for resource, kind, name, deletable in self._unexpected(desired):
+        for resource, kind, name, deletable in self._unexpected(desired, rbac):
             if deletable:
                 k.delete(resource, kind, name, ns)
         desired_keys = {(o["kind"], o["metadata"]["name"]) for o in desired}
@@ -399,14 +472,15 @@ class EnvironmentManager:
 
         Includes node-level residue (decision 0012): a fault-backend side effect left
         behind is dirty even with no Chaos CR present. Any check that can't run counts
-        as dirty (fail closed). Guard and credential errors propagate: they're
-        misconfiguration, not a dirty environment.
+        as dirty (fail closed). Guard, credential and configuration errors propagate
+        instead: they're misconfiguration, which a rebuild can't fix, not a dirty
+        environment.
         """
         from safeops.cluster import CredentialError, GuardError
         from safeops.environment import snapshot
-        from safeops.environment.desired import load_desired_state
         from safeops.environment.node import NodeCheckError
 
+        desired_state, desired_objects, rbac = self._configuration()  # raises, never "dirty"
         problems: list[str] = []
         try:
             if not self.wait_stabilization_window():
@@ -414,14 +488,14 @@ class EnvironmentManager:
                     "testbed not stable within the stabilization window: "
                     + "; ".join(getattr(self, "last_stability_problems", [])[:5])
                 )
-            problems += snapshot.diff(load_desired_state(), self.capture_snapshot())
+            problems += snapshot.diff(desired_state, self.capture_snapshot())
             problems += [
                 f"{kind}/{name} ({resource}) still present"
                 for resource, kind, name in self._chaos_objects()
             ]
             problems += [
                 f"{kind}/{name}: unexpected object in the testbed"
-                for _, kind, name, _ in self._unexpected()
+                for _, kind, name, _ in self._unexpected(desired_objects, rbac)
             ]
         except (GuardError, CredentialError):
             raise

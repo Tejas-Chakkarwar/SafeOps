@@ -328,6 +328,33 @@ def test_statefulset_replace_is_a_no_op_when_nothing_drifted(env) -> None:
     assert env.verify_clean_state().clean
 
 
+# --- Milestone 3 second review R5: an injected EndpointSlice is a stray, found fast ---
+
+
+def test_injected_endpoint_slice_is_flagged_quickly_and_removed_by_reset(env) -> None:
+    admin(
+        "apply",
+        "-f",
+        "-",
+        stdin=(
+            "apiVersion: discovery.k8s.io/v1\nkind: EndpointSlice\n"
+            f"metadata: {{name: m3r2-inject, namespace: {NS},\n"
+            "  labels: {kubernetes.io/service-name: orders-svc}}\n"
+            "addressType: IPv4\n"
+            "endpoints: [{addresses: ['10.0.0.99'], conditions: {ready: true}}]\n"
+            "ports: [{name: http, port: 8080, protocol: TCP}]\n"
+        ),
+    )
+    started = time.monotonic()
+    result = env.verify_clean_state()
+    took = time.monotonic() - started
+    assert "EndpointSlice/m3r2-inject: unexpected object in the testbed" in result.problems
+    assert took < 60, f"verify stalled {took:.0f}s on a hand-made slice"
+    env.reset_environment()
+    after = env.verify_clean_state()
+    assert after.clean, after.problems
+
+
 # --- reset -> verify passes 10 times in a row ---
 
 

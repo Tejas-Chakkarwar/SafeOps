@@ -78,7 +78,9 @@ class FakeKubectl:
 
 
 def _env(tmp_path, kubectl=None, node=None, rebuild=None) -> EnvironmentManager:
-    env = EnvironmentManager(kubectl=kubectl, node=node, rebuild=rebuild, sleep=lambda s: None)
+    env = EnvironmentManager(
+        kubectl=kubectl, node=node, rebuild=rebuild, sleep=lambda s: None, image_check=False
+    )
     env._cfg = _cfg(tmp_path)
     return env
 

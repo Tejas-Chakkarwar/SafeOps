@@ -139,3 +139,24 @@ The post-fault snapshot is the harm baseline, so a fault that triggers a rollout
 - **Option B:** declare in each fault spec whether its post-fault state is expected to stabilize.
 
 Not changed here.
+
+## Amendment, 2026-11-19: Milestone 3 second review
+
+The regression tests are in the "second review" section of `tests/test_m3_review.py`, plus a live test for R5.
+
+- **R1: configuration errors are not dirt.**
+  - The first review's fail-closed fix also caught SafeOps' *own* misconfiguration: a stale or unreadable `desired_state.yaml`, a manifest render error, a topology error. It reported them as a dirty environment, so a pre-run verify triggered a quarantine rebuild that couldn't fix them.
+  - `_configuration()` now loads everything reset and verify compare against *before* the fail-closed block, and raises `ConfigurationError` on failure. Configuration, guard and credential errors propagate. Only failures in reading or evaluating the *cluster* are reported as dirty.
+- **R2: any post-run failure keeps the run.** Before, the post-run reset and verify caught only `CommandError`, so, for example, a harness token expiring mid-run lost the completed run's record. Any exception there is now a dirty result: the record is written, then quarantine runs. Quarantine's rebuild issues a fresh token, which also repairs that case.
+- **R3: inert kinds are inventoried too.**
+  - Added: DaemonSets, ReplicationControllers, PodTemplates and Leases, all deletable by reset.
+  - An inert DaemonSet had been caught only indirectly, through its ControllerRevision. A zero-replica ReplicationController would have been invisible.
+  - **Exact coverage claim:** the inventory covers the kinds listed in `INVENTORY`, plus the five projected kinds and Chaos Mesh objects. Not Secrets, by design, and not Events or the legacy `Endpoints` objects that controllers derive from Services.
+- **R4: stale images are named, not discovered.**
+  - Reset and verify now check that the images reset would deploy (the content tags from the current source) are the ones `cluster-up` loaded, according to `.safeops/images.json`. A mismatch raises `ConfigurationError("testbed source changed since cluster-up … run make cluster-down && make cluster-up")`.
+  - Before this, a testbed source edit led to ImagePullBackOff, a 120 s timeout, a dirty verify and a full rebuild, with no message saying why.
+  - Tests that use fakes pass `image_check=False`.
+- **R5: hand-made EndpointSlices.**
+  - An EndpointSlice injected into `orders-svc` was detected, but the stabilization check treated it as "not yet stable", so every verify waited the full window (125 s measured). Reset also couldn't remove it.
+  - EndpointSlices are now inventoried. Expected slices are the ones managed by `endpointslice-controller.k8s.io` and owned by a desired Service; anything else is a stray that reset deletes (the harness gained `delete` on endpointslices).
+  - Stabilization counts only controller-managed slices, so a stray is reported at once instead of stalling verify. The snapshot still counts *every* slice, because an injected endpoint is exactly the harm signal it exists to catch.

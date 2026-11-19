@@ -126,8 +126,10 @@ class ExperimentRunner:
         try:
             env.reset_environment()
             post_clean = env.verify_clean_state()
-        except CommandError as exc:  # infrastructure failure during reset: keep the run
-            post_clean = CleanStateResult(False, (f"post-run reset failed: {exc}",))
+        except Exception as exc:  # any failure here (even an expired credential, R2): keep the run
+            post_clean = CleanStateResult(
+                False, (f"post-run reset failed: {type(exc).__name__}: {exc}",)
+            )
         reset_verified = self._post_run_clean(post_clean)
         self.records.finalize(
             unit=unit,

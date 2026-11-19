@@ -56,7 +56,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "delete"]  # delete: hand-made slices only (second review, R5)
   - apiGroups: ["chaos-mesh.org"]
     resources: ["*"]
     verbs: ["get", "list", "watch", "delete"]  # reset removes chaos; injecting it is Milestone 4
@@ -76,6 +76,16 @@ rules:
     verbs: ["get", "list", "watch", "delete"]
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "delete"]
+  # second review, R3: inert kinds that create no pods could otherwise hide
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["replicationcontrollers", "podtemplates"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
     verbs: ["get", "list", "watch", "delete"]
   # ...but only reads these. Stray ones are flagged, which leads to quarantine.
   - apiGroups: ["apps"]
