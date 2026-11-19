@@ -543,3 +543,37 @@ def test_exit_code_table_lists_every_code() -> None:
     text = (REPO_ROOT / "docs/decisions/0004-milestone-1-acceptance-command.md").read_text()
     for code in ("| 0 |", "| 2 |", "| 3 |", "| 4 |", "| 5 |"):
         assert code in text
+
+
+# --- closeout: raw() paths must be absolute ------------------------------------------------
+
+
+@pytest.mark.parametrize("phase", [Phase.RUNTIME, Phase.BOOTSTRAP])
+@pytest.mark.parametrize(
+    "path",
+    ["--kubeconfig=/Users/x/.kube/config", "--context=minikube", "api/v1/namespaces", "", "-s"],
+)
+def test_raw_requires_an_absolute_path(tmp_path, phase, path) -> None:
+    runner = Runner()
+    k = Kubectl(
+        _cfg(tmp_path), phase, runner=runner, kubeconfig=tmp_path / "kc", verify_identity=False
+    )
+    with pytest.raises(GuardError, match="must start with '/'"):
+        k.raw("GET", path)
+    assert runner.calls == []
+
+
+def test_raw_still_accepts_absolute_bootstrap_paths(tmp_path) -> None:
+    runner = Runner()
+    k = Kubectl(
+        _cfg(tmp_path),
+        Phase.BOOTSTRAP,
+        runner=runner,
+        kubeconfig=tmp_path / "kc",
+        verify_identity=False,
+    )
+    k.raw(
+        "GET",
+        "/api/v1/namespaces/safeops-monitoring/services/prometheus-server:80/proxy/api/v1/targets",
+    )
+    assert runner.calls[0][5:7] == ["get", "--raw"]

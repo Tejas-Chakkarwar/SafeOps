@@ -51,7 +51,7 @@ Prometheus may show workload metrics to the agent (`loadgen_attempts_total`, `lo
 ## Steady state: a fixed denominator (`config/workload.yaml`)
 
 - **Load:** 10 req/s, `GET /checkout` through `gateway-svc`.
-- **Warmup:** 15 s of load before the window opens. Proposed on 2026-11-19 and not objected to. Flag it at review if that's wrong.
+- **Warmup:** 15 s of load before the window opens. Accepted at the Milestone 2 review. Revisit only before the pilot freeze, and only if fault behavior gives a reason.
 - **The window is exactly 300 scheduled attempts**, which at 10 req/s means 30 s of scheduling. The denominator is always 300.
 - **An attempt succeeds only with HTTP 200 inside its 1-second deadline, measured from dispatch.** A timeout, an error, a non-200, a late 200, and no response at all are all failed attempts.
 - **Where the window ends:** after the 300th attempt is dispatched, outstanding attempts get until their own deadline. The window then closes at `last_dispatch + 1 s + 0.5 s settle`, and is computed over all 300.
@@ -71,7 +71,8 @@ Prometheus may show workload metrics to the agent (`loadgen_attempts_total`, `lo
   - Every runtime command uses `experiment-controller`'s credential (`.safeops/experiment-controller.kubeconfig`).
   - **Runtime never falls back to the admin kubeconfig.** A missing, invalid or expired credential fails loudly (`CredentialError`; CLI exit code 5). A fallback would silently undo the separation of phases by credential.
 - **The credential is a time-limited TokenRequest ServiceAccount token.** It isn't a "bound token": no `boundObjectRef` is supplied.
-  - Bootstrap requests `harness_session_s` (86400 s, 24 h) and then **reads the issued expiry back from the token** instead of trusting the request; the API server can cap durations with `--service-account-max-token-expiration`.
+  - Bootstrap requests `harness_session_s` and then **reads the issued expiry back from the token** instead of trusting the request; the API server can cap durations with `--service-account-max-token-expiration`.
+  - **The lifetime is 7 days (604800 s)**, raised from 24 h at the Milestone 2 closeout (2026-11-19). Milestone 3 is where `experiment-controller` gains testbed lifecycle privileges and starts to matter, so an expiry mid-session would be confusing, not just annoying. A development cluster session is now up to 7 days.
   - If the issued lifetime is shorter than requested, bootstrap fails clearly and writes no credential.
   - The lifetime and expiry, never the token, go into `.safeops/experiment-controller.token.json`.
 - **No refresh machinery at Milestone 2.** Revisit before Milestone 14, once campaign duration has been measured.

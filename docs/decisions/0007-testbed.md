@@ -8,6 +8,7 @@
 Four services plus Postgres, exactly as §12 describes: `gateway` → `orders` → {`inventory`, `payment`, `postgres`}.
 
 - The workload calls `GET /checkout` on `gateway`. `gateway` calls `POST /orders` on `orders`. `orders` reserves stock with `inventory`, charges `payment`, then inserts a row into Postgres. Every request exercises the whole graph.
+- **`/checkout` is an operation, not a service.** It's the gateway's user-facing operation, while `orders` is a service identity. The Revision 5.1 problem was a nonexistent *checkout service* in the topology, which became `orders`, not the word "checkout". Keeping `/checkout` as the route is a decision, not a leftover from that fix.
 - Every service exposes `/healthz` (liveness), `/readyz` (readiness) and `/metrics`, and logs JSON lines filtered by `LOG_LEVEL`. `orders` reports ready only after its schema exists.
 - `http_requests_total{service,route,code}` and `http_request_duration_seconds` are the agent-facing metrics. `orders` also exposes pool gauges (`db_pool_max_size`, `db_pool_size`, `db_pool_available`, `db_pool_requests_waiting`) and `db_pool_timeouts_total`.
 - **The language is Python 3.12** (stdlib HTTP server, `prometheus-client`, `psycopg`), the same language as the rest of the project.

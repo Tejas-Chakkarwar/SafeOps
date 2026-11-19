@@ -281,9 +281,11 @@ def verified_scope(
 def build_images(cfg: ClusterConfig) -> dict[str, dict]:
     """Reproducible OCI archives: identical inputs give a byte-identical image (decision 0007).
 
-    The archive is loaded straight into kind, so the digest pods report is the manifest
-    digest buildx printed here. Docker's own image store isn't involved, and neither are
-    its unpack and attestation defaults.
+    The archive is loaded straight into kind, so Docker's own image store isn't involved,
+    and neither are its unpack and attestation defaults. Running pods report the archive's
+    *index* digest (sha256 of its index.json) in imageID. That is the provenance digest,
+    and _archive_digests() records it as index_digest. buildx prints the image config
+    digest, which is recorded as config_digest for cross-reference (decision 0007).
     """
     out_dir = cfg.kubeconfig_path.parent / "images"
     out_dir.mkdir(parents=True, exist_ok=True)

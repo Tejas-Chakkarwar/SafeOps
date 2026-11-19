@@ -433,7 +433,13 @@ class Kubectl:
 
         Defense in depth: at runtime, raw calls may only target the workload generator's
         proxy path. Bootstrap may only GET.
+
+        Every path must be an absolute API path. A wrapper validates its own assumptions:
+        without this, a bootstrap path shaped like a flag ("--kubeconfig=...") would land
+        after the guard's own --kubeconfig and win, because kubectl takes the last one.
         """
+        if not path.startswith("/"):
+            raise GuardError(f"raw path must start with '/', got {path[:40]!r}")
         if self.phase is Phase.RUNTIME:
             prefix = (
                 f"/api/v1/namespaces/{self.cfg.workload_namespace}"

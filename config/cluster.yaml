@@ -16,9 +16,11 @@ kind_node_image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a2
 kubeconfig_path: .safeops/kubeconfig
 harness_kubeconfig_path: .safeops/experiment-controller.kubeconfig
 harness_token_meta_path: .safeops/experiment-controller.token.json
-# Requested lifetime of the harness token, which must cover the intended cluster session.
-# Bootstrap reads the issued expiry back and fails if it is shorter (0009).
-harness_session_s: 86400
+# Requested lifetime of the harness token: one development cluster session of 7 days.
+# Bootstrap reads the issued expiry back and fails if the API server caps it lower.
+# Never falls back to the admin kubeconfig. Revisit before Milestone 14 with the measured
+# campaign duration (0009).
+harness_session_s: 604800
 
 # Namespaces.
 namespace: testbed                       # system under test; the only namespace runtime may mutate (0006)

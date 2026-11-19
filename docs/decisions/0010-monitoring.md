@@ -15,7 +15,7 @@
 |---|---|---|
 | `scrape_interval` | 5 s | Symptom expressions such as "for 2m", fault verification and effectiveness all work on windows of tens of seconds. At 5 s, `get_metrics`' cap of 60 points (§11.3) covers 5 minutes. |
 | `scrape_timeout` | 4 s | Must be shorter than the interval |
-| `retention` | 2 h | A run takes minutes. Telemetry older than a run is never needed, and short retention bounds memory on a single node with about 7.65–10 GiB. |
+| `retention` | 2 h | A run takes minutes. Telemetry older than a run is never needed, and short retention bounds memory on a single node with 7.65 GiB. |
 | storage | emptyDir (no PV) | Nothing needs to survive a Prometheus restart beyond the current run |
 | resources | requests 256 Mi / 100m, limits 1 Gi / 1000m | Leaves room on one kind node |
 
@@ -44,3 +44,9 @@ The chart's cluster-scoped objects (ClusterRole and ClusterRoleBinding `promethe
 - **The leak:** the `safeops-workload-generator` job also scraped the generator's own HTTP server metrics. `http_requests_total{service="workload-generator", route="/stats" | "/control"}` counted the harness's polls and control calls, so the agent could have seen when the evaluator was measuring. That's evaluator-path traffic in the agent's sensory input.
 - **The fix:** the job now has `metric_relabel_configs` keeping only `__name__ =~ "loadgen_.*"`, which is workload telemetry and nothing about the harness.
 - **Test:** `tests/test_m2_review.py` asserts it.
+
+## Amendment, 2026-11-19 (Milestone 2 closeout): Docker memory stays at 7.65 GiB
+
+- **Measured:** the full stack (kind control plane, Chaos Mesh, Prometheus, 8 testbed pods, Postgres, the workload generator) uses about 2.0–2.1 GiB of Docker Desktop's 7.65 GiB, under load and at idle.
+- **No change:** the earlier 10 GiB recommendation had no measured justification, so the setting stays.
+- **When to revisit:** at Milestone 11 (the full fault catalog) or Milestone 14 (the campaign), with measured numbers.
