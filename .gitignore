@@ -1,0 +1,17 @@
+reference/
+
+# Run records: gitignored, backed up separately, immutable once finalized.
+data/runs/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets never live in files; ignore .env defensively anyway.
+.env

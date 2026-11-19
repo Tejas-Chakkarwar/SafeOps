@@ -1,0 +1,112 @@
+"""SafeOps command-line interface."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Annotated
+
+import typer
+
+from safeops.stubs import NotImplementedStage
+
+# Exit codes (decision 0004).
+EXIT_USAGE = 2
+EXIT_NOT_IMPLEMENTED = 3
+
+# pretty_exceptions_show_locals=False: a traceback must never dump local variables,
+# because they may later hold API keys or tokens (CLAUDE.md, Secrets).
+app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_show_locals=False,
+    help="SafeOps: risk-aware remediation for AI incident-response agents in Kubernetes.",
+)
+
+
+def _fail(command: str, message: str, code: int) -> None:
+    typer.echo(f"safeops {command}: {message}", err=True)
+    raise typer.Exit(code)
+
+
+def _run_stage(command: str, fn: Callable[[], object], context: str = "") -> None:
+    """Run ``fn``. If it hits a stub, print one readable line and exit non-zero."""
+    try:
+        fn()
+    except NotImplementedStage as exc:
+        _fail(command, f"{exc}.{context}", EXIT_NOT_IMPLEMENTED)
+
+
+@app.command()
+def run(
+    fault: Annotated[
+        str | None, typer.Option("--fault", help="Fault id, e.g. bad-deployment-config.")
+    ] = None,
+    seed: Annotated[int | None, typer.Option("--seed", min=0, help="Fault seed.")] = None,
+    trial: Annotated[
+        int | None, typer.Option("--trial", min=0, help="Trial index, 0..k-1.")
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the pipeline and each stage's status. Runs nothing."),
+    ] = False,
+) -> None:
+    """Run one experimental unit (fault_id, fault_seed, trial_index)."""
+    given = {"--fault": fault, "--seed": seed, "--trial": trial}
+
+    if dry_run:
+        passed = [name for name, value in given.items() if value is not None]
+        if passed:
+            _fail(
+                "run",
+                f"--dry-run takes no experiment arguments (got {', '.join(passed)}).",
+                EXIT_USAGE,
+            )
+        from safeops.experiment.sequence import render_dry_run
+
+        typer.echo(render_dry_run())
+        return
+
+    missing = [name for name, value in given.items() if value is None]
+    if missing:
+        _fail("run", f"missing required option(s): {', '.join(missing)}.", EXIT_USAGE)
+    assert fault is not None and seed is not None and trial is not None
+    if not fault.strip():
+        _fail("run", "--fault must not be empty.", EXIT_USAGE)
+
+    from safeops.experiment.runner import RunUnit, build_runner
+
+    unit = RunUnit(fault_id=fault, fault_seed=seed, trial_index=trial)
+    _run_stage(
+        "run",
+        lambda: build_runner().run(unit),
+        f" Run unit: fault_id={unit.fault_id}, fault_seed={unit.fault_seed},"
+        f" trial_index={unit.trial_index}.",
+    )
+
+
+@app.command()
+def replay() -> None:
+    """Offline gate replay over cohort G."""
+    from safeops.experiment.replay import replay_cohort
+
+    _run_stage("replay", replay_cohort)
+
+
+@app.command()
+def analyze() -> None:
+    """Metrics, funnel, and risk-automation curves."""
+    from safeops.analysis.report import analyze as analyze_runs
+
+    _run_stage("analyze", analyze_runs)
+
+
+@app.command()
+def snapshot() -> None:
+    """Capture and inspect a canonical snapshot of the testbed."""
+    from safeops.environment.manager import EnvironmentManager
+
+    _run_stage("snapshot", EnvironmentManager().capture_snapshot)
+
+
+if __name__ == "__main__":
+    app()
