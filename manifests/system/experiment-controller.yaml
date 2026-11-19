@@ -1,0 +1,34 @@
+# experiment-controller: the harness identity (design §4; decision 0009).
+# It lives in the system namespace so it survives a testbed rebuild or quarantine.
+# Milestone 2 grants it exactly one capability: proxy GET and PUT to the workload
+# generator Service, by name. Its testbed rights are added at Milestone 3 with reset.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: experiment-controller
+  namespace: ${SYSTEM_NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: experiment-controller-workload-proxy
+  namespace: ${WORKLOAD_NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["services/proxy"]
+    resourceNames: ["${WORKLOAD_SERVICE}"]
+    verbs: ["get", "update"]     # GET /stats, PUT /control
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: experiment-controller-workload-proxy
+  namespace: ${WORKLOAD_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: experiment-controller
+    namespace: ${SYSTEM_NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: experiment-controller-workload-proxy

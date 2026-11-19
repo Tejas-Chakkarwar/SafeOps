@@ -1,0 +1,23 @@
+# Testbed ConfigMaps (decision 0007, config split).
+# Values that patch_configmap must be able to repair live here. orders reads them as
+# environment variables at container start, so a patch followed by the composite's
+# rollout-restart picks them up. Values that rollback_deployment must repair live in
+# the pod template instead.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-config
+  namespace: ${TESTBED_NAMESPACE}
+  labels: {app: orders}
+data:
+  log_level: info
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-pool-config
+  namespace: ${TESTBED_NAMESPACE}
+  labels: {app: orders}
+data:
+  max_pool_size: "10"            # safe_range [5, 30]; maps to psycopg_pool ConnectionPool(max_size=...)
+  connection_timeout_ms: "2000"  # safe_range [500, 10000]; the pool's checkout timeout

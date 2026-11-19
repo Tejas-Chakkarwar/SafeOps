@@ -1,0 +1,53 @@
+# Workload generator: measurement infrastructure, not part of the system under test
+# (decision 0009). It lives outside the testbed namespace, so safeops-reader can never see
+# it, and testbed reset and snapshots never touch it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${WORKLOAD_SERVICE}
+  namespace: ${WORKLOAD_NAMESPACE}
+  labels: {app: workload-generator}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: workload-generator}
+  template:
+    metadata:
+      labels: {app: workload-generator}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "${WORKLOAD_SERVICE_PORT}"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: workload-generator
+          image: ${LOADGEN_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports: [{name: http, containerPort: 8080}]
+          env:
+            - {name: SERVICE_NAME, value: workload-generator}
+            - {name: GATEWAY_BASE_URL, value: "http://gateway-svc.${TESTBED_NAMESPACE}.svc.cluster.local:8080"}
+            - {name: LOG_LEVEL, value: info}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 1000m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${WORKLOAD_SERVICE}
+  namespace: ${WORKLOAD_NAMESPACE}
+  labels: {app: workload-generator}
+spec:
+  selector: {app: workload-generator}
+  # Unnamed on purpose: the API-server proxy path then works with the bare Service name
+  # (/services/workload-generator/proxy/...), which is exactly the RBAC resourceName.
+  # A named port would need /services/workload-generator:http/proxy/ (decision 0009).
+  ports:
+    - {port: ${WORKLOAD_SERVICE_PORT}, targetPort: http}

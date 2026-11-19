@@ -1,0 +1,30 @@
+# Namespaces created at bootstrap (decision 0006). ${...} values come from config/cluster.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${TESTBED_NAMESPACE}
+  labels: {app.kubernetes.io/part-of: safeops, safeops.io/role: system-under-test}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${SYSTEM_NAMESPACE}
+  labels: {app.kubernetes.io/part-of: safeops, safeops.io/role: harness-identity}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${WORKLOAD_NAMESPACE}
+  labels: {app.kubernetes.io/part-of: safeops, safeops.io/role: measurement}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${MONITORING_NAMESPACE}
+  labels: {app.kubernetes.io/part-of: safeops, safeops.io/role: telemetry}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${CHAOS_NAMESPACE}
+  labels: {app.kubernetes.io/part-of: safeops, safeops.io/role: fault-backend}

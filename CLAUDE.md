@@ -63,10 +63,13 @@ Write the harm checker, the canonicalizer, and the metric computation by hand. A
 ## Commands
 
 ```bash
-make cluster-up      # create kind cluster + deploy testbed
+make cluster-up      # create kind cluster + deploy testbed (bootstrap phase; decision 0006)
 make cluster-down
-make test            # pytest
+make bootstrap-scope # re-render pinned charts into config/bootstrap_scope.yaml; review the diff
+make test            # offline pytest; never touches a cluster
+make cluster-test    # live RBAC and harness-path tests; needs make cluster-up
 make lint
+safeops steady-state # start load, measure one 300-attempt window, stop (decision 0009)
 safeops run --fault <id> --seed <n> --trial <i>
 safeops replay       # offline gate replay over cohort G
 safeops analyze      # metrics, funnel, curves

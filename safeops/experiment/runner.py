@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from safeops.agent.loop import Agent
 from safeops.agent.parser import ProposalParser
 from safeops.environment.manager import EnvironmentManager
-from safeops.environment.workload import WorkloadGenerator
+from safeops.environment.workload import WorkloadGenerator, check_steady_state
 from safeops.executor.executor import ActionExecutor
 from safeops.experiment.records import RunRecordWriter
 from safeops.faults.alerts import AlertGenerator
@@ -134,9 +134,13 @@ class ExperimentRunner:
     def _require_pre_run_clean(self, clean_state) -> None:
         """If not clean: discard the run, count it, quarantine (§5, §11.1)."""
 
-    @stub(milestone=2)
     def _require_steady_state(self, steady_state) -> None:
-        """Stop the run if no measurable steady-state baseline is reached."""
+        """Stop the run if no valid steady-state baseline was measured (decision 0009).
+
+        Raises SteadyStateError, a pre-run failure: the run is discarded and counted.
+        Recording the discard is Milestone 5.
+        """
+        check_steady_state(steady_state)
 
     @stub(milestone=4)
     def _require_fault_present(self, present: bool) -> None:

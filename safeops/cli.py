@@ -9,9 +9,11 @@ import typer
 
 from safeops.stubs import NotImplementedStage
 
-# Exit codes (decision 0004).
+# Exit codes (decisions 0004, 0009).
 EXIT_USAGE = 2
 EXIT_NOT_IMPLEMENTED = 3
+EXIT_STEADY_STATE = 4  # no valid steady-state baseline
+EXIT_CLUSTER = 5  # guard refusal, missing or expired credential, failed cluster command
 
 # pretty_exceptions_show_locals=False: a traceback must never dump local variables,
 # because they may later hold API keys or tokens (CLAUDE.md, Secrets).
@@ -82,6 +84,42 @@ def run(
         f" Run unit: fault_id={unit.fault_id}, fault_seed={unit.fault_seed},"
         f" trial_index={unit.trial_index}.",
     )
+
+
+@app.command("steady-state")
+def steady_state() -> None:
+    """Start the workload, measure one steady-state window, stop. Needs `make cluster-up`."""
+    from safeops.cluster import CommandError, CredentialError, GuardError
+    from safeops.environment.workload import (
+        SteadyStateError,
+        WorkloadGenerator,
+        check_steady_state,
+    )
+
+    generator = WorkloadGenerator()
+    s = generator.settings
+    typer.echo(
+        f"safeops steady-state: {s.rate_rps:g} req/s to {s.target_path}, {s.warmup_s:g}s warmup,"
+        f" window of {s.window_attempts} scheduled attempts, {s.attempt_deadline_s:g}s deadline,"
+        f" pass at >= {s.min_successes}"
+    )
+    try:
+        generator.start_workload()
+        try:
+            result = generator.verify_steady_state()
+        finally:
+            generator.stop_workload()
+        typer.echo(
+            f"  window {result.window_id}: {result.state}, scheduled {result.scheduled}"
+            f"/{result.size}, succeeded {result.succeeded}, success_rate {result.success_rate},"
+            f" p95 {result.p95_latency_ms} ms"
+        )
+        check_steady_state(result)
+    except SteadyStateError as exc:
+        _fail("steady-state", str(exc), EXIT_STEADY_STATE)
+    except (CredentialError, GuardError, CommandError) as exc:
+        _fail("steady-state", str(exc), EXIT_CLUSTER)
+    typer.echo("  baseline: PASS")
 
 
 @app.command()

@@ -39,3 +39,38 @@ The allowed set isn't written by hand from memory. At Milestone 2, render the pi
    - runtime refuses the wrong context, a namespace other than `testbed` (including `chaos_namespace`), and anything cluster-scoped;
    - bootstrap refuses the wrong context and anything outside its recorded scope;
    - only the cluster-up and cluster-down entry points can obtain bootstrap.
+
+## Amendment, 2026-11-19 (Milestone 2): open items resolved
+
+**1. Kubeconfig.** The admin kubeconfig lives at `kubeconfig_path: .safeops/kubeconfig`, gitignored along with everything under `.safeops/`. `kind create cluster --kubeconfig` writes there, so `~/.kube/config` is never touched and `minikube` stays the current context. Every command passes **both** `--kubeconfig` and `--context`. Runtime uses a second credential, `.safeops/experiment-controller.kubeconfig`, and never the admin one (decision 0009). The guard picks the credential by phase, so the phases are separated by credential, not only by guard logic.
+
+**2. Bootstrap scope, extended by amendment.** The bootstrap namespaces are now `testbed`, `chaos_namespace` (`chaos-mesh`), `system_namespace` (`safeops-system`, decision 0009), `workload_namespace` (`safeops-workload`, decision 0009) and `monitoring_namespace` (`safeops-monitoring`, decision 0010). Runtime still allows `testbed` only.
+
+The cluster-scoped set is **recorded mechanically** in `config/bootstrap_scope.yaml`:
+- `make bootstrap-scope` renders both pinned charts with their install values (`helm template`, CRDs included) plus the SafeOps manifests, and writes every cluster-scoped `(kind, name)`.
+- `make cluster-up` re-renders before creating anything and **refuses on any difference**.
+- After creating the cluster, it also checks that every recorded kind really is cluster-scoped according to `kubectl api-resources --namespaced=false`.
+- Every namespaced object a chart renders must target its release namespace, or bootstrap refuses.
+- Chart and manifest objects are applied only after each one passes `check_object` in the bootstrap phase.
+
+Rendered on 2026-11-19:
+
+| Source | Cluster-scoped objects |
+|---|---|
+| Chaos Mesh 2.8.8 | 24 CRDs (`*.chaos-mesh.org`); 6 ClusterRoles and 6 ClusterRoleBindings (controller-manager, dns-server, and dashboard, each `-cluster-level` and `-target-namespace`); MutatingWebhookConfiguration `chaos-mesh-mutation`; ValidatingWebhookConfigurations `chaos-mesh-validation` and `chaos-mesh-validation-auth` |
+| Prometheus chart 29.47.2 | ClusterRole and ClusterRoleBinding `prometheus-server` |
+| SafeOps manifests | Namespaces `testbed`, `safeops-system`, `safeops-workload`, `safeops-monitoring`, `chaos-mesh` |
+
+- **Dashboard RBAC:** the chart renders the dashboard's ClusterRoles even with `dashboard.create=false`. The procedure records what the chart actually produces, not what was expected.
+- **No `cluster-admin`:** nothing in the set grants it, and `tests/test_cluster_guard.py` asserts that.
+
+**3. Guard tests.** `tests/test_cluster_guard.py` covers:
+- runtime refuses every namespace other than `testbed` and anything cluster-scoped;
+- bootstrap allows exactly its namespaces and its recorded cluster scope;
+- an AST check confirms that only `safeops/bootstrap.py` (and the definition in `safeops/cluster.py`) references `Phase.BOOTSTRAP`;
+- every kubectl call carries `--kubeconfig` and `--context`, and never reads `current-context`;
+- `Kubectl.read` refuses mutating verbs;
+- `apply` checks every object before running anything;
+- runtime raw calls can only reach the workload-generator proxy.
+
+**Workload proxy.** The workload-generator proxy (decision 0009) is not a Kubernetes-object mutation, so `check_object` doesn't govern it. `WorkloadProxy` has its own capability check instead (namespace, Service, operation ∈ {stats, control}).

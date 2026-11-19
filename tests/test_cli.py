@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 import safeops.experiment.runner as runner_module
-from safeops.cli import EXIT_NOT_IMPLEMENTED, EXIT_USAGE, app
+from safeops.cli import EXIT_CLUSTER, EXIT_NOT_IMPLEMENTED, EXIT_USAGE, app
 from safeops.experiment.sequence import RUN_SEQUENCE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -121,11 +121,38 @@ def test_unimplemented_commands_fail_readably(command: str, stage: str, mileston
     )
 
 
+def test_steady_state_without_harness_credential_fails_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No harness credential: exit 5 with one line, and the admin kubeconfig is never used."""
+    import yaml
+
+    import safeops.cluster as cluster
+
+    data = yaml.safe_load((REPO_ROOT / "config" / "cluster.yaml").read_text())
+    cfg = cluster.parse_cluster_config(data, root=tmp_path)
+    cfg.kubeconfig_path.parent.mkdir(parents=True)
+    cfg.kubeconfig_path.write_text("admin credential that must not be used")
+    monkeypatch.setattr(cluster, "load_cluster_config", lambda *a, **k: cfg)
+    called = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: called.append(a))
+
+    result = cli.invoke(app, ["steady-state"])
+    assert result.exit_code == EXIT_CLUSTER, result.output
+    assert "never falls back to the admin kubeconfig" in result.stderr
+    assert "Traceback" not in result.output
+    assert called == []  # no kubectl ran at all
+
+
 @pytest.mark.skipif(shutil.which("make") is None, reason="make not installed")
-@pytest.mark.parametrize("target", ["cluster-up", "cluster-down"])
-def test_unimplemented_make_targets_exit_nonzero(target: str) -> None:
+def test_make_cluster_targets_go_through_the_bootstrap_module() -> None:
     proc = subprocess.run(
-        ["make", "-s", target], cwd=REPO_ROOT, capture_output=True, text=True, check=False
+        ["make", "-n", "cluster-up", "cluster-down"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    assert proc.returncode != 0
-    assert "not implemented until Milestone 2" in proc.stderr
+    assert proc.returncode == 0
+    assert "python -m safeops.bootstrap up" in proc.stdout
+    assert "python -m safeops.bootstrap down" in proc.stdout

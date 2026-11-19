@@ -1,15 +1,43 @@
-# SafeOps cluster identity (decision 0002). This is the single source of truth.
-# Starting at Milestone 2, the context guard and every cluster command read these
-# values from here. Nothing reads them at Milestone 1. Never hardcode them anywhere else.
+# SafeOps cluster identity and bootstrap pins (decisions 0002, 0003, 0006, 0009, 0010).
+# This is the single source of truth: the context guard and every cluster command read
+# these values from here. Never hardcode them anywhere else.
 #
 # Changing this file changes the experimental condition (CLAUDE.md, config/).
 
 cluster_name: safeops        # kind cluster name
 kube_context: kind-safeops   # passed explicitly as --context; current-context is never read (0006)
-namespace: testbed           # SafeOps testbed namespace; the only namespace the runtime guard allows (0006)
+# Pinned node image. Kubernetes v1.37.0, the default for kind v0.33.0.
+kind_node_image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
 
-# Fault backend (decisions 0003 and 0006). make cluster-up passes the version to
-# `helm install --version` and installs into chaos_namespace, starting at Milestone 2.
-# chaos_namespace is reachable only through the bootstrap guard, never at runtime.
-chaos_namespace: chaos-mesh
+# Credentials, both gitignored under .safeops/ and never printed (0006, 0009).
+# admin:   written by `kind create cluster`. Used for bootstrap only.
+# harness: experiment-controller's time-limited TokenRequest token. Used for every runtime
+#          command. Runtime never falls back to the admin kubeconfig.
+kubeconfig_path: .safeops/kubeconfig
+harness_kubeconfig_path: .safeops/experiment-controller.kubeconfig
+harness_token_meta_path: .safeops/experiment-controller.token.json
+# Requested lifetime of the harness token, which must cover the intended cluster session.
+# Bootstrap reads the issued expiry back and fails if it is shorter (0009).
+harness_session_s: 86400
+
+# Namespaces.
+namespace: testbed                       # system under test; the only namespace runtime may mutate (0006)
+system_namespace: safeops-system         # experiment-controller identity; survives a testbed rebuild (0009)
+workload_namespace: safeops-workload     # workload generator: measurement infrastructure, not the SUT (0009)
+workload_service: workload-generator     # the only Service the harness may proxy to (0009)
+workload_service_port: 8080
+monitoring_namespace: safeops-monitoring # Prometheus server (0010)
+chaos_namespace: chaos-mesh              # Chaos Mesh control plane; bootstrap only (0003, 0006)
+
+# Testbed images (decision 0007). safeops-testbed and safeops-loadgen are built locally
+# from testbed/Dockerfile with content-derived tags; the run record stores their OCI
+# digests. Postgres is pinned by digest.
+postgres_image: postgres:16-alpine@sha256:1d5b02d3a9941fbd52437db4107f8c52d6297dac553ca1e5c299ebb3756b4857
+
+# Helm chart pins, installed with --repo so the user's Helm repo list is never touched.
+chaos_mesh_repo: https://charts.chaos-mesh.org
 chaos_mesh_version: 2.8.8
+prometheus_chart_repo: https://prometheus-community.github.io/helm-charts
+prometheus_chart_version: 29.47.2        # Prometheus v3.16.0
+prometheus_service: prometheus-server
+prometheus_service_port: 80

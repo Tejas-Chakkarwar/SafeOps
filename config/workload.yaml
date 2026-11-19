@@ -1,0 +1,15 @@
+# Workload generator and steady-state measurement (decision 0009).
+# The steady-state baseline is the reference that `effective` is measured against (§11.7),
+# so these values are part of the experimental condition.
+
+target_path: /checkout       # GET through gateway-svc; exercises gateway -> orders -> inventory, payment, postgres
+rate_rps: 10                 # open-loop schedule: attempts are dispatched on time, never paced by responses
+attempt_deadline_s: 1.0      # an attempt succeeds only with HTTP 200 inside this deadline
+
+# Steady-state window: a fixed denominator of scheduled attempts, not a time slice.
+warmup_s: 15                 # load runs this long before the window opens
+window_attempts: 300         # 300 attempts at 10 rps = 30 s of scheduling
+min_successes: 297           # baseline passes at >= 297 of 300 scheduled
+# Harness-side bound on waiting for a window: 30 s of scheduling + the deadline + slack.
+window_poll_timeout_s: 60
+window_poll_interval_s: 1.0

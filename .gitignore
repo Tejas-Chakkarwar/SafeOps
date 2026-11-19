@@ -15,3 +15,6 @@ __pycache__/
 
 # Secrets never live in files; ignore .env defensively anyway.
 .env
+
+# Local cluster credentials and rendered bootstrap files (decision 0006). Never commit.
+.safeops/

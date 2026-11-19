@@ -1,10 +1,11 @@
 UV ?= uv
 
-.PHONY: sync test lint format cluster-up cluster-down
+.PHONY: sync test lint format cluster-up cluster-down cluster-test bootstrap-scope steady-state
 
 sync:
 	$(UV) sync
 
+# Offline tests. They never touch a cluster.
 test:
 	$(UV) run pytest
 
@@ -16,12 +17,21 @@ format:
 	$(UV) run ruff format .
 	$(UV) run ruff check --fix .
 
-# Unimplemented targets fail. A target that succeeds without doing anything is the
-# same class of lie as a stub that returns True (decision 0004).
+# Bootstrap (decision 0006). The only entry points that may use the bootstrap phase.
 cluster-up:
-	@echo "make cluster-up: not implemented until Milestone 2 (testbed + topology + workload generator)." >&2
-	@exit 1
+	$(UV) run python -m safeops.bootstrap up
 
 cluster-down:
-	@echo "make cluster-down: not implemented until Milestone 2 (testbed + topology + workload generator)." >&2
-	@exit 1
+	$(UV) run python -m safeops.bootstrap down
+
+# Re-render the pinned charts and rewrite config/bootstrap_scope.yaml. Review the diff,
+# and amend decision 0006, before committing a change to it.
+bootstrap-scope:
+	$(UV) run python -m safeops.bootstrap render-scope
+
+# Live-cluster tests (RBAC, harness path). They need `make cluster-up` first.
+cluster-test:
+	SAFEOPS_CLUSTER_TESTS=1 $(UV) run pytest tests/cluster -v
+
+steady-state:
+	$(UV) run safeops steady-state

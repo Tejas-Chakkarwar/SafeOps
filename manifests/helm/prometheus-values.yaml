@@ -1,0 +1,96 @@
+# Prometheus server for agent-facing telemetry (decision 0010).
+# Server only. Scrape configuration defines what the agent can observe, so it's part of
+# the experimental condition: every job is listed explicitly and every chart default
+# that isn't needed is switched off.
+# ${...} values come from config/cluster.yaml.
+
+alertmanager: {enabled: false}            # alerts come from the alert generator (§6), not Alertmanager
+prometheus-pushgateway: {enabled: false}
+prometheus-node-exporter: {enabled: false}
+kube-state-metrics: {enabled: false}      # object state reaches the agent through get_pods/get_events/...
+configmapReload:
+  prometheus: {enabled: false}            # config is set once at bootstrap; no live reload
+
+server:
+  global:
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    evaluation_interval: 5s
+  retention: 2h
+  persistentVolume: {enabled: false}
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 1000m, memory: 1Gi}
+
+scrapeConfigs:
+  # --- enabled ---------------------------------------------------------------
+  prometheus:                             # Prometheus self-scrape (chart default, kept)
+    enabled: true
+
+  safeops-testbed-pods:                   # SafeOps application pod metrics
+    enabled: true
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces: {names: ["${TESTBED_NAMESPACE}"]}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: (.+);(.+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        target_label: app
+
+  safeops-workload-generator:             # workload generator metrics (agent-visible telemetry only;
+    enabled: true                         # the effectiveness verdict never reads Prometheus, 0009)
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces: {names: ["${WORKLOAD_NAMESPACE}"]}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: workload-generator
+      - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: (.+);(.+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+  safeops-cadvisor:                       # container CPU/memory and memory-pressure signals, testbed only
+    enabled: true
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      insecure_skip_verify: true
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    metrics_path: /metrics/cadvisor
+    kubernetes_sd_configs:
+      - role: node
+    metric_relabel_configs:
+      - source_labels: [namespace]
+        action: keep
+        regex: ${TESTBED_NAMESPACE}
+
+  # --- disabled chart defaults -------------------------------------------------
+  kubernetes-api-servers: {enabled: false}
+  kubernetes-nodes: {enabled: false}
+  kubernetes-nodes-cadvisor: {enabled: false}   # replaced by safeops-cadvisor (testbed only)
+  kubernetes-service-endpoints: {enabled: false}
+  kubernetes-service-endpoints-slow: {enabled: false}
+  prometheus-pushgateway: {enabled: false}
+  kubernetes-services: {enabled: false}
+  kubernetes-pods: {enabled: false}
+  kubernetes-pods-slow: {enabled: false}
