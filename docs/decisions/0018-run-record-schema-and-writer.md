@@ -160,3 +160,61 @@ These are still fixes to v1, since no record exists yet. The tests are in the "s
 5. **Durability.**
    - After the hard link, the directory is fsynced too, because the link is a directory entry. Otherwise a host crash during the destructive recovery that follows could lose a record `finalize` had reported as written.
    - Both the file and the directory also get `F_FULLFSYNC` where it exists: on macOS, a plain `fsync` leaves data in the drive's cache.
+
+## Amendment, 2026-11-20: Milestone 5 review fix list (schema v1 invariants)
+
+These are fixed in v1 now, because 0017 §7 makes every later structural change a version bump. Deferring them to Milestones 8–9 would split pilot and campaign data across versions. The tests are in `tests/test_m5_fixlist.py`. A mutation check restored the old behavior for each item (15 mutations), and each one made a test fail.
+
+1. **The `run_id` lifecycle.**
+   - The runner allocates `run_id` **once, at the start of `run()`**, next to `started_at` and the start-of-run provenance. Nothing regenerates it, and the writer refuses a record without it.
+   - The same ID goes:
+     - to the shadow gates: `ShadowGateScorer.score(features, run_id)`, the seed for `random-p` (Rule 24), which isn't implemented yet;
+     - to the recovery diagnostics: the quarantine reasons name the run;
+     - into the record's `run_id`;
+     - into its filename, `data/runs/<run_id>.json`.
+2. **The run stages are a closed enum.**
+   - `RunStage` (in `safeops/enums.py`) lists every stage, and the runner names each stage only through it.
+   - `PRE_AGENT_STAGES` and `POST_AGENT_STAGES` are tuples of enum members. A test checks against the enum itself that they're disjoint and together cover every member exactly once, so a member added later and left out of both fails.
+   - `DiscardReason.stage` is typed `RunStage`. `Discard()` refuses an unknown stage immediately.
+   - `stage_phase()` raises for an unclassified stage instead of guessing pre-agent. A guess of pre-agent would skip the post-run cleanup after a mutation may have happened; extra cleanup is cheap.
+3. **Provider and executor infrastructure failures are discards.**
+   - `provider_failure` is a `DiscardCause`. `proposal_status == provider_failure` requires `discarded` with cause `provider_failure`, and no proposal object. It's therefore outside cohort G and has no outcome category.
+   - `execution.status == infrastructure_failure` requires an `infrastructure_failure` discard.
+   - `refused_by_envelope`, `rejected_invalid_action` and `partially_applied` are real observed outcomes, kept and not discarded; the last is simply outside G.
+   - Fabricated records cover every value of both enums.
+4. **Phase A's online gate is always-act.**
+   - `Gate` is typed `strategy: "always-act"`, `decision: "execute"`, `score: null`.
+   - This holds whenever a gate is present, including on a run discarded after it executed.
+   - Statuses that never reach the online gate (`no_action`, `invalid_output`, `step_limit`, `model_refusal`, `provider_failure`) carry `gate: null`.
+   - Shadow strategies live only in `ShadowGates`, which has its own typed fields, so pinning `Gate` can't constrain them.
+5. **The parser's output depends on its status.**
+   - The parse stage always produces `proposal_status`.
+   - **The proposal object, by status:**
+     - `valid_action`: a proposal with an action;
+     - **`no_action`: a proposal whose `recommended_action` is null**, which is the design's own representation (§11.4: "`recommended_action = None` … no mutation warranted"), so no new decision was needed;
+     - `invalid_output`, `step_limit`, `model_refusal` and `provider_failure`: no proposal.
+   - Stage completeness no longer demands a proposal for a later discard. Each status followed by a later failure is tested through the runner.
+6. **An unknown token count stays unknown.** `totals.tokens_in` and `totals.tokens_out` are the sum over steps only if every step's count is known. Otherwise they're null, never a partial sum that would pass for a complete one. A known zero stays zero. Cost is derived at analysis time from these totals (§11.8: no `cost_usd`), so it inherits the same rule.
+7. **The partial-trajectory sink, an interface contract for Milestone 9.**
+   - **What's recorded now:**
+     - the runner will own a mutable trajectory sink for the run and pass it into `investigate`;
+     - the agent appends each completed step as it happens;
+     - if `investigate` raises, the failure handling serializes whatever steps are already in the sink;
+     - R2 starts with the first recorded step, so an empty sink is not R2.
+
+     This mirrors `action_attempted`, which is set before `executor.apply()` because execution can fail mid-way.
+   - **Already in v1:** a discard at stage `agent` may carry a partial trajectory with no `proposal_status` (`_PARTIAL_AT_OWN_STAGE`).
+   - **Not built now:** the agent plumbing itself, which arrives with the agent.
+8. **Steady-state arithmetic lives on the `SteadyState` model**, so it applies to every record that carries a window, discarded or not:
+   - `scheduled ≤ size`;
+   - `min_successes ≤ size`;
+   - `succeeded ≤ scheduled`;
+   - `size ≥ 1`;
+   - a `success_rate` requires `succeeded`;
+   - `success_rate == succeeded / size` (absolute tolerance 1e-9, relative 0).
+
+   **The denominator is always `size`**, the configured attempts, never `scheduled`. A timed-out window that scheduled 150 of 300 still divides by 300 (decision 0009). The completed-run baseline *policy* check stays where it was.
+9. **Write errors match what's on disk.** If the hard link succeeded but confirming durability (the directory sync) failed, the error says the record **is installed**, and the record is left in place, read-only. Only a failure before the link says it was not installed. Both stay loud.
+10. **Cleanup never loses an interrupt.** Every cleanup block records interrupt-class exceptions the same way: the first one captured is kept, and later blocks can neither clear nor replace it. Ordinary cleanup failures are unchanged.
+
+`docs/safeops-design.md` is unchanged. No field was reserved for a later milestone.

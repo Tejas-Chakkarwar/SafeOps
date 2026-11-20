@@ -26,11 +26,12 @@ import hashlib
 import json
 import os
 import subprocess
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from safeops.enums import RunStage
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RUNS_DIR = REPO_ROOT / "data" / "runs"
@@ -43,17 +44,23 @@ class RecordWriteError(Exception):
 
 @dataclass(frozen=True)
 class Discard:
-    """Why a run was discarded: the stage it stopped at, the cause, and the error."""
+    """Why a run was discarded: the stage it stopped at, the cause, and the error.
 
-    stage: str
+    The stage must be a RunStage: a misspelled or unknown stage fails here, at once, never
+    later as a record that silently took the wrong cleanup path (M5 review, item 2)."""
+
+    stage: RunStage
     cause: str
     error: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stage", RunStage(self.stage))  # ValueError if unknown
+
     @property
     def phase(self) -> str:
-        from safeops.experiment.schema import POST_AGENT_STAGES
+        from safeops.experiment.schema import stage_phase
 
-        return "post_agent" if self.stage in POST_AGENT_STAGES else "pre_agent"
+        return stage_phase(self.stage)
 
 
 def _iso(dt: datetime) -> str:
@@ -62,6 +69,17 @@ def _iso(dt: datetime) -> str:
 
 def _sha256_file(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _known_total(steps: list[dict] | None, key: str) -> int | None:
+    """The sum over steps, or None if any step's count is unknown: a partial sum would
+    pass for a complete one and undercount cost (M5 review, item 6). Zero stays zero."""
+    if steps is None:
+        return None
+    values = [s.get(key) for s in steps]
+    if any(v is None for v in values):
+        return None
+    return sum(values)
 
 
 def _plain(obj):
@@ -157,6 +175,7 @@ class ProvenanceSource:
 
 RECORD_FIELDS = frozenset(
     {
+        "run_id",
         "unit",
         "started_at",
         "provenance",
@@ -192,7 +211,6 @@ class RunRecordWriter:
         runs_dir: Path | None = None,  # None: RUNS_DIR, read when the writer is built
         provenance: ProvenanceSource | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        new_id: Callable[[], uuid.UUID] = uuid.uuid4,
         phase: str = "A",
         faults_dir: Path | None = None,
     ) -> None:
@@ -202,7 +220,6 @@ class RunRecordWriter:
         self.faults_dir = faults_dir
         self._provenance = provenance
         self._clock = clock
-        self._new_id = new_id
         self.phase = phase
 
     @property
@@ -232,6 +249,8 @@ class RunRecordWriter:
         finalized_at = self._clock()
         started_at = f["started_at"] or finalized_at
 
+        if not isinstance(f["run_id"], str) or not f["run_id"]:
+            raise TypeError("finalize() needs the run_id allocated at the start of the run")
         if f["provenance"] is None:
             raise TypeError("finalize() needs the provenance captured at the start of the run")
         provenance = dict(f["provenance"])
@@ -276,14 +295,12 @@ class RunRecordWriter:
                 ),
             }
 
-        tokens_in = tokens_out = None
-        if steps:
-            tokens_in = sum(s.get("tokens_in") or 0 for s in steps)
-            tokens_out = sum(s.get("tokens_out") or 0 for s in steps)
+        tokens_in, tokens_out = _known_total(steps, "tokens_in"), _known_total(steps, "tokens_out")
         stabilized = f["stabilized"]
 
         return {
-            "run_id": str(self._new_id()),
+            # Allocated by the runner at run start and never regenerated here (item 1).
+            "run_id": f["run_id"],
             "schema_version": 1,
             "phase": self.phase,
             "unit": {
@@ -393,6 +410,7 @@ class RunRecordWriter:
         directory.mkdir(parents=True, exist_ok=True)
         final = directory / f"{run_id}.json"
         tmp = directory / f".{run_id}.json.tmp"
+        installed = False
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as fh:
@@ -400,6 +418,7 @@ class RunRecordWriter:
                 fh.flush()
                 _durable_sync(fh.fileno())
             os.link(tmp, final)  # fails if the record exists: never overwritten
+            installed = True
             # The link is a directory entry: sync the directory too, or a crash during the
             # destructive recovery that follows could lose a record finalize reported as
             # written (M5 second review, finding 5).
@@ -411,7 +430,17 @@ class RunRecordWriter:
         except FileExistsError as exc:
             raise RecordWriteError(f"run record {final} already exists; never overwritten") from exc
         except OSError as exc:
-            raise RecordWriteError(f"could not write run record {final}: {exc}") from exc
+            if installed or final.exists():
+                # The record is on disk; only the durability confirmation failed. Say so,
+                # and leave it in place, read-only (M5 review, item 9).
+                try:
+                    os.chmod(final, 0o444)
+                except OSError:
+                    pass
+                raise RecordWriteError(
+                    f"run record {final} is installed, but confirming it durable failed: {exc}"
+                ) from exc
+            raise RecordWriteError(f"run record {final} was not installed: {exc}") from exc
         finally:
             tmp.unlink(missing_ok=True)
         os.chmod(final, 0o444)

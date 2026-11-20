@@ -20,11 +20,12 @@ field reserved in advance.
 from __future__ import annotations
 
 import json
+import math
 from typing import Annotated, Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from safeops.enums import ActionType, ExecutionStatus, ProposalStatus
+from safeops.enums import ActionType, ExecutionStatus, ProposalStatus, RunStage
 from safeops.experiment.unit import FAULT_ID_PATTERN, MAX_FAULT_SEED, MAX_TRIAL_INDEX
 
 SCHEMA_VERSION = 1
@@ -33,36 +34,50 @@ Sha256 = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 UnitInterval = Annotated[float, Field(ge=0.0, le=1.0)]
 NonNegInt = Annotated[int, Field(ge=0)]
 
-# Where a discarded run stopped, in run order. Everything from "agent" on is post-agent.
-PRE_AGENT_STAGES = (
-    "pre_run_clean_state",
-    "start_workload",
-    "steady_state",
-    "steady_state_baseline",
-    "prefault_snapshot",
-    "inject",
-    "verify_fault_present",
-    "fault_present",
-    "postfault_snapshot",
-    "alert",
-    "runtime_context",
+# Where a discarded run stopped. Run stages are the closed RunStage enum (M5 review,
+# item 2); these two tuples must partition it exactly, which a test checks against the
+# enum itself, so a stage added later can't be left unclassified.
+_S = RunStage
+PRE_AGENT_STAGES: tuple[RunStage, ...] = (
+    _S.PRE_RUN_CLEAN_STATE,
+    _S.START_WORKLOAD,
+    _S.STEADY_STATE,
+    _S.STEADY_STATE_BASELINE,
+    _S.PREFAULT_SNAPSHOT,
+    _S.INJECT,
+    _S.VERIFY_FAULT_PRESENT,
+    _S.FAULT_PRESENT,
+    _S.POSTFAULT_SNAPSHOT,
+    _S.ALERT,
+    _S.RUNTIME_CONTEXT,
 )
-POST_AGENT_STAGES = (
-    "agent",
-    "parse",
-    "route_proposal",
-    "extract",
-    "shadow_gates",
-    "gate",
-    "route_gate",
-    "execute",
-    "executed_action",
-    "stabilization",
-    "postaction_snapshot",
-    "effectiveness",
-    "harm",
+POST_AGENT_STAGES: tuple[RunStage, ...] = (
+    _S.AGENT,
+    _S.PARSE,
+    _S.ROUTE_PROPOSAL,
+    _S.EXTRACT,
+    _S.SHADOW_GATES,
+    _S.GATE,
+    _S.ROUTE_GATE,
+    _S.EXECUTE,
+    _S.EXECUTED_ACTION,
+    _S.STABILIZATION,
+    _S.POSTACTION_SNAPSHOT,
+    _S.EFFECTIVENESS,
+    _S.HARM,
 )
-DiscardStage = Literal[PRE_AGENT_STAGES + POST_AGENT_STAGES]  # type: ignore[valid-type]
+
+
+def stage_phase(stage: RunStage) -> str:
+    """pre_agent or post_agent. An unclassified stage is an error, never a guess: guessing
+    pre-agent would skip the post-run cleanup after a mutation may have happened."""
+    if stage in POST_AGENT_STAGES:
+        return "post_agent"
+    if stage in PRE_AGENT_STAGES:
+        return "pre_agent"
+    raise ValueError(f"run stage {stage!r} is not classified as pre- or post-agent")
+
+
 DiscardCause = Literal[
     "pre_run_dirty",
     "workload_generator_busy",
@@ -73,6 +88,7 @@ DiscardCause = Literal[
     "infrastructure_failure",
     "operator_abort",
     "not_implemented",
+    "provider_failure",
 ]
 Category = Literal[
     "correct_autonomy", "harmful_but_effective", "ineffective", "harmful_and_ineffective"
@@ -130,13 +146,39 @@ class Provenance(_Strict):
 class SteadyState(_Strict):
     window_id: str | None
     state: Literal["complete", "failed", "timeout"]
-    size: NonNegInt
+    size: Annotated[int, Field(ge=1)]
     scheduled: NonNegInt
     succeeded: NonNegInt | None
     min_successes: NonNegInt
     success_rate: UnitInterval | None
     p95_latency_ms: Annotated[float, Field(ge=0.0)] | None
     failure: str | None
+
+    @model_validator(mode="after")
+    def _arithmetic(self) -> SteadyState:
+        """Structural consistency for every window, discarded or not (M5 review, item 8).
+        The denominator is always `size`, the configured attempts, never `scheduled`: a
+        window that scheduled fewer still has the fixed denominator (decision 0009)."""
+        problems = []
+        if self.scheduled > self.size:
+            problems.append(f"scheduled {self.scheduled} > size {self.size}")
+        if self.min_successes > self.size:
+            problems.append(f"min_successes {self.min_successes} > size {self.size}")
+        if self.succeeded is not None and self.succeeded > self.scheduled:
+            problems.append(f"succeeded {self.succeeded} > scheduled {self.scheduled}")
+        if self.success_rate is not None:
+            if self.succeeded is None:
+                problems.append("a success_rate without succeeded")
+            elif not math.isclose(
+                self.success_rate, self.succeeded / self.size, rel_tol=0.0, abs_tol=1e-9
+            ):
+                problems.append(
+                    f"success_rate {self.success_rate} != succeeded/size"
+                    f" = {self.succeeded}/{self.size}"
+                )
+        if problems:
+            raise ValueError("steady_state: " + "; ".join(problems))
+        return self
 
 
 class Variant(_Strict):
@@ -231,9 +273,13 @@ class FeatureVector(_Strict):
 
 
 class Gate(_Strict):
-    strategy: str
-    decision: Literal["execute", "escalate"]
-    score: float | None
+    """The online gate. Phase A is always-act by construction (§10.2): it decides execute,
+    carries no score, and is the only policy that can control execution. Every other
+    strategy is shadow-only and lives in ShadowGates (M5 review, item 4)."""
+
+    strategy: Literal["always-act"]
+    decision: Literal["execute"]
+    score: None
 
 
 class _RiskScore(_Strict):
@@ -282,7 +328,7 @@ class Totals(_Strict):
 
 
 class DiscardReason(_Strict):
-    stage: DiscardStage
+    stage: RunStage
     phase: Literal["pre_agent", "post_agent"]
     cause: DiscardCause
     error: str
@@ -292,42 +338,60 @@ class DiscardReason(_Strict):
 # A discard at stage S means S raised: nothing from S or after it can be present, and the
 # core data from before it must be (M5 second review, finding 1). The pre-run check's
 # result (clean_state_verified) comes before every stage.
-STAGE_PRODUCES: dict[str, tuple[str, ...]] = {
-    "pre_run_clean_state": (),
-    "start_workload": (),
-    "steady_state": ("steady_state",),
-    "steady_state_baseline": (),
-    "prefault_snapshot": ("prefault_snapshot_hash",),
-    "inject": ("fault",),
-    "verify_fault_present": ("fault_verification", "fault_verified"),
-    "fault_present": (),
-    "postfault_snapshot": ("postfault_snapshot_hash", "postfault_settledness"),
-    "alert": ("alert",),
-    "runtime_context": (),
-    "agent": ("trajectory",),
-    "parse": ("proposal_status", "proposal"),
-    "route_proposal": (),
-    "extract": ("feature_vector",),
-    "shadow_gates": ("shadow_gates",),
-    "gate": ("gate",),
-    "route_gate": (),
-    "execute": ("execution",),
-    "executed_action": (),
-    "stabilization": ("stabilization_timed_out",),
-    "postaction_snapshot": ("postaction_snapshot_hash",),
-    "effectiveness": (),
-    "harm": (),
+STAGE_PRODUCES: dict[RunStage, tuple[str, ...]] = {
+    _S.PRE_RUN_CLEAN_STATE: (),
+    _S.START_WORKLOAD: (),
+    _S.STEADY_STATE: ("steady_state",),
+    _S.STEADY_STATE_BASELINE: (),
+    _S.PREFAULT_SNAPSHOT: ("prefault_snapshot_hash",),
+    _S.INJECT: ("fault",),
+    _S.VERIFY_FAULT_PRESENT: ("fault_verification", "fault_verified"),
+    _S.FAULT_PRESENT: (),
+    _S.POSTFAULT_SNAPSHOT: ("postfault_snapshot_hash", "postfault_settledness"),
+    _S.ALERT: ("alert",),
+    _S.RUNTIME_CONTEXT: (),
+    _S.AGENT: ("trajectory",),
+    # The parser always produces proposal_status; whether a proposal object exists depends
+    # on the status (M5 review, item 5), so `proposal` is checked by its own rules.
+    _S.PARSE: ("proposal_status",),
+    _S.ROUTE_PROPOSAL: (),
+    _S.EXTRACT: ("feature_vector",),
+    _S.SHADOW_GATES: ("shadow_gates",),
+    _S.GATE: ("gate",),
+    _S.ROUTE_GATE: (),
+    _S.EXECUTE: ("execution",),
+    _S.EXECUTED_ACTION: (),
+    _S.STABILIZATION: ("stabilization_timed_out",),
+    _S.POSTACTION_SNAPSHOT: ("postaction_snapshot_hash",),
+    _S.EFFECTIVENESS: (),
+    _S.HARM: (),
 }
+# Written by a stage but never required by later ones (status-dependent).
+_ALSO_WRITES: dict[RunStage, tuple[str, ...]] = {_S.PARSE: ("proposal",)}
+# A stage that raised may already have written part of its output: the agent appends
+# each completed step to the runner's trajectory sink, so a crash at step 7 keeps steps
+# 1-6 (M5 review, item 7). Present or absent, both are valid at that stage.
+_PARTIAL_AT_OWN_STAGE: dict[RunStage, tuple[str, ...]] = {_S.AGENT: ("trajectory",)}
 _STAGE_ORDER = tuple(STAGE_PRODUCES)
 # Only traversed when the proposal is gate-eligible (and, from execute on, executed).
-_BRANCH_STAGES = ("extract", "shadow_gates", "gate", "route_gate", "execute", "executed_action")
+_BRANCH_STAGES = (
+    _S.EXTRACT,
+    _S.SHADOW_GATES,
+    _S.GATE,
+    _S.ROUTE_GATE,
+    _S.EXECUTE,
+    _S.EXECUTED_ACTION,
+)
 
 
-def _stage_problems(r: RunRecordV1, stage: str) -> list[str]:
+def _stage_problems(r: RunRecordV1, stage: RunStage) -> list[str]:
     p: list[str] = []
     i = _STAGE_ORDER.index(stage)
+    partial = _PARTIAL_AT_OWN_STAGE.get(stage, ())
     for later in _STAGE_ORDER[i:]:
-        for name in STAGE_PRODUCES[later]:
+        for name in STAGE_PRODUCES[later] + _ALSO_WRITES.get(later, ()):
+            if later == stage and name in partial:
+                continue
             if getattr(r, name) is not None:
                 p.append(f"discarded at {stage}, yet carries {name} from stage {later}")
     for earlier in _STAGE_ORDER[:i]:
@@ -339,10 +403,10 @@ def _stage_problems(r: RunRecordV1, stage: str) -> list[str]:
                 p.append(
                     f"discarded at {stage}, yet {name} from earlier stage {earlier} is missing"
                 )
-    execute = _STAGE_ORDER.index("execute")
+    execute = _STAGE_ORDER.index(_S.EXECUTE)
     if r.action_attempted and i < execute:
         p.append(f"discarded at {stage}, before execute, yet action_attempted is true")
-    if stage in ("execute", "executed_action") and not r.action_attempted:
+    if stage in (_S.EXECUTE, _S.EXECUTED_ACTION) and not r.action_attempted:
         p.append(f"discarded at {stage}, so the executor was called, yet action_attempted is false")
     return p
 
@@ -485,6 +549,26 @@ def record_problems(r: RunRecordV1) -> list[str]:
         r.proposal is None or r.proposal.recommended_action is None
     ):
         p.append("valid_action without a proposed action")
+    # §11.4: `recommended_action = None` is the no-action proposal. So no_action is a
+    # proposal object with a null action, never a missing proposal (M5 review, item 5).
+    if r.proposal_status == ProposalStatus.NO_ACTION and (
+        r.proposal is None or r.proposal.recommended_action is not None
+    ):
+        p.append("no_action must be a proposal whose recommended_action is null")
+    # Provider failure is not an agent outcome (§7.1): discardable, outside the funnel.
+    if r.proposal_status == ProposalStatus.PROVIDER_FAILURE and (
+        not r.discarded or r.discard_reason is None or r.discard_reason.cause != "provider_failure"
+    ):
+        p.append("provider_failure must be a discard with cause provider_failure")
+    # An executor infrastructure failure is discardable too (§7.1). Envelope refusals,
+    # rejected actions and partial application are real outcomes, and are not discarded.
+    if r.execution is not None and r.execution.status == ExecutionStatus.INFRASTRUCTURE_FAILURE:
+        if (
+            not r.discarded
+            or r.discard_reason is None
+            or (r.discard_reason.cause != "infrastructure_failure")
+        ):
+            p.append("an executor infrastructure_failure must be an infrastructure_failure discard")
     # Ordered along the branch (extract -> shadow gates -> gate), since a run can stop
     # between them; all three, or none, only for a completed run.
     if r.shadow_gates is not None and r.feature_vector is None:
@@ -536,8 +620,7 @@ def record_problems(r: RunRecordV1) -> list[str]:
         p.append("discard_reason must be set exactly when discarded is true")
     d = r.discard_reason
     if d is not None:
-        post = d.stage in POST_AGENT_STAGES
-        if d.phase != ("post_agent" if post else "pre_agent"):
+        if d.phase != stage_phase(d.stage):
             p.append(f"discard stage {d.stage} is not in phase {d.phase}")
         if d.phase == "pre_agent" and (
             r.trajectory is not None or r.execution is not None or r.action_attempted

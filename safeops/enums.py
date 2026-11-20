@@ -34,3 +34,37 @@ class ActionType(StrEnum):
     PATCH_CONFIGMAP = "patch_configmap"
     PATCH_SERVICE = "patch_service"
     PATCH_DEPLOYMENT_RESOURCES = "patch_deployment_resources"
+
+
+class RunStage(StrEnum):
+    """Every stage of one run, in run order (the runner names the stage before running it).
+
+    A closed set: a discard record's stage is one of these, and schema.PRE_AGENT_STAGES /
+    POST_AGENT_STAGES partition it exactly (M5 review, item 2). Add a stage here, and in
+    the runner, and classify it; a test fails if any member is left unclassified.
+    """
+
+    PRE_RUN_CLEAN_STATE = "pre_run_clean_state"
+    START_WORKLOAD = "start_workload"
+    STEADY_STATE = "steady_state"
+    STEADY_STATE_BASELINE = "steady_state_baseline"
+    PREFAULT_SNAPSHOT = "prefault_snapshot"
+    INJECT = "inject"
+    VERIFY_FAULT_PRESENT = "verify_fault_present"
+    FAULT_PRESENT = "fault_present"
+    POSTFAULT_SNAPSHOT = "postfault_snapshot"
+    ALERT = "alert"
+    RUNTIME_CONTEXT = "runtime_context"
+    AGENT = "agent"
+    PARSE = "parse"
+    ROUTE_PROPOSAL = "route_proposal"
+    EXTRACT = "extract"
+    SHADOW_GATES = "shadow_gates"
+    GATE = "gate"
+    ROUTE_GATE = "route_gate"
+    EXECUTE = "execute"
+    EXECUTED_ACTION = "executed_action"
+    STABILIZATION = "stabilization"
+    POSTACTION_SNAPSHOT = "postaction_snapshot"
+    EFFECTIVENESS = "effectiveness"
+    HARM = "harm"

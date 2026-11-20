@@ -831,8 +831,12 @@ def test_review_attempt_needs_an_execute_decision(good) -> None:
     rec = _set(rec, ("execution",), None)
     rec = _set(rec, ("in_cohort_g",), False)
     rec = _set(rec, ("outcome", "category"), None)
-    with pytest.raises(RecordValidationError, match="attempted without a gate decision"):
+    # Phase A's online gate can only say execute (M5 review item 4), so the type refuses it.
+    with pytest.raises(RecordValidationError, match="Input should be 'execute'"):
         _check(rec)
+    no_gate = _set(good, ("gate",), None)
+    with pytest.raises(RecordValidationError, match="attempted without a gate decision"):
+        _check(no_gate)
 
 
 def test_review_a_pre_agent_discard_cannot_claim_an_attempt(dirty) -> None:

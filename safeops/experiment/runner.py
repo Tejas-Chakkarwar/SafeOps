@@ -11,11 +11,13 @@ tests/test_run_sequence.py enforces that.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 from safeops.agent.loop import Agent
 from safeops.agent.parser import ProposalParser
 from safeops.cluster import CommandError
+from safeops.enums import RunStage
 from safeops.environment.manager import CleanStateResult, EnvironmentManager, QuarantineFailed
 from safeops.environment.workload import (
     SteadyStateError,
@@ -88,6 +90,7 @@ class ExperimentRunner:
         self._halt: Exception | None = None
         self._topology = None
         self._wall_clock = lambda: datetime.now(UTC)
+        self._new_run_id = uuid.uuid4
 
     def run(self, unit: RunUnit) -> None:
         """One attempted run. Exactly one record per attempted unit (decision 0017 §1, R1),
@@ -100,7 +103,13 @@ class ExperimentRunner:
 
         # Provenance as of now, when the code that runs is the code recorded (M5 review,
         # finding 3). If it can't be captured, nothing was attempted: no record (R1).
+        # run_id is allocated once, here, and never regenerated: the shadow gates seed
+        # random-p from it (Rule 24), recovery diagnostics name it, and the record and its
+        # filename carry it (M5 review, item 1).
+        run_id = str(self._new_run_id())
+        self.current_run_id = run_id  # for diagnostics outside the record (recovery reasons)
         data: dict = {
+            "run_id": run_id,
             "unit": unit,
             "started_at": self._wall_clock(),
             "provenance": self.records.capture_provenance(unit),
@@ -123,10 +132,12 @@ class ExperimentRunner:
             # record failure never skips the rebuild (M5 second review, finding 3).
             path = self._finalize_then_recover(
                 data,
-                Discard("pre_run_clean_state", "pre_run_dirty", str(exc)),
+                Discard(RunStage.PRE_RUN_CLEAN_STATE, "pre_run_dirty", str(exc)),
                 pre_clean,
                 None,
-                recover=lambda: self._quarantine("pre-run: " + "; ".join(pre_clean.problems[:10])),
+                recover=lambda: self._quarantine(
+                    f"pre-run (run {run_id}): " + "; ".join(pre_clean.problems[:10])
+                ),
             )
             self._note_record(exc, path)
             raise
@@ -138,64 +149,64 @@ class ExperimentRunner:
         # response was lost: the generator may be running anyway (fix list, item 4). The one
         # exception is WorkloadGeneratorBusy, which means the load is someone else's (0009,
         # W5). Then _handle_failure writes the record R1/R2 call for (decision 0017 §1).
-        stage = "start_workload"
+        stage = RunStage.START_WORKLOAD
         try:
             self.workload.start_workload()
-            stage = "steady_state"
+            stage = RunStage.STEADY_STATE
             steady_state = data["steady_state"] = self.workload.verify_steady_state()
-            stage = "steady_state_baseline"  # the check, after the window is recorded
+            stage = RunStage.STEADY_STATE_BASELINE  # the check, after the window is recorded
             self._require_steady_state(steady_state)
-            stage = "prefault_snapshot"
+            stage = RunStage.PREFAULT_SNAPSHOT
             data["prefault"] = env.capture_snapshot()
-            stage = "inject"
+            stage = RunStage.INJECT
             fault = data["fault"] = self.injector.inject(unit.fault_id, unit.fault_seed)
-            stage = "verify_fault_present"
+            stage = RunStage.VERIFY_FAULT_PRESENT
             verification = data["fault_verification"] = self.injector.verify_fault_present(fault)
-            stage = "fault_present"
+            stage = RunStage.FAULT_PRESENT
             self._require_fault_present(verification)
             # Harm baseline (§5, Rule 2), taken once the projection has settled; flagged if
             # it never settled, never silently a mid-transition snapshot (decision 0013).
-            stage = "postfault_snapshot"
+            stage = RunStage.POSTFAULT_SNAPSHOT
             postfault = data["postfault"] = env.capture_settled_snapshot()
 
             # Information wall (§6): only the alert, built from the verified symptom,
             # crosses into the runtime. The fault and its spec stay on this side.
-            stage = "alert"
+            stage = RunStage.ALERT
             alert = data["alert"] = self.alerts.build_alert(verification)
-            stage = "runtime_context"
+            stage = RunStage.RUNTIME_CONTEXT
             context = self._runtime_context(alert)
-            stage = "agent"
+            stage = RunStage.AGENT
             raw_output, trajectory = self.agent.investigate(context)
             data["trajectory"] = trajectory  # from here on, R2: a record however it ends
-            stage = "parse"
+            stage = RunStage.PARSE
             proposal = data["proposal"] = self.parser.parse(raw_output)
 
             executed_action = None
-            stage = "route_proposal"
+            stage = RunStage.ROUTE_PROPOSAL
             action = self._gate_eligible_action(proposal)
             if action is not None:
-                stage = "extract"
+                stage = RunStage.EXTRACT
                 features = data["features"] = self.extractor.extract(proposal, trajectory, context)
-                stage = "shadow_gates"
-                data["shadow_scores"] = self.shadow_gates.score(features)
-                stage = "gate"
+                stage = RunStage.SHADOW_GATES
+                data["shadow_scores"] = self.shadow_gates.score(features, run_id=run_id)
+                stage = RunStage.GATE
                 decision = data["decision"] = self.gate.decide(features)
-                stage = "route_gate"
+                stage = RunStage.ROUTE_GATE
                 if self._should_execute(decision):
-                    stage = "execute"
+                    stage = RunStage.EXECUTE
                     data["action_attempted"] = True  # before the call: it may raise mid-way
                     execution = data["execution"] = self.executor.apply(action)
-                    stage = "executed_action"
+                    stage = RunStage.EXECUTED_ACTION
                     executed_action = self._executed_action(action, execution)
 
             # Verification, against the post-fault snapshot (§11.7).
-            stage = "stabilization"
+            stage = RunStage.STABILIZATION
             data["stabilized"] = env.wait_stabilization_window()
-            stage = "postaction_snapshot"
+            stage = RunStage.POSTACTION_SNAPSHOT
             postaction = data["postaction"] = env.capture_snapshot()
-            stage = "effectiveness"
+            stage = RunStage.EFFECTIVENESS
             effective = self.effectiveness.verify(steady_state)
-            stage = "harm"
+            stage = RunStage.HARM
             harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)
             data["effective"], data["harm"] = effective, harm
         except BaseException as exc:
@@ -256,11 +267,19 @@ class ExperimentRunner:
         env = self.environment
         problems: list[str] = []
         interrupt: BaseException | None = None
+
+        def keep(exc: BaseException) -> None:
+            # Every block accumulates the same way: once an interrupt-class exception is
+            # captured, later blocks can neither clear nor replace it (M5 review, item 10).
+            nonlocal interrupt
+            if interrupt is None and not isinstance(exc, Exception):
+                interrupt = exc
+
         try:
             self.workload.stop_workload()
         except BaseException as exc:
             problems.append(f"stop_workload failed: {type(exc).__name__}: {exc}")
-            interrupt = None if isinstance(exc, Exception) else exc
+            keep(exc)
         try:
             env.reset_environment()
             post_clean = env.verify_clean_state()
@@ -268,7 +287,7 @@ class ExperimentRunner:
             post_clean = CleanStateResult(
                 False, (f"post-run reset failed: {type(exc).__name__}: {exc}",)
             )
-            interrupt = interrupt or (None if isinstance(exc, Exception) else exc)
+            keep(exc)
         if problems:
             post_clean = CleanStateResult(False, tuple(problems) + post_clean.problems)
         return post_clean, interrupt
@@ -292,7 +311,8 @@ class ExperimentRunner:
         - From the agent on, the run is cleaned up, recorded as discarded with all its data,
           then recovered if dirty, in that order. Its exception surfaces as PostAgentDiscard.
         """
-        r2 = data.get("trajectory") is not None or data["action_attempted"]
+        # R2 starts with the first recorded trajectory step (the sink contract, item 7).
+        r2 = bool(data.get("trajectory")) or data["action_attempted"]
         aborted = not isinstance(exc, Exception)
         if not r2 and (aborted or isinstance(exc, NotImplementedStage)):
             raise exc
@@ -405,7 +425,8 @@ class ExperimentRunner:
         """
         if clean_state.clean:
             return
-        self._quarantine("post-run: " + "; ".join(clean_state.problems[:10]))
+        run = getattr(self, "current_run_id", None)
+        self._quarantine(f"post-run (run {run}): " + "; ".join(clean_state.problems[:10]))
 
 
 def _cause(exc: BaseException, data: dict, aborted: bool) -> str:
