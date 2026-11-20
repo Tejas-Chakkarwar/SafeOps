@@ -1,6 +1,6 @@
 # 0017 — Requirements carried from Milestone 4 into Milestones 5, 6 and 11
 
-**Status:** Accepted (2026-11-19), recorded at the Milestone 4 closeout. **Recorded, not implemented.** Each item names the milestone that must satisfy it before that milestone's acceptance criterion counts as met.
+**Status:** Accepted (2026-11-19), recorded at the Milestone 4 closeout; §6 added at the final review. **Recorded, not implemented.** Each item names the milestone that must satisfy it before that milestone's acceptance criterion counts as met.
 **Design refs:** §5, §7.1, §7.2, §11.1, §11.3, §11.8; decisions 0009, 0011, 0013, 0015
 
 ## 1. BLOCKING for Milestone 5: a verifier or harness exception after the agent starts must still produce a record
@@ -65,6 +65,20 @@ Don't redesign the loadgen metrics.
 6. checks that the previous run's window is no longer listed and returns 404 by id, that `dispatched_total` restarted from zero for the new run, and that the new run measures a window normally.
 
 It is a live assertion of the measurement infrastructure's run boundary. Write it at Milestone 5, not as part of the Milestone 4 closeout.
+
+## 6. Milestones 6 and 12: the host and node clocks must be compared each run
+
+- The harness stamps `Alert.fired_at`, `IncidentRuntimeContext.now` and `InjectedFault.injected_at` with the **host's** clock (macOS). Kubernetes events, container logs and Prometheus samples carry the **kind node's** clock, which is the Docker Desktop VM's.
+- Measured at the final Milestone 4 review (2026-11-19), node minus host was +0.05 to +0.14 s, and that includes `docker exec` latency. That's harmless today.
+- But Docker Desktop's VM clock can drift, for example after the host sleeps, and nothing would notice. The alert would then claim an onset the cluster's own timeline contradicts.
+
+**Requirement:**
+- **Milestone 6:** before the agent's time-windowed tools (`last_minutes`, the metric `window`) are trusted, the harness measures the host–node clock offset at the start of each run and records it in the run record.
+- **Milestone 12:** a run whose offset exceeds a bound is flagged, before the `telemetry_conflict` rule "event timeline contradicts claimed failure onset" (§11.5) compares the two clocks. The bound is decided then, from the measured offsets.
+
+The mechanism is open:
+- reading the node's time over decision 0012's host-side `docker exec` would widen that capability's stated use (clean-state inspection only), so it needs its own decision;
+- an API-server-side source, such as a response `Date` header, needs none.
 
 ## Not carried
 
