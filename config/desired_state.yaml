@@ -1,7 +1,7 @@
 # Desired testbed state (decision 0013): the canonical snapshot a clean testbed must
 # match. Generated from manifests/testbed and config/topology.yaml by
 # `make desired-state`. Do not edit by hand. tests/test_snapshot.py fails on drift.
-projection_version: 1
+projection_version: 2
 resources:
   ConfigMap/db-pool-config:
     approved_keys_sha256: ae93d104e5984424977736d9302130506f47e4b32e92ee59dd211798d9c99b05
@@ -32,24 +32,28 @@ resources:
         failureThreshold: 3
         httpGet:
           host: null
+          httpHeaders: []
           path: /healthz
           port: http
           scheme: HTTP
         initialDelaySeconds: 0
         periodSeconds: 10
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       name: gateway
       readinessProbe:
         failureThreshold: 3
         httpGet:
           host: null
+          httpHeaders: []
           path: /readyz
           port: http
           scheme: HTTP
         initialDelaySeconds: 0
         periodSeconds: 5
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       resources:
         limits:
@@ -58,6 +62,7 @@ resources:
         requests:
           cpu_millis: 100
           memory_mib: 256
+      startupProbe: null
     replicas: 2
     volumes: []
   Deployment/inventory:
@@ -77,24 +82,28 @@ resources:
         failureThreshold: 3
         httpGet:
           host: null
+          httpHeaders: []
           path: /healthz
           port: http
           scheme: HTTP
         initialDelaySeconds: 0
         periodSeconds: 10
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       name: inventory
       readinessProbe:
         failureThreshold: 3
         httpGet:
           host: null
+          httpHeaders: []
           path: /readyz
           port: http
           scheme: HTTP
         initialDelaySeconds: 0
         periodSeconds: 5
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       resources:
         limits:
@@ -103,6 +112,7 @@ resources:
         requests:
           cpu_millis: 100
           memory_mib: 256
+      startupProbe: null
     replicas: 2
     volumes: []
   Deployment/orders:
@@ -150,24 +160,28 @@ resources:
         failureThreshold: 3
         httpGet:
           host: null
+          httpHeaders: []
           path: /healthz
           port: http
           scheme: HTTP
         initialDelaySeconds: 0
         periodSeconds: 10
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       name: orders
       readinessProbe:
         failureThreshold: 3
         httpGet:
           host: null
+          httpHeaders: []
           path: /readyz
           port: http
           scheme: HTTP
         initialDelaySeconds: 0
         periodSeconds: 5
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       resources:
         limits:
@@ -176,6 +190,7 @@ resources:
         requests:
           cpu_millis: 100
           memory_mib: 256
+      startupProbe: null
     replicas: 2
     volumes: []
   Deployment/payment:
@@ -195,24 +210,28 @@ resources:
         failureThreshold: 3
         httpGet:
           host: null
+          httpHeaders: []
           path: /healthz
           port: http
           scheme: HTTP
         initialDelaySeconds: 0
         periodSeconds: 10
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       name: payment
       readinessProbe:
         failureThreshold: 3
         httpGet:
           host: null
+          httpHeaders: []
           path: /readyz
           port: http
           scheme: HTTP
         initialDelaySeconds: 0
         periodSeconds: 5
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       resources:
         limits:
@@ -221,6 +240,7 @@ resources:
         requests:
           cpu_millis: 100
           memory_mib: 256
+      startupProbe: null
     replicas: 2
     volumes: []
   PersistentVolumeClaim/data-postgres-0:
@@ -318,6 +338,7 @@ resources:
         initialDelaySeconds: 0
         periodSeconds: 10
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       name: postgres
       readinessProbe:
@@ -332,6 +353,7 @@ resources:
         initialDelaySeconds: 0
         periodSeconds: 5
         successThreshold: 1
+        terminationGracePeriodSeconds: null
         timeoutSeconds: 1
       resources:
         limits:
@@ -340,6 +362,7 @@ resources:
         requests:
           cpu_millis: 100
           memory_mib: 256
+      startupProbe: null
     replicas: 1
     serviceName: postgres-svc
     volumeClaimTemplates:

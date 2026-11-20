@@ -269,14 +269,15 @@ def test_any_rebuild_crash_keeps_the_marker_and_raises_quarantine_failed(tmp_pat
     assert env._marker.is_file()
 
 
-def test_post_run_quarantine_crash_still_lets_the_record_be_written(offline_runner_factory) -> None:
+def test_post_run_quarantine_crash_becomes_quarantine_failed(offline_runner_factory) -> None:
     r = offline_runner_factory()
 
     def crash(reason=""):
         raise RuntimeError("unexpected")
 
     r.environment.quarantine_and_rebuild = crash
-    assert r._post_run_clean(CleanStateResult(False, ("x",))) is False  # no exception here
+    with pytest.raises(QuarantineFailed, match="RuntimeError"):
+        r._recover_if_dirty(CleanStateResult(False, ("x",)))
     assert isinstance(r._halt, QuarantineFailed)
 
 
@@ -536,3 +537,250 @@ def test_a_hand_made_slice_does_not_make_the_testbed_look_unstable() -> None:
     }
     slices = [_slice("orders-svc-abc"), _slice("inject", managed=False)]
     assert stability_problems([], [], [svc], slices, [pod]) == []
+
+
+# ============================== third review ===============================================
+
+# --- finalize strictly before recovery; workload stop is cleanup ------------------------------
+
+
+class _Events:
+    def __init__(self):
+        self.log: list[str] = []
+
+
+def _full_runner(
+    events: _Events,
+    *,
+    verify_dirty=False,
+    stop_raises=False,
+    reset_raises=False,
+    quarantine_fails=False,
+):
+    """A real ExperimentRunner driven end to end: every stage after the pre-run phase is
+    a double, the still-stubbed hooks take the full path, and a shared event log records
+    the order of the post-measurement steps."""
+    from tests.conftest import FakeEnvironment, FakeWorkload  # noqa: I001
+
+    from safeops.experiment.runner import ExperimentRunner
+
+    class Env(FakeEnvironment):
+        def __init__(self):
+            super().__init__()
+            self.resets = 0
+
+        def reset_environment(self):
+            self.resets += 1
+            if self.resets == 2:
+                events.log.append("reset")
+                if reset_raises:
+                    raise CommandError("kubectl delete failed: timed out")
+
+        def verify_clean_state(self):
+            if self.resets >= 2:
+                events.log.append("verify")
+                if verify_dirty:
+                    return CleanStateResult(False, ("Deployment/orders: drift",))
+            return CleanStateResult(True, ())
+
+        def quarantine_and_rebuild(self, reason=""):
+            events.log.append("quarantine")
+            if quarantine_fails:
+                raise QuarantineFailed("rebuilt environment is still not clean")
+
+    class Workload(FakeWorkload):
+        def stop_workload(self):
+            events.log.append("stop_workload")
+            if stop_raises:
+                raise CommandError("kubectl replace failed: generator unreachable")
+
+    class Records:
+        def __init__(self):
+            self.fields = None
+
+        def finalize(self, **fields):
+            events.log.append("finalize")
+            self.fields = fields
+
+    class Anything:
+        def __getattr__(self, name):
+            def call(*a, **k):
+                if name == "check":
+                    events.log.append("harm.check")
+                return (object(), object()) if name == "investigate" else object()
+
+            return call
+
+    class Through(ExperimentRunner):
+        def _require_fault_present(self, present):
+            pass
+
+        def _runtime_context(self, alert):
+            return object()
+
+        def _gate_eligible_action(self, proposal):
+            return None
+
+    records = Records()
+    r = Through(
+        environment=Env(),
+        workload=Workload(),
+        injector=Anything(),
+        alerts=Anything(),
+        agent=Anything(),
+        parser=Anything(),
+        extractor=Anything(),
+        shadow_gates=Anything(),
+        gate=Anything(),
+        executor=Anything(),
+        effectiveness=Anything(),
+        harm=Anything(),
+        records=records,
+    )
+    return r, records
+
+
+def _run(r):
+    from safeops.experiment.runner import RunUnit
+
+    r.run(RunUnit("bad-deployment-config", 0, 0))
+
+
+def test_dirty_post_run_finalizes_before_quarantine() -> None:
+    ev = _Events()
+    r, records = _full_runner(ev, verify_dirty=True)
+    _run(r)
+    assert ev.log.index("finalize") < ev.log.index("quarantine")
+    assert ev.log[-2:] == ["finalize", "quarantine"]
+    assert records.fields["reset_verified"] is False
+
+
+def test_stop_workload_failure_keeps_the_run_and_recovers_after_the_record() -> None:
+    ev = _Events()
+    r, records = _full_runner(ev, stop_raises=True)
+    _run(r)  # no exception escapes: the completed measurements are kept
+    assert ev.log.index("harm.check") < ev.log.index("stop_workload")
+    assert ev.log.index("finalize") < ev.log.index("quarantine")
+    assert records.fields["reset_verified"] is False  # cleanup failed, even though verify was clean
+
+
+def test_post_run_reset_exception_finalizes_before_quarantine() -> None:
+    ev = _Events()
+    r, records = _full_runner(ev, reset_raises=True)
+    _run(r)
+    assert ev.log.index("finalize") < ev.log.index("quarantine")
+    assert records.fields["reset_verified"] is False
+
+
+def test_failed_recovery_halts_only_after_the_record() -> None:
+    ev = _Events()
+    r, records = _full_runner(ev, verify_dirty=True, quarantine_fails=True)
+    with pytest.raises(QuarantineFailed):
+        _run(r)
+    assert ev.log.index("finalize") < ev.log.index("quarantine")
+    assert records.fields is not None  # the record exists although the worker halted
+    with pytest.raises(QuarantineFailed):  # and the halted runner refuses further runs
+        _run(r)
+
+
+def test_clean_post_run_does_not_quarantine() -> None:
+    ev = _Events()
+    r, records = _full_runner(ev)
+    _run(r)
+    assert "quarantine" not in ev.log and records.fields["reset_verified"] is True
+
+
+# --- a valid but stale desired_state.yaml is a configuration error ---------------------------
+
+
+def test_stale_desired_state_raises_configuration_error_for_reset_and_verify(monkeypatch) -> None:
+    from safeops.environment import desired as desired_mod
+    from safeops.environment.manager import ConfigurationError
+
+    stale = load_desired_state()  # valid, current projection version...
+    stale.resources[("Deployment", "orders")]["replicas"] = 3  # ...but not what manifests say
+    monkeypatch.setattr(desired_mod, "load_desired_state", lambda *a, **k: stale)
+
+    class NeverCalled:
+        def __getattr__(self, name):
+            raise AssertionError(f"cluster touched ({name}) despite stale configuration")
+
+    env = EnvironmentManager(kubectl=NeverCalled(), node=NeverCalled(), image_check=False)
+    with pytest.raises(ConfigurationError, match="stale; run make desired-state"):
+        env.verify_clean_state()
+    with pytest.raises(ConfigurationError, match="stale; run make desired-state"):
+        env.reset_environment()
+
+
+def test_committed_desired_state_is_current() -> None:
+    from safeops.environment.desired import desired_snapshot
+
+    assert snap.diff(load_desired_state(), desired_snapshot()) == []
+
+
+# --- probes: every behavior-relevant field is projected --------------------------------------
+
+
+def _probe_deployment(**probe_overrides):
+    values = manifests.template_values(CFG, manifests.image_refs())
+    objs = {
+        o["metadata"]["name"]: o
+        for f in manifests.manifest_files("testbed")
+        for o in manifests.load_objects(f, values)
+        if o["kind"] == "Deployment"
+    }
+    d = copy.deepcopy(objs["orders"])
+    probe = d["spec"]["template"]["spec"]["containers"][0]["readinessProbe"]
+    for key, value in probe_overrides.items():
+        if key == "httpHeaders":
+            probe["httpGet"]["httpHeaders"] = value
+        else:
+            probe[key] = value
+    return d
+
+
+def test_http_probe_header_change_is_a_snapshot_diff() -> None:
+    a = _probe_deployment(httpHeaders=[{"name": "X-Probe", "value": "a"}])
+    b = _probe_deployment(httpHeaders=[{"name": "X-Probe", "value": "b"}])
+    assert snap.deployment(a) != snap.deployment(b)
+    assert snap.deployment(_probe_deployment()) != snap.deployment(a)  # adding a header too
+
+
+def test_http_probe_header_canonicalization_is_stable() -> None:
+    a = _probe_deployment(
+        httpHeaders=[{"name": "X-A", "value": "1"}, {"name": "x-b", "value": "2"}]
+    )
+    b = _probe_deployment(
+        httpHeaders=[{"name": "X-B", "value": "2"}, {"name": "x-a", "value": "1"}]
+    )
+    assert snap.deployment(a) == snap.deployment(b)  # order and name case don't matter
+    c = _probe_deployment(
+        httpHeaders=[{"name": "X-A", "value": "1"}, {"name": "X-A", "value": "1"}]
+    )
+    d = _probe_deployment(httpHeaders=[{"name": "X-A", "value": "1"}])
+    assert snap.deployment(c) != snap.deployment(d)  # a repeated header is meaningful
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"terminationGracePeriodSeconds": 5},
+        {"periodSeconds": 3},
+        {"timeoutSeconds": 4},
+        {"failureThreshold": 1},
+        {"successThreshold": 2},
+        {"initialDelaySeconds": 9},
+    ],
+)
+def test_every_probe_timing_field_is_projected(override) -> None:
+    assert snap.deployment(_probe_deployment(**override)) != snap.deployment(_probe_deployment())
+
+
+def test_startup_probe_is_projected() -> None:
+    a = _probe_deployment()
+    b = copy.deepcopy(a)
+    b["spec"]["template"]["spec"]["containers"][0]["startupProbe"] = {
+        "httpGet": {"path": "/healthz", "port": "http"},
+        "failureThreshold": 1,
+    }
+    assert snap.deployment(a) != snap.deployment(b)

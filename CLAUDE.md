@@ -8,12 +8,19 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 
 ## Current milestone
 
-> **Milestone 3 — lifecycle + canonical snapshotter.**
-> Done when reset→verify passes 10× consecutively, deliberately corrupting state makes verify fail, the quarantine path is tested, and a rollout and a restart each produce zero spurious snapshot diffs. Plus decision 0003's F3: a planted netem qdisc and a planted stress-ng workload, each with no Chaos CR present, must each make `verify_clean_state` fail.
+> **Milestone 4 — first fault + alert generator.**
+> Done when injection reliably produces measurable errors, silent non-injection is caught, and the alert is built from symptoms only (design §14).
+>
+> Also lands in Milestone 4, already decided:
+> - a bounded **post-fault settledness** check before the harm-baseline snapshot: poll the canonical projection until it's identical across two consecutive intervals, and flag it if it doesn't settle. It's separate from Milestone 3's health stabilization, and observed from cluster state, never declared per fault (decision 0013, third review)
+> - `Alert` and `IncidentRuntimeContext` live outside `safeops.faults`; the fault id is validated before it's used as a path; the seed range is decided (decision 0004 notes)
+> - `memory-limit-low` lowers request and limit together (decision 0011)
+> - the Milestone 4 reference reading first: ITBench `scenarios/sre/` and the AIOpsLab fault library, as a short targeted pass
 
 Completed:
 - Milestone 1 (`8cd8986`, review fixes `2f32bcb`). Acceptance command and rationale are in decision 0004.
 - Milestone 2 (`cdc9178`, review fixes `c3db4ef`, closeout `d5609eb`). Decisions 0006–0011.
+- Milestone 3 (`4e7b76d`, review fixes `f6a7173`, `e7c50ca`, third-review fixes in the closing commit). Decisions 0012–0013.
 
 Update this line as milestones complete. Work on the current milestone only. The design document lists 17; do not run ahead. Milestone N's acceptance criterion must pass before N+1 starts.
 

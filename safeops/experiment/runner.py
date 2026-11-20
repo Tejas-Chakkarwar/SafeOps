@@ -120,16 +120,28 @@ class ExperimentRunner:
         postaction = env.capture_snapshot()
         effective = self.effectiveness.verify(steady_state)
         harm = self.harm.check(executed_action, context, postfault, postaction)
-        self.workload.stop_workload()
 
-        # Post-run. A completed run is kept even if this reset fails (§11.1).
+        # Measurements are complete. Everything from here on is cleanup, and no cleanup
+        # failure may erase the run (§11.1; Milestone 3 third review). Order:
+        #   1. clean up: stop the workload, reset, verify (failures become "not clean")
+        #   2. determine reset_verified
+        #   3. finalize the record
+        #   4. only then recover a dirty environment (quarantine + rebuild)
+        #   5. a failed recovery halts the worker, after the record exists
+        cleanup_problems: list[str] = []
+        try:
+            self.workload.stop_workload()
+        except Exception as exc:
+            cleanup_problems.append(f"stop_workload failed: {type(exc).__name__}: {exc}")
         try:
             env.reset_environment()
             post_clean = env.verify_clean_state()
-        except Exception as exc:  # any failure here (even an expired credential, R2): keep the run
+        except Exception as exc:  # any failure here (even an expired credential): keep the run
             post_clean = CleanStateResult(
                 False, (f"post-run reset failed: {type(exc).__name__}: {exc}",)
             )
+        if cleanup_problems:
+            post_clean = CleanStateResult(False, tuple(cleanup_problems) + post_clean.problems)
         reset_verified = self._post_run_clean(post_clean)
         self.records.finalize(
             unit=unit,
@@ -148,8 +160,7 @@ class ExperimentRunner:
             harm=harm,
             reset_verified=reset_verified,
         )
-        if self._halt is not None:  # the record is written first; then the worker halts
-            raise self._halt
+        self._recover_if_dirty(post_clean)  # strictly after the record
 
     # Runner hooks: points where the runner interprets a stage's result.
 
@@ -195,25 +206,32 @@ class ExperimentRunner:
         """Return the action the harm checker should judge, given the execution status."""
 
     def _post_run_clean(self, clean_state) -> bool:
-        """Return reset_verified. On failure, keep the run and quarantine (§11.1).
+        """Return reset_verified for the record. Pure: no recovery happens here.
 
         A completed run is never discarded for a failed cleanup: the hardest runs to clean
-        up are the ones where the agent did the most damage. If the rebuild also fails,
-        the run's record is still written; then the worker halts.
+        up are the ones where the agent did the most damage (§11.1).
+        """
+        return bool(clean_state.clean)
+
+    def _recover_if_dirty(self, clean_state) -> None:
+        """After the record is finalized: quarantine and rebuild a dirty environment.
+
+        If recovery fails, the worker halts: QuarantineFailed is raised here and kept, so
+        the runner refuses later runs. The record already exists by then.
         """
         if clean_state.clean:
-            return True
+            return
         try:
             self.environment.quarantine_and_rebuild(
                 reason="post-run: " + "; ".join(clean_state.problems[:10])
             )
-        except Exception as exc:  # anything at all: the record is written first (review M3)
+        except Exception as exc:
             self._halt = (
                 exc
                 if isinstance(exc, QuarantineFailed)
                 else QuarantineFailed(f"quarantine failed: {type(exc).__name__}: {exc}")
             )
-        return False
+            raise self._halt from exc
 
 
 def build_runner() -> ExperimentRunner:

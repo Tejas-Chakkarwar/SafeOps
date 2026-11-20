@@ -79,6 +79,7 @@ RUN_SEQUENCE: tuple[Stage, ...] = (
     Stage("verify clean state", EnvironmentManager, "verify_clean_state"),
     Stage("handle post-run clean state", ExperimentRunner, "_post_run_clean"),
     Stage("finalize run record", RunRecordWriter, "finalize"),
+    Stage("recover a dirty environment (after the record)", ExperimentRunner, "_recover_if_dirty"),
 )
 
 

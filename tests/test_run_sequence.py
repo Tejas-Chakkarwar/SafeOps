@@ -68,6 +68,7 @@ def _traced_runner(recorder: _Recorder, *, eligible: bool, execute: bool) -> Exp
         "_should_execute": execute,
         "_executed_action": object(),
         "_post_run_clean": True,
+        "_recover_if_dirty": None,
     }
     traced = type(
         "TracedRunner",

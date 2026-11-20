@@ -8,7 +8,8 @@ normalized, so a manifest and the live object it produced project identically.
 
 Projected fields (§11.1):
   Deployment   replicas; per container: image, env (incl. ConfigMap/Secret refs), envFrom,
-               readiness and liveness probes, resource requests and limits (kept separate,
+               readiness, liveness and startup probes (every Probe field), resource
+               requests and limits (kept separate,
                decision 0011); config volumes
   Service      selector, ports, headless, type, ready_endpoint_count,
                endpoint_owner_services (from EndpointSlices)
@@ -30,7 +31,7 @@ from fractions import Fraction
 PROJECTED_KINDS = ("Deployment", "Service", "ConfigMap", "StatefulSet", "PersistentVolumeClaim")
 # Created by Kubernetes in every namespace; not part of the testbed (same rule as ownership).
 IGNORED = frozenset({("ConfigMap", "kube-root-ca.crt")})
-SNAPSHOT_PROJECTION_VERSION = 1
+SNAPSHOT_PROJECTION_VERSION = 2  # 2: full Probe projection + startupProbe (0013)
 
 
 # --- quantities --------------------------------------------------------------------------
@@ -79,20 +80,42 @@ _PROBE_DEFAULTS = {
     "timeoutSeconds": 1,
     "successThreshold": 1,
     "failureThreshold": 3,
+    "terminationGracePeriodSeconds": None,  # probe-level override; None = pod's own grace period
 }
 
 
 def _probe(p: dict | None) -> dict | None:
+    """Every behavior-relevant field of a Kubernetes v1 Probe (audited at the Milestone 3
+    third review, against core/v1 Probe and ProbeHandler):
+
+      handlers  exec.command; httpGet.{path, port, host, scheme, httpHeaders};
+                tcpSocket.{port, host}; grpc.{port, service}
+      timing    initialDelaySeconds, periodSeconds, timeoutSeconds, successThreshold,
+                failureThreshold, terminationGracePeriodSeconds
+
+    No field of Probe is excluded. Defaults are applied, so a manifest and the live object
+    project identically. HTTP header names are lowercased, because header names are
+    case-insensitive in HTTP, and headers are sorted by (name, value); values are kept
+    exactly. Repeated headers are kept, since repetition is meaningful.
+    """
     if not p:
         return None
     out: dict = {k: p.get(k, v) for k, v in _PROBE_DEFAULTS.items()}
     if "httpGet" in p:
         h = p["httpGet"]
+        headers = sorted(
+            (
+                {"name": str(x.get("name", "")).lower(), "value": x.get("value", "")}
+                for x in h.get("httpHeaders") or []
+            ),
+            key=lambda x: (x["name"], x["value"]),
+        )
         out["httpGet"] = {
             "path": h.get("path", "/"),
             "port": h.get("port"),
             "scheme": h.get("scheme", "HTTP"),
             "host": h.get("host"),
+            "httpHeaders": headers,
         }
     if "exec" in p:
         out["exec"] = {"command": list(p["exec"].get("command") or [])}
@@ -146,6 +169,9 @@ def _containers(spec: dict) -> list:
                 "envFrom": _env_from(c.get("envFrom")),
                 "readinessProbe": _probe(c.get("readinessProbe")),
                 "livenessProbe": _probe(c.get("livenessProbe")),
+                # Not in §11.1's list, but it gates readiness and can restart the
+                # container, so it's projected too (decision 0013, third review).
+                "startupProbe": _probe(c.get("startupProbe")),
                 "resources": _resources(c.get("resources")),
             }
         )

@@ -332,23 +332,30 @@ def test_pre_run_dirty_quarantines_and_discards(offline_runner_factory) -> None:
     r._require_pre_run_clean(CleanStateResult(True, ()))  # clean: nothing happens
 
 
-def test_post_run_dirty_keeps_the_run_and_quarantines(offline_runner_factory) -> None:
+def test_post_run_clean_is_pure_and_recovery_is_separate(offline_runner_factory) -> None:
+    """Third review: _post_run_clean only decides reset_verified; recovery happens later,
+    in _recover_if_dirty, after the record (ordering is tested in test_m3_review)."""
     r = offline_runner_factory()
     assert r._post_run_clean(CleanStateResult(True, ())) is True
     assert r._post_run_clean(CleanStateResult(False, ("x",))) is False
+    assert r.environment.calls == []  # no recovery from the decision itself
+    r._recover_if_dirty(CleanStateResult(True, ()))
+    assert r.environment.calls == []
+    r._recover_if_dirty(CleanStateResult(False, ("x",)))
     assert r.environment.calls == ["quarantine_and_rebuild"]
     assert r._halt is None
 
 
-def test_post_run_failed_rebuild_halts_after_the_record(offline_runner_factory) -> None:
+def test_failed_recovery_halts_the_worker(offline_runner_factory) -> None:
     r = offline_runner_factory()
 
     def fail(reason=""):
         raise QuarantineFailed("still dirty")
 
     r.environment.quarantine_and_rebuild = fail
-    assert r._post_run_clean(CleanStateResult(False, ("x",))) is False
-    assert isinstance(r._halt, QuarantineFailed)  # raised by run() only after finalize
+    with pytest.raises(QuarantineFailed):
+        r._recover_if_dirty(CleanStateResult(False, ("x",)))
+    assert isinstance(r._halt, QuarantineFailed)
 
 
 # --- node inspector (host-side docker exec, fail closed) ---

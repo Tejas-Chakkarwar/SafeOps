@@ -339,10 +339,12 @@ class EnvironmentManager:
     def _configuration(self) -> tuple:
         """Everything reset and verify compare against. A failure here is misconfiguration
         (ConfigurationError), never a dirty environment (R1)."""
-        from safeops.environment.desired import load_desired_state
+        from safeops.environment import snapshot
+        from safeops.environment.desired import desired_snapshot, load_desired_state
 
         try:
             desired_state = load_desired_state()
+            current = desired_snapshot()  # what the current manifests + topology generate
             desired_objects = self._desired_objects()
             rbac = self._rbac_allowlist()
             _ = self.topology
@@ -352,6 +354,14 @@ class EnvironmentManager:
             raise ConfigurationError(
                 f"SafeOps configuration could not be loaded: {type(exc).__name__}: {exc}"
             ) from exc
+        # A valid but stale file would make reset and verify chase an old target (third
+        # review). Never rewritten here: regenerating it is a reviewed, committed change.
+        stale = snapshot.diff(desired_state, current)
+        if stale:
+            raise ConfigurationError(
+                "config/desired_state.yaml is stale; run make desired-state"
+                f" ({len(stale)} differences, e.g. {stale[0]})"
+            )
         if self._image_check:
             self._check_images_loaded()
         return desired_state, desired_objects, rbac
