@@ -26,6 +26,38 @@ Both verifiers are stubs today, so this is inert until Milestone 7. That is also
 
 **Already right, and to keep:** failures before the agent starts are pre-run discards (§11.1). Stopping the load in that handler is cleanup, not classification (0015 amendments).
 
+### §1 resolved (2026-11-19, before the Milestone 5 schema), answered by the user
+
+**Two rules, so the next case resolves itself:**
+- **R1. Exactly one record per attempted experimental unit, and none for anything else.** A pre-agent discard is an attempt. A stub abort (`NotImplementedStage`) is not.
+- **R2. Once the agent has produced a trajectory, or an action has been attempted on the cluster, a record is written however the run ends.** R2 overrides R1's exclusions.
+
+**Classifying runs:**
+- **A post-agent harness or verifier failure** is discarded, with its data kept:
+  - `discarded = true`;
+  - `effective` and `harmful` are null;
+  - trajectory, proposal and execution data are preserved;
+  - it counts in the discard rate and is outside cohort G.
+
+  That follows §7.1 (discardable) and §7.4 (harness reliability, discard rate). Putting it in the headline reliability number is the opposite of losing it quietly.
+- **A pre-agent discard** (dirty pre-run environment, no baseline, failed injection, silent non-injection, an unmeasurable detection window) writes a discard record in the same schema, with everything measured before the failure. The discard rate is computed from records, never from logs. The silent non-injection rate per fault and per variant is a result in its own right, and it can only be analyzed if it is in the dataset.
+- **`NotImplementedStage`** never writes a record. A stub is the program being unfinished, not an experimental outcome, and records for stubs would fill `data/runs/` with development artifacts that every analysis must filter out; a filter that must always be applied is one someone eventually forgets. Until the agent exists, "every run writes one" is proven with fabricated doubles for the unbuilt stages, plus live runs that end in pre-agent discard records.
+- **`KeyboardInterrupt`** writes no record today, because every real run stops at a stub before the agent exists, so nothing has happened.
+  - **From Milestone 9**, when the agent is real, an interrupt after the agent has produced a trajectory, or after an action was attempted, takes the R2 path: a record with discard stage `operator_abort`.
+  - Otherwise the hole closed at Milestone 5 would reopen at Milestone 9, with the operator as the cause instead of a crash. The debris is identical either way.
+  - The runner implements R2 generically, so this needs no new code at Milestone 9; it is tested now with doubles.
+
+**The safety claim needs this, not only the reliability number.**
+- If the harm checker is most likely to crash on the strangest agent actions, excluding those runs removes harmful runs preferentially and biases the harmful-action rate downward. So:
+  - `discard_reason` encodes the **stage** that failed, not only the exception;
+  - analysis can always separate **pre-agent** from **post-agent** discards;
+  - every post-agent discard whose `execution` is non-null is reported as a **measurement gap in the safety claim**, with its own count, not folded into the discard rate alone;
+  - if that count is non-trivial, the headline harmful-action rate carries a stated caveat naming how many executed actions went unmeasured.
+
+**Validator requirements this creates (Milestone 5):**
+- **The required set is exactly:** `unit`, the timestamps, `schema_version`, `discarded` and `discard_reason`. Everything downstream is nullable, because a dirty-pre-run discard has no steady state, no snapshots and no alert.
+- **Monotonic stage presence**, which a strict field check doesn't give you: if a later stage's data is present, every earlier stage's data must be too. A record with a proposal but no alert is a writer bug, and strict field validation alone would pass it.
+
 ## 2. Milestone 5: the settledness condition must reach the record
 
 `EnvironmentManager.capture_settled_snapshot` (`manager.py:403`) returns a `SettledSnapshot` with `settled`, `polls`, `elapsed_s` and `last_changes`. The runner passes the whole object to `records.finalize(postfault=…)`.

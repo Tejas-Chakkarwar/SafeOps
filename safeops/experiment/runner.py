@@ -18,21 +18,32 @@ from safeops.agent.parser import ProposalParser
 from safeops.cluster import CommandError
 from safeops.environment.manager import CleanStateResult, EnvironmentManager, QuarantineFailed
 from safeops.environment.workload import (
+    SteadyStateError,
     WorkloadGenerator,
     WorkloadGeneratorBusy,
     check_steady_state,
 )
 from safeops.executor.executor import ActionExecutor
-from safeops.experiment.records import RunRecordWriter
+from safeops.experiment.records import RECORD_FIELDS, Discard, RunRecordWriter
 from safeops.experiment.unit import RunUnit
 from safeops.faults.alerts import AlertGenerator
-from safeops.faults.injector import FaultInjector, FaultNotPresent
+from safeops.faults.injector import (
+    FaultInjectionError,
+    FaultInjector,
+    FaultNotPresent,
+    FaultVerificationFailed,
+)
 from safeops.features.extractor import RiskFeatureExtractor
 from safeops.gate.always_act import AlwaysActGate
 from safeops.gate.shadow import ShadowGateScorer
-from safeops.stubs import stub
+from safeops.stubs import NotImplementedStage, stub
 from safeops.verify.effectiveness import EffectivenessVerifier
 from safeops.verify.harm import HarmChecker
+
+
+class PostAgentDiscard(Exception):
+    """A harness or verifier failure after the agent started. The run was recorded as
+    discarded with all its data, cleaned up, and recovered if dirty (decision 0017 §1)."""
 
 
 class PreRunDiscard(Exception):
@@ -40,7 +51,7 @@ class PreRunDiscard(Exception):
     (§11.1), and the worker was quarantined and rebuilt."""
 
 
-__all__ = ["ExperimentRunner", "PreRunDiscard", "RunUnit", "build_runner"]
+__all__ = ["ExperimentRunner", "PostAgentDiscard", "PreRunDiscard", "RunUnit", "build_runner"]
 
 
 class ExperimentRunner:
@@ -79,65 +90,107 @@ class ExperimentRunner:
         self._wall_clock = lambda: datetime.now(UTC)
 
     def run(self, unit: RunUnit) -> None:
+        """One attempted run. Exactly one record per attempted unit (decision 0017 §1, R1),
+        and once the agent has produced a trajectory or an action was attempted, a record
+        however the run ends (R2)."""
         env = self.environment
 
         if self._halt is not None:  # a failed quarantine halted this worker (review L2)
             raise self._halt
 
-        # Pre-run. A failure here is discardable (§7.1, §11.1). A reset that fails outright
-        # counts as a dirty environment: quarantine, then discard (review M2).
+        data: dict = {"unit": unit, "started_at": self._wall_clock()}
+        flags = {"action_attempted": False}
+
+        # Pre-run. A reset that fails outright counts as a dirty environment (review M2).
+        # One that can't produce a result at all (a configuration, guard or credential
+        # error, a quarantined worker) propagates: nothing was attempted, so no record (R1).
         try:
             env.reset_environment()
             pre_clean = env.verify_clean_state()
         except CommandError as exc:
             pre_clean = CleanStateResult(False, (f"pre-run reset failed: {exc}",))
-        self._require_pre_run_clean(pre_clean)
+        data["clean_state_verified"] = pre_clean.clean
+        try:
+            self._require_pre_run_clean(pre_clean)
+        except PreRunDiscard as exc:
+            # The record first, then the rebuild (same order as post-run; decision 0013).
+            self._note_record(
+                exc, self._finalize(data, Discard("pre_run_clean_state", "pre_run_dirty", str(exc)))
+            )
+            self._quarantine("pre-run: " + "; ".join(pre_clean.problems[:10]))
+            raise
+
         # From the start of the load until the measurements are complete, any failure stops
         # the load, so it never leaves the generator busy for the next run. That holds for a
         # pre-agent discard (Milestone 4 review, finding 3), a stub or crash after the agent
         # starts (second review, finding 1), Ctrl-C (finding 5), and a start whose control
         # response was lost: the generator may be running anyway (fix list, item 4). The one
         # exception is WorkloadGeneratorBusy, which means the load is someone else's (0009,
-        # W5). This is cleanup, not classification: how such a run is recorded is Milestone
-        # 5, and an injected fault is left for the next run's pre-run reset.
+        # W5). Then _handle_failure writes the record R1/R2 call for (decision 0017 §1).
+        stage = "start_workload"
         try:
             self.workload.start_workload()
-            steady_state = self.workload.verify_steady_state()
+            stage = "steady_state"
+            steady_state = data["steady_state"] = self.workload.verify_steady_state()
             self._require_steady_state(steady_state)
-            prefault = env.capture_snapshot()
-            fault = self.injector.inject(unit.fault_id, unit.fault_seed)
-            verification = self.injector.verify_fault_present(fault)
+            stage = "prefault_snapshot"
+            data["prefault"] = env.capture_snapshot()
+            stage = "inject"
+            fault = data["fault"] = self.injector.inject(unit.fault_id, unit.fault_seed)
+            stage = "verify_fault_present"
+            verification = data["fault_verification"] = self.injector.verify_fault_present(fault)
+            stage = "fault_present"
             self._require_fault_present(verification)
             # Harm baseline (§5, Rule 2), taken once the projection has settled; flagged if
             # it never settled, never silently a mid-transition snapshot (decision 0013).
-            postfault = env.capture_settled_snapshot()
+            stage = "postfault_snapshot"
+            postfault = data["postfault"] = env.capture_settled_snapshot()
 
             # Information wall (§6): only the alert, built from the verified symptom,
             # crosses into the runtime. The fault and its spec stay on this side.
-            alert = self.alerts.build_alert(verification)
+            stage = "alert"
+            alert = data["alert"] = self.alerts.build_alert(verification)
+            stage = "runtime_context"
             context = self._runtime_context(alert)
+            stage = "agent"
             raw_output, trajectory = self.agent.investigate(context)
-            proposal = self.parser.parse(raw_output)
+            data["trajectory"] = trajectory  # from here on, R2: a record however it ends
+            stage = "parse"
+            proposal = data["proposal"] = self.parser.parse(raw_output)
 
-            features = shadow_scores = decision = execution = executed_action = None
+            executed_action = None
+            stage = "route_proposal"
             action = self._gate_eligible_action(proposal)
             if action is not None:
-                features = self.extractor.extract(proposal, trajectory, context)
-                shadow_scores = self.shadow_gates.score(features)
-                decision = self.gate.decide(features)
+                stage = "extract"
+                features = data["features"] = self.extractor.extract(proposal, trajectory, context)
+                stage = "shadow_gates"
+                data["shadow_scores"] = self.shadow_gates.score(features)
+                stage = "gate"
+                decision = data["decision"] = self.gate.decide(features)
+                stage = "route_gate"
                 if self._should_execute(decision):
-                    execution = self.executor.apply(action)
+                    stage = "execute"
+                    flags["action_attempted"] = True
+                    execution = data["execution"] = self.executor.apply(action)
+                    stage = "executed_action"
                     executed_action = self._executed_action(action, execution)
 
             # Verification, against the post-fault snapshot (§11.7).
-            env.wait_stabilization_window()
-            postaction = env.capture_snapshot()
+            stage = "stabilization"
+            data["stabilized"] = env.wait_stabilization_window()
+            stage = "postaction_snapshot"
+            postaction = data["postaction"] = env.capture_snapshot()
+            stage = "effectiveness"
             effective = self.effectiveness.verify(steady_state)
+            stage = "harm"
             harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)
+            data["effective"], data["harm"] = effective, harm
         except BaseException as exc:
             if not isinstance(exc, WorkloadGeneratorBusy):
                 self._stop_load_after_failure(exc)
-            raise
+            self._handle_failure(data, flags, stage, exc)
+            raise  # _handle_failure always raises; this is never reached
 
         # Measurements are complete. Everything from here on is cleanup, and no cleanup
         # failure may erase the run (§11.1; Milestone 3 third review). Order:
@@ -146,41 +199,98 @@ class ExperimentRunner:
         #   3. finalize the record
         #   4. only then recover a dirty environment (quarantine + rebuild)
         #   5. a failed recovery halts the worker, after the record exists
-        cleanup_problems: list[str] = []
+        post_clean, interrupt = self._cleanup()
+        data["reset_verified"] = self._post_run_clean(post_clean)
+        try:
+            self._finalize(data)
+        finally:
+            if interrupt is None:
+                self._recover_if_dirty(post_clean)  # strictly after the record
+        if interrupt is not None:
+            raise interrupt
+
+    def _cleanup(self) -> tuple[CleanStateResult, BaseException | None]:
+        """Stop the load, reset, verify. Never raises: every failure becomes "not clean".
+
+        A second Ctrl-C during cleanup is remembered rather than raised at once, so the
+        record is still written; the caller then skips recovery and re-raises it (the
+        next run's pre-run check will find the environment dirty).
+        """
+        env = self.environment
+        problems: list[str] = []
+        interrupt: BaseException | None = None
         try:
             self.workload.stop_workload()
-        except Exception as exc:
-            cleanup_problems.append(f"stop_workload failed: {type(exc).__name__}: {exc}")
+        except BaseException as exc:
+            problems.append(f"stop_workload failed: {type(exc).__name__}: {exc}")
+            interrupt = None if isinstance(exc, Exception) else exc
         try:
             env.reset_environment()
             post_clean = env.verify_clean_state()
-        except Exception as exc:  # any failure here (even an expired credential): keep the run
+        except BaseException as exc:  # any failure here (even an expired credential)
             post_clean = CleanStateResult(
                 False, (f"post-run reset failed: {type(exc).__name__}: {exc}",)
             )
-        if cleanup_problems:
-            post_clean = CleanStateResult(False, tuple(cleanup_problems) + post_clean.problems)
-        reset_verified = self._post_run_clean(post_clean)
-        self.records.finalize(
-            unit=unit,
-            steady_state=steady_state,
-            prefault=prefault,
-            fault=fault,
-            fault_verification=verification,
-            postfault=postfault,
-            alert=alert,
-            trajectory=trajectory,
-            proposal=proposal,
-            features=features,
-            shadow_scores=shadow_scores,
-            decision=decision,
-            execution=execution,
-            postaction=postaction,
-            effective=effective,
-            harm=harm,
-            reset_verified=reset_verified,
+            interrupt = interrupt or (None if isinstance(exc, Exception) else exc)
+        if problems:
+            post_clean = CleanStateResult(False, tuple(problems) + post_clean.problems)
+        return post_clean, interrupt
+
+    def _finalize(self, data: dict, discard: Discard | None = None):
+        fields = {k: v for k, v in data.items() if k in RECORD_FIELDS}
+        return self.records.finalize(**fields, discard=discard)
+
+    @staticmethod
+    def _note_record(exc: BaseException, path) -> None:
+        if path is not None:
+            exc.add_note(f"run record: {path}")
+
+    def _handle_failure(self, data: dict, flags: dict, stage: str, exc: BaseException) -> None:
+        """Apply R1/R2 (decision 0017 §1) to a failure after the pre-run check. Always raises.
+
+        - A stub (NotImplementedStage) or an abort (Ctrl-C) before R2 applies is not an
+          attempted experimental outcome: no record.
+        - A pre-agent failure is a discard record. The injected fault, if any, is left for
+          the next run's pre-run reset (decision 0015).
+        - From the agent on, the run is cleaned up, recorded as discarded with all its data,
+          then recovered if dirty, in that order. Its exception surfaces as PostAgentDiscard.
+        """
+        r2 = data.get("trajectory") is not None or flags["action_attempted"]
+        aborted = not isinstance(exc, Exception)
+        if not r2 and (aborted or isinstance(exc, NotImplementedStage)):
+            raise exc
+        discard = Discard(stage, _cause(exc, data, aborted), f"{type(exc).__name__}: {exc}")
+        if discard.phase == "pre_agent":
+            self._note_record(exc, self._finalize(data, discard))
+            raise exc
+        post_clean, interrupt = self._cleanup()
+        data["reset_verified"] = self._post_run_clean(post_clean)
+        try:
+            path = self._finalize(data, discard)
+        finally:
+            if interrupt is None:
+                self._recover_if_dirty(post_clean)
+        if aborted or isinstance(exc, NotImplementedStage) or interrupt is not None:
+            self._note_record(exc, path)
+            raise exc
+        discarded = PostAgentDiscard(
+            f"discarded after the agent started (stage {stage}); recorded with all its data:"
+            f" {type(exc).__name__}: {exc}"
         )
-        self._recover_if_dirty(post_clean)  # strictly after the record
+        self._note_record(discarded, path)
+        raise discarded from exc
+
+    def _quarantine(self, reason: str) -> None:
+        """Quarantine and rebuild. A failure halts the worker: it is kept, and raised."""
+        try:
+            self.environment.quarantine_and_rebuild(reason=reason)
+        except Exception as exc:
+            self._halt = (
+                exc
+                if isinstance(exc, QuarantineFailed)
+                else QuarantineFailed(f"quarantine failed: {type(exc).__name__}: {exc}")
+            )
+            raise self._halt from exc
 
     def _stop_load_after_failure(self, exc: BaseException) -> None:
         """Best-effort stop of the load this run started. A stop failure is attached to the
@@ -193,14 +303,15 @@ class ExperimentRunner:
     # Runner hooks: points where the runner interprets a stage's result.
 
     def _require_pre_run_clean(self, clean_state) -> None:
-        """If not clean: quarantine and rebuild, then discard the run (§5, §11.1).
+        """If not clean, the run is a pre-run discard (§5, §11.1): raise PreRunDiscard.
 
-        A rebuild that fails raises QuarantineFailed: the worker halts.
+        Pure. The runner then writes the discard record and only after that quarantines
+        and rebuilds (record first, as post-run; decisions 0013, 0017 §1). A rebuild that
+        fails raises QuarantineFailed and halts the worker.
         """
         if clean_state.clean:
             return
         reason = "; ".join(clean_state.problems[:10])
-        self.environment.quarantine_and_rebuild(reason=f"pre-run: {reason}")
         raise PreRunDiscard(
             f"environment not clean before the run; discarded and rebuilt: {reason}"
         )
@@ -261,17 +372,26 @@ class ExperimentRunner:
         """
         if clean_state.clean:
             return
-        try:
-            self.environment.quarantine_and_rebuild(
-                reason="post-run: " + "; ".join(clean_state.problems[:10])
-            )
-        except Exception as exc:
-            self._halt = (
-                exc
-                if isinstance(exc, QuarantineFailed)
-                else QuarantineFailed(f"quarantine failed: {type(exc).__name__}: {exc}")
-            )
-            raise self._halt from exc
+        self._quarantine("post-run: " + "; ".join(clean_state.problems[:10]))
+
+
+def _cause(exc: BaseException, data: dict, aborted: bool) -> str:
+    """The discard cause recorded for a failure (decision 0017 §1)."""
+    if aborted:
+        return "operator_abort"
+    if isinstance(exc, NotImplementedStage):
+        return "not_implemented"
+    if isinstance(exc, WorkloadGeneratorBusy):
+        return "workload_generator_busy"
+    if isinstance(exc, SteadyStateError) and data.get("steady_state") is not None:
+        return "no_steady_state"
+    if isinstance(exc, FaultInjectionError):
+        return "injection_failed"
+    if isinstance(exc, FaultVerificationFailed):
+        return "detection_unmeasurable"
+    if isinstance(exc, FaultNotPresent):
+        return "silent_non_injection"
+    return "infrastructure_failure"
 
 
 def build_runner() -> ExperimentRunner:

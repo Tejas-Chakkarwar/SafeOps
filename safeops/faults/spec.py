@@ -15,23 +15,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from safeops.enums import ActionType
 from safeops.experiment.unit import MAX_FAULT_SEED, validate_fault_id
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 FAULTS_DIR = REPO_ROOT / "faults"
 
-# §9.1's frozen action names. The ActionType enum itself arrives at Milestone 8; until
-# then a remediation oracle is checked against these names so a typo can't hide in one.
-ACTION_TYPES = frozenset(
-    {
-        "rollback_deployment",
-        "restart_deployment",
-        "scale_deployment",
-        "patch_configmap",
-        "patch_service",
-        "patch_deployment_resources",
-    }
-)
+# §9.1's frozen action names, from the one ActionType enum, so a typo can't hide in a
+# remediation oracle.
+ACTION_TYPES = frozenset(a.value for a in ActionType)
 
 # Symptom metrics the harness can evaluate on its own measurement path (decision 0015).
 SUPPORTED_METRICS = frozenset({"http_5xx_rate"})

@@ -323,13 +323,27 @@ def test_failed_rebuild_keeps_the_worker_quarantined(tmp_path) -> None:
 
 
 def test_pre_run_dirty_quarantines_and_discards(offline_runner_factory) -> None:
-    from safeops.experiment.runner import PreRunDiscard
+    """The hook only decides; the runner records the discard and only then quarantines
+    (record first, Milestone 5; decision 0017 §1)."""
+    from safeops.experiment.runner import PreRunDiscard, RunUnit
 
     r = offline_runner_factory()
     with pytest.raises(PreRunDiscard, match="discarded"):
         r._require_pre_run_clean(CleanStateResult(False, ("Deployment/orders: drift",)))
-    assert r.environment.calls == ["quarantine_and_rebuild"]
+    assert r.environment.calls == []  # the hook itself is pure now
     r._require_pre_run_clean(CleanStateResult(True, ()))  # clean: nothing happens
+
+    events: list[str] = []
+    r.environment.clean = False
+    real_quarantine = r.environment.quarantine_and_rebuild
+    r.environment.quarantine_and_rebuild = lambda reason="": (
+        events.append("quarantine"),
+        real_quarantine(reason),
+    )
+    r.records.finalize = lambda **fields: events.append(f"finalize:{fields['discard'].cause}")
+    with pytest.raises(PreRunDiscard):
+        r.run(RunUnit("bad-deployment-config", 0, 0))
+    assert events == ["finalize:pre_run_dirty", "quarantine"]
 
 
 def test_post_run_clean_is_pure_and_recovery_is_separate(offline_runner_factory) -> None:

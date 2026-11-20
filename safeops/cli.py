@@ -17,6 +17,8 @@ EXIT_STEADY_STATE = 4  # no valid steady-state baseline
 EXIT_CLUSTER = 5  # guard refusal, missing or expired credential, failed cluster command
 EXIT_DIRTY = 6  # the environment did not verify clean (decision 0013)
 EXIT_DISCARDED = 7  # the run was discarded before the agent started (decision 0015)
+EXIT_POST_AGENT_DISCARD = 8  # discarded after the agent started; recorded (decision 0018)
+EXIT_RECORD = 9  # the run record could not be written or failed validation (decision 0018)
 
 # pretty_exceptions_show_locals=False: a traceback must never dump local variables,
 # because they may later hold API keys or tokens (CLAUDE.md, Secrets).
@@ -95,7 +97,9 @@ def run(
         _fail("run", f"{exc}.", EXIT_USAGE)
 
     from safeops.environment.workload import SteadyStateError
-    from safeops.experiment.runner import PreRunDiscard, build_runner
+    from safeops.experiment.records import RecordWriteError
+    from safeops.experiment.runner import PostAgentDiscard, PreRunDiscard, build_runner
+    from safeops.experiment.schema import RecordValidationError
     from safeops.faults.injector import (
         FaultInjectionError,
         FaultNotPresent,
@@ -106,12 +110,25 @@ def run(
         f" Run unit: fault_id={unit.fault_id}, fault_seed={unit.fault_seed},"
         f" trial_index={unit.trial_index}."
     )
+
+    def recorded(exc: BaseException) -> str:
+        notes = [n for n in getattr(exc, "__notes__", []) if n.startswith("run record:")]
+        return (" " + " ".join(notes) + ".") if notes else ""
+
     try:
         _run_stage("run", lambda: build_runner().run(unit), where)
+    except (RecordValidationError, RecordWriteError) as exc:
+        _fail("run", f"run record not written: {exc}.{where}", EXIT_RECORD)
+    except PostAgentDiscard as exc:
+        _fail("run", f"{exc}.{recorded(exc)}{where}", EXIT_POST_AGENT_DISCARD)
     except (PreRunDiscard, FaultNotPresent, FaultInjectionError, FaultVerificationFailed) as exc:
-        _fail("run", f"discarded before the agent: {exc}.{where}", EXIT_DISCARDED)
+        _fail("run", f"discarded before the agent: {exc}.{recorded(exc)}{where}", EXIT_DISCARDED)
     except SteadyStateError as exc:
-        _fail("run", f"discarded, no steady-state baseline: {exc}.{where}", EXIT_STEADY_STATE)
+        _fail(
+            "run",
+            f"discarded, no steady-state baseline: {exc}.{recorded(exc)}{where}",
+            EXIT_STEADY_STATE,
+        )
     except FaultSpecError as exc:
         _fail("run", f"{exc}.{where}", EXIT_USAGE)
     except _cluster_errors() as exc:  # incl. WorkerQuarantined, ConfigurationError (finding 6)

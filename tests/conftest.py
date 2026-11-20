@@ -3,16 +3,41 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from safeops.environment.manager import CleanStateResult, SettledSnapshot
 from safeops.environment.snapshot import Snapshot
 from safeops.environment.workload import SteadyState
-from safeops.faults.injector import FaultVerification, SymptomObservation
-from safeops.faults.spec import Symptom
+from safeops.experiment.records import RunRecordWriter
+from safeops.faults.injector import (
+    FaultBackendRef,
+    FaultVerification,
+    InjectedFault,
+    SymptomObservation,
+)
+from safeops.faults.spec import Symptom, load_fault_spec
 
 FIXED_TIME = datetime(2026, 11, 19, 18, 0, 0, tzinfo=UTC)
+
+REPO_RUNS_DIR = Path(__file__).resolve().parent.parent / "data" / "runs"
+
+
+def _repo_records() -> set[str]:
+    return {p.name for p in REPO_RUNS_DIR.rglob("*")} if REPO_RUNS_DIR.exists() else set()
+
+
+@pytest.fixture(autouse=True)
+def _never_write_the_real_dataset(tmp_path, monkeypatch):
+    """No test may ever write a record into the repository's data/runs/ (the dataset).
+    Default writers point at a temporary directory, and the dataset is checked untouched."""
+    from safeops.experiment import records
+
+    before = _repo_records()
+    monkeypatch.setattr(records, "RUNS_DIR", tmp_path / "default-runs")
+    yield
+    assert _repo_records() == before, "a test wrote into the repository's data/runs/"
 
 
 class FakeEnvironment:
@@ -65,7 +90,17 @@ class FakeInjector:
 
     def inject(self, fault_id: str, fault_seed: int):
         self.calls.append("inject")
-        return ("fake-injected-fault", fault_id, fault_seed)
+        spec = load_fault_spec(fault_id)
+        index, variant = spec.variant_for(fault_seed)
+        return InjectedFault(
+            spec,
+            fault_seed,
+            index,
+            variant,
+            "http://inventory-svc:8080",
+            FIXED_TIME,
+            FaultBackendRef(spec.injection.backend, None),
+        )
 
     def verify_fault_present(self, fault, timeout_s=None) -> FaultVerification:
         self.calls.append("verify_fault_present")
@@ -75,8 +110,44 @@ class FakeInjector:
         return FaultVerification(self.present, symptom, (obs,), None if self.present else "absent")
 
 
+class FixedProvenance:
+    """Provenance with no git, kubectl or kind calls: offline tests never touch a cluster."""
+
+    def collect(self) -> dict:
+        sha = "sha256:" + "0" * 64
+        return {
+            "provider": None,
+            "model_id": None,
+            "model_parameters": None,
+            "prompt_hash": None,
+            "tool_schema_hash": None,
+            "action_semantics_hash": None,
+            "gate_feature_version": None,
+            "evidence_requirements_hash": None,
+            "conflict_rules_hash": None,
+            "fault_definition_hash": None,
+            "fault_backend": None,
+            "desired_state_hash": sha,
+            "topology_hash": sha,
+            "snapshot_projection_version": 2,
+            "safeops_commit": "0" * 40,
+            "safeops_tree_dirty": False,
+            "kubernetes_version": "v1.37.0",
+            "kind_version": "v0.33.0",
+            "testbed_version": "safeops-testbed:000000000000",
+            "image_digests": {"testbed": sha},
+            "running_images": {},
+            "is_pilot_run": True,
+        }
+
+
+def offline_writer(runs_dir) -> RunRecordWriter:
+    """The real writer and validator, into a temporary directory, with fixed provenance."""
+    return RunRecordWriter(runs_dir=runs_dir, provenance=FixedProvenance())
+
+
 @pytest.fixture
-def offline_runner_factory():
+def offline_runner_factory(tmp_path):
     """build_runner() with every implemented, cluster-touching stage replaced by a fake;
     stages that are still stubs stay real, so a run stops at the first real stub."""
     from safeops.experiment import runner as runner_module
@@ -89,6 +160,7 @@ def offline_runner_factory():
         r.workload = FakeWorkload()
         r.injector = FakeInjector()
         r.alerts._namespace = "testbed"  # no cluster config read in offline tests
+        r.records = offline_writer(tmp_path / "runs")  # never the repo's data/runs/
         return r
 
     return factory
