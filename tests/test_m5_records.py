@@ -780,3 +780,268 @@ def test_the_cohort_flag_is_checked_on_its_own(good) -> None:
     rec = _set(rec, ("outcome", "category"), None)
     with pytest.raises(RecordValidationError, match="in_cohort_g"):
         _check(rec)
+
+
+# --- Milestone 5 adversarial review --------------------------------------------------------------
+
+
+def test_review_an_executor_crash_is_an_attempted_action_and_a_measurement_gap(tmp_path) -> None:
+    """Finding 1: the executor raised mid-apply; the cluster may already be changed."""
+    from safeops.experiment.schema import unmeasured_executed_action
+
+    r = _runner(tmp_path, executor=Fixed(raises=RuntimeError("PATCH sent, connection dropped")))
+    with pytest.raises(PostAgentDiscard):
+        r.run(UNIT)
+    (path,) = (tmp_path / "runs").glob("*.json")
+    rec = load_record(path)
+    assert rec.action_attempted is True and rec.execution is None
+    assert rec.discard_reason.stage == "execute"
+    assert unmeasured_executed_action(rec)
+
+
+def test_review_a_crash_before_execution_is_not_counted_as_an_attempt(tmp_path) -> None:
+    from safeops.experiment.schema import unmeasured_executed_action
+
+    r = _runner(tmp_path, gate=Fixed(raises=RuntimeError("gate crashed")))
+    with pytest.raises(PostAgentDiscard):
+        r.run(UNIT)
+    (path,) = (tmp_path / "runs").glob("*.json")
+    rec = load_record(path)
+    assert rec.action_attempted is False and not unmeasured_executed_action(rec)
+
+
+ATTEMPT_RULES = {
+    "execution without attempt": (("action_attempted",), False),
+    "do-nothing is not a v1 phase": (("phase",), "do-nothing"),
+    "completed with a failed baseline": (("steady_state", "succeeded"), 12),
+    "completed with an unmeasured baseline": (("steady_state", "state"), "failed"),
+    "NaN gate score": (("gate", "score"), float("nan")),
+    "infinite latency": (("trajectory", 0, "latency_ms"), float("inf")),
+}
+
+
+@pytest.mark.parametrize("path,value", ATTEMPT_RULES.values(), ids=ATTEMPT_RULES.keys())
+def test_review_malformed_records_are_rejected(good, path, value) -> None:
+    with pytest.raises(RecordValidationError):
+        _check(_set(good, path, value))
+
+
+def test_review_attempt_needs_an_execute_decision(good) -> None:
+    rec = _set(good, ("gate", "decision"), "escalate")
+    rec = _set(rec, ("execution",), None)
+    rec = _set(rec, ("in_cohort_g",), False)
+    rec = _set(rec, ("outcome", "category"), None)
+    with pytest.raises(RecordValidationError, match="attempted without a gate decision"):
+        _check(rec)
+
+
+def test_review_a_pre_agent_discard_cannot_claim_an_attempt(dirty) -> None:
+    with pytest.raises(RecordValidationError):
+        _check(_set(dirty, ("action_attempted",), True))
+
+
+def test_review_provenance_is_captured_once_at_the_start_of_the_run(tmp_path) -> None:
+    """Finding 3: a commit made during the run must not be attributed to it."""
+    order: list[str] = []
+
+    class Changing(AgentProvenance):
+        commits = iter(["a" * 40, "b" * 40])
+
+        def collect(self):
+            order.append("provenance")
+            p = super().collect()
+            p["safeops_commit"] = next(self.commits)
+            return p
+
+    r = _runner(tmp_path, provenance=Changing())
+    real_reset = r.environment.reset_environment
+    r.environment.reset_environment = lambda: (order.append("reset"), real_reset())[1]
+    r.run(UNIT)
+    (rec,) = _records(tmp_path)
+    assert rec["provenance"]["safeops_commit"] == "a" * 40
+    assert order[:2] == ["provenance", "reset"] and order.count("provenance") == 1
+
+
+def test_review_finalize_requires_start_of_run_provenance(tmp_path) -> None:
+    w = RunRecordWriter(runs_dir=tmp_path, provenance=FixedProvenance())
+    with pytest.raises(TypeError, match="start of the run"):
+        w.finalize(unit=UNIT, discard=Discard("pre_run_clean_state", "pre_run_dirty", "x"))
+
+
+def test_review_pre_injection_discards_hash_the_injectors_spec_source(tmp_path) -> None:
+    """Finding 5: the writer and the injector read specs from the same directory."""
+    import hashlib
+
+    from safeops.experiment.runner import build_runner
+    from safeops.faults.spec import FAULTS_DIR
+
+    built = build_runner()
+    assert built.records.faults_dir == built.injector._faults_dir == FAULTS_DIR
+    faults = tmp_path / "faults"
+    faults.mkdir()
+    spec = (FAULTS_DIR / "bad-deployment-config.yaml").read_bytes() + b"# local copy\n"
+    (faults / "bad-deployment-config.yaml").write_bytes(spec)
+    w = RunRecordWriter(runs_dir=tmp_path / "runs", provenance=FixedProvenance(), faults_dir=faults)
+    assert w.capture_provenance(UNIT)["fault_definition_hash"] == (
+        "sha256:" + hashlib.sha256(spec).hexdigest()
+    )
+
+
+def test_review_a_nan_is_kept_aside_never_written_into_the_dataset(tmp_path) -> None:
+    """Finding 6: NaN isn't JSON; the writer refuses it."""
+    nan_gate = Rec({"strategy": "always-act", "decision": "execute", "score": float("nan")})
+    r = _runner(tmp_path, gate=Fixed(nan_gate))
+    with pytest.raises(RecordValidationError, match="kept at"):
+        r.run(UNIT)
+    assert _records(tmp_path) == []
+    assert len(list((tmp_path / "runs" / "rejected").glob("*.json"))) == 1
+
+
+def test_review_a_failed_recovery_does_not_hide_a_failed_record(tmp_path) -> None:
+    """Finding 7: both failures are visible."""
+    from safeops.environment.manager import QuarantineFailed
+
+    r = _runner(tmp_path, provenance=FixedProvenance())  # no agent provenance: invalid record
+    _dirty_after_the_run(r)
+
+    def failing_rebuild(reason=""):
+        raise QuarantineFailed("rebuilt environment is still not clean")
+
+    r.environment.quarantine_and_rebuild = failing_rebuild
+    with pytest.raises(QuarantineFailed) as exc:
+        r.run(UNIT)
+    assert any("run record also failed" in n for n in exc.value.__notes__)
+    assert len(list((tmp_path / "runs" / "rejected").glob("*.json"))) == 1
+
+
+class _Hooked(Through):
+    """Through, with one routing hook made to raise."""
+
+    raising: str | None = None
+
+    def _gate_eligible_action(self, proposal):
+        if self.raising == "_gate_eligible_action":
+            raise RuntimeError("route_proposal crashed")
+        return super()._gate_eligible_action(proposal)
+
+    def _should_execute(self, decision):
+        if self.raising == "_should_execute":
+            raise RuntimeError("route_gate crashed")
+        return super()._should_execute(decision)
+
+    def _executed_action(self, action, execution):
+        if self.raising == "_executed_action":
+            raise RuntimeError("executed_action crashed")
+        return super()._executed_action(action, execution)
+
+
+def _crash_at(r, stage: str) -> None:
+    boom = RuntimeError(f"{stage} crashed")
+    owner = {
+        "agent": "agent",
+        "parse": "parser",
+        "extract": "extractor",
+        "shadow_gates": "shadow_gates",
+        "gate": "gate",
+        "execute": "executor",
+        "effectiveness": "effectiveness",
+        "harm": "harm",
+    }
+    hooks = {
+        "route_proposal": "_gate_eligible_action",
+        "route_gate": "_should_execute",
+        "executed_action": "_executed_action",
+    }
+    env_methods = {
+        "stabilization": "wait_stabilization_window",
+        "postaction_snapshot": "capture_snapshot",
+    }
+    if stage in owner:
+        setattr(r, owner[stage], Fixed(raises=boom) if stage != "agent" else Agent(raises=boom))
+    elif stage in hooks:
+        r.raising = hooks[stage]
+    else:
+        calls = {"n": 0}
+        real = getattr(r.environment, env_methods[stage])
+
+        def method(*a, **k):
+            calls["n"] += 1
+            # capture_snapshot is also the pre-fault snapshot: crash only the second call.
+            if stage == "postaction_snapshot" and calls["n"] == 1:
+                return real(*a, **k)
+            raise boom
+
+        setattr(r.environment, env_methods[stage], method)
+
+
+@pytest.mark.parametrize("stage", POST_AGENT_STAGES)
+def test_review_a_crash_at_every_post_agent_stage_writes_a_valid_record(tmp_path, stage) -> None:
+    """The systematic check the first version lacked: partial data at any stage is valid."""
+    from tests.conftest import FakeEnvironment, FakeWorkload
+
+    base = _runner(tmp_path)
+    r = _Hooked(
+        environment=FakeEnvironment(),
+        workload=FakeWorkload(),
+        injector=FakeInjector(),
+        alerts=base.alerts,
+        agent=Agent(),
+        parser=base.parser,
+        extractor=base.extractor,
+        shadow_gates=base.shadow_gates,
+        gate=base.gate,
+        executor=base.executor,
+        effectiveness=base.effectiveness,
+        harm=base.harm,
+        records=base.records,
+    )
+    _crash_at(r, stage)
+    with pytest.raises(PostAgentDiscard):
+        r.run(UNIT)
+    (rec,) = _records(tmp_path)  # one valid record, in the dataset, not rejected/
+    assert (
+        rec["discard_reason"]["stage"] == stage and rec["discard_reason"]["phase"] == "post_agent"
+    )
+    assert not (tmp_path / "runs" / "rejected").exists()
+
+
+@pytest.mark.parametrize("stage", PRE_AGENT_STAGES[1:])  # pre_run_clean_state: own tests
+def test_review_a_crash_at_every_pre_agent_stage_writes_a_valid_record(tmp_path, stage) -> None:
+    boom = RuntimeError(f"{stage} crashed")
+    r = _runner(tmp_path)
+
+    def raiser(*a, **k):
+        raise boom
+
+    target = {
+        "start_workload": (r.workload, "start_workload"),
+        "steady_state": (r.workload, "verify_steady_state"),
+        "prefault_snapshot": (r.environment, "capture_snapshot"),
+        "inject": (r.injector, "inject"),
+        "verify_fault_present": (r.injector, "verify_fault_present"),
+        "fault_present": (r, "_require_fault_present"),
+        "postfault_snapshot": (r.environment, "capture_settled_snapshot"),
+        "alert": (r.alerts, "build_alert"),
+        "runtime_context": (r, "_runtime_context"),
+    }[stage]
+    setattr(*target, raiser)
+    with pytest.raises(RuntimeError):
+        r.run(UNIT)
+    (rec,) = _records(tmp_path)
+    assert rec["discard_reason"]["stage"] == stage and rec["discard_reason"]["phase"] == "pre_agent"
+    assert not (tmp_path / "runs" / "rejected").exists()
+
+
+def test_review_a_nan_inside_an_untyped_tool_result_never_reaches_the_dataset(tmp_path) -> None:
+    """The schema types `result` as Any, so only the writer's allow_nan=False can see it."""
+    step = copy.deepcopy(STEP.record)
+    step["result"] = {"cpu": float("nan")}
+
+    class NanAgent(Agent):
+        def investigate(self, context):
+            return "raw", [Rec(step)]
+
+    r = _runner(tmp_path, agent=NanAgent())
+    with pytest.raises(RecordValidationError, match="kept at"):
+        r.run(UNIT)
+    assert _records(tmp_path) == []

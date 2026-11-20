@@ -158,6 +158,7 @@ RECORD_FIELDS = frozenset(
     {
         "unit",
         "started_at",
+        "provenance",
         "clean_state_verified",
         "steady_state",
         "prefault",
@@ -170,6 +171,7 @@ RECORD_FIELDS = frozenset(
         "features",
         "shadow_scores",
         "decision",
+        "action_attempted",
         "execution",
         "stabilized",
         "postaction",
@@ -191,8 +193,12 @@ class RunRecordWriter:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         new_id: Callable[[], uuid.UUID] = uuid.uuid4,
         phase: str = "A",
+        faults_dir: Path | None = None,
     ) -> None:
         self.runs_dir = Path(RUNS_DIR if runs_dir is None else runs_dir)
+        # The same spec source as the injector (build_runner wires both), so a run that
+        # never got to injection still records the hash of the spec it would have used.
+        self.faults_dir = faults_dir
         self._provenance = provenance
         self._clock = clock
         self._new_id = new_id
@@ -204,6 +210,17 @@ class RunRecordWriter:
             self._provenance = ProvenanceSource()
         return self._provenance
 
+    def capture_provenance(self, unit) -> dict:
+        """Provenance as of the start of the run, when the code that runs is the code
+        recorded (review finding 3). The runner passes it back to finalize()."""
+        from safeops.faults.spec import FAULTS_DIR, fault_path
+
+        provenance = self.provenance.collect()
+        path = fault_path(unit.fault_id, self.faults_dir or FAULTS_DIR)
+        if path.is_file():
+            provenance["fault_definition_hash"] = _sha256_file(path)
+        return provenance
+
     def build(self, **fields) -> dict:
         """The record as a plain dict, not yet validated."""
         unknown = set(fields) - RECORD_FIELDS
@@ -214,17 +231,14 @@ class RunRecordWriter:
         finalized_at = self._clock()
         started_at = f["started_at"] or finalized_at
 
-        provenance = self.provenance.collect()
+        if f["provenance"] is None:
+            raise TypeError("finalize() needs the provenance captured at the start of the run")
+        provenance = dict(f["provenance"])
         fault = f["fault"]
         if fault is not None:
+            # The spec that was actually injected is authoritative.
             provenance["fault_definition_hash"] = fault.spec.definition_sha256
             provenance["fault_backend"] = dataclasses.asdict(fault.backend)
-        else:
-            from safeops.faults.spec import fault_path
-
-            path = fault_path(unit.fault_id)
-            if path.is_file():
-                provenance["fault_definition_hash"] = _sha256_file(path)
 
         verification = f["fault_verification"]
         postfault = f["postfault"]
@@ -327,6 +341,7 @@ class RunRecordWriter:
             "feature_vector": _plain(f["features"]),
             "gate": _plain(f["decision"]),
             "shadow_gates": _plain(f["shadow_scores"]),
+            "action_attempted": bool(f["action_attempted"]),
             "execution": execution,
             "stabilization_timed_out": None if stabilized is None else not stabilized,
             "postaction_snapshot_hash": None
@@ -360,10 +375,12 @@ class RunRecordWriter:
         from safeops.experiment.schema import RecordValidationError, validate_record_json
 
         record = self.build(**fields)
-        text = json.dumps(record, sort_keys=True, indent=2) + "\n"
         try:
+            # allow_nan=False: NaN and Infinity aren't JSON; refuse them (review finding 6).
+            text = json.dumps(record, sort_keys=True, indent=2, allow_nan=False) + "\n"
             validate_record_json(text)
-        except RecordValidationError as exc:
+        except (ValueError, RecordValidationError) as exc:
+            text = json.dumps(record, sort_keys=True, indent=2) + "\n"
             kept = self._write_once(self.runs_dir / "rejected", record["run_id"], text)
             raise RecordValidationError(
                 f"run record failed validation (writer bug); kept at {kept}: {exc}"

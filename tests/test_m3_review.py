@@ -390,6 +390,9 @@ def test_post_run_reset_failure_of_any_kind_still_writes_the_record(offline_runn
     finalized = {}
 
     class Records:
+        def capture_provenance(self, unit):
+            return {}
+
         def finalize(self, **fields):
             finalized.update(fields)
 
@@ -597,6 +600,9 @@ def _full_runner(
     class Records:
         def __init__(self):
             self.fields = None
+
+        def capture_provenance(self, unit):
+            return {}
 
         def finalize(self, **fields):
             events.log.append("finalize")

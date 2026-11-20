@@ -112,3 +112,31 @@ A mutation check undid the key rules (monotonic presence, the cohort flag, pre-a
 - **A real run through every harness stage**, with only the agent, gate, executor and verifiers fabricated (the executor touches nothing), writes exactly one complete record. It is in cohort G, settled in 3 polls, has `reset_verified` true and wall time 124 s, and the post-run reset left the testbed clean.
 - **The acceptance command `safeops run --fault bad-deployment-config --seed 0 --trial 0`** reaches the agent stub (exit 3) and writes **no** record (R1). Its load is stopped.
 - The repository's `data/runs/` was never created during any of this.
+
+## Amendment, 2026-11-19: Milestone 5 adversarial review
+
+No v1 record existed yet, so these schema changes are fixes to v1 itself, not a v2. The regression tests are in the "Milestone 5 adversarial review" section of `tests/test_m5_records.py`. A mutation check undid each fix, and every one failed a test. The writer's NaN check survived until a test put a NaN inside an untyped tool result.
+
+1. **`action_attempted` (new, required).**
+   - **The problem:** an executor that raised mid-apply left `execution: null` with `gate.decision: execute`, so 0017 §1's measurement gap ("`execution` non-null") missed the run most likely to have changed the cluster.
+   - **The fix:** the runner sets `action_attempted` *before* calling the executor.
+   - **New rules:**
+     - an attempt needs a gate decision to execute;
+     - an execution result implies an attempt;
+     - a completed run whose gate said execute must have both;
+     - a pre-agent discard can't claim an attempt.
+   - `schema.unmeasured_executed_action(record)` computes the gap, and 0017 §1's wording is amended to match.
+2. **`phase` is `"A"` only.** A completed do-nothing run (§5: no agent) was rejected because v1's core chain requires a trajectory. Do-nothing runs (Milestone 14) get their own schema version rather than a value v1 accepts but can't represent.
+3. **Provenance is captured once, at the start of the run.** Before, it was captured at `finalize`, a few minutes later, so a commit or edit during the run would have been attributed to it.
+   - `RunRecordWriter.capture_provenance(unit)` is the new first stage in `RUN_SEQUENCE`. It runs before the pre-run reset, so a dirty-pre-run discard has it too.
+   - `finalize` refuses to build a record without it.
+   - If it can't be captured, nothing was attempted (R1).
+4. **A completed run must have passed its baseline:** `state == complete`, all attempts scheduled, `succeeded ≥ min_successes`. Before, a completed record with 12/300 validated.
+5. **One spec source.** The writer takes `faults_dir`, and `build_runner` wires the same `FAULTS_DIR` into the writer and the injector. A run discarded before injection now records the hash of the spec the injector would have used. Once a fault is injected, the injected spec's hash is authoritative.
+6. **No NaN or infinity.** The schema refuses them in every typed field (`allow_inf_nan=False`), and the writer serializes with `allow_nan=False`, so untyped content (a tool result) can't smuggle a NaN in either. Such a record goes to `rejected/`, never into the dataset.
+7. **A failed recovery doesn't hide a failed record.** The record is written, then recovery runs. A record failure never stops recovery, and if recovery also fails, the record failure is attached to it as a note. Both paths, completed and post-agent discard, share `_finalize_then_recover`.
+
+**Found by the new tests, beyond the seven findings:**
+- **The problem:** two "present together" rules rejected legitimate post-agent discards. A run that crashed in the parser (trajectory, no `proposal_status`), or between the extractor and the gate (feature vector, no gate), went to `rejected/` instead of the dataset: the very loss 0017 §1 exists to prevent.
+- **The fix:** those rules are now ordered along the branch, and all-or-nothing only for a completed run.
+- **The systematic test that should have existed:** a crash at **every** pre-agent and post-agent stage must produce one valid record in the dataset. Restoring the old rules fails three of those stages.

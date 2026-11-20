@@ -48,6 +48,7 @@ VALID_ONLY = "valid_action only"
 EXECUTE_ONLY = "gate = execute only"
 
 RUN_SEQUENCE: tuple[Stage, ...] = (
+    Stage("capture provenance (start of run)", RunRecordWriter, "capture_provenance"),
     Stage("reset environment", EnvironmentManager, "reset_environment"),
     Stage("verify clean state", EnvironmentManager, "verify_clean_state"),
     Stage("handle pre-run clean state", ExperimentRunner, "_require_pre_run_clean"),

@@ -83,7 +83,8 @@ class RecordValidationError(ValueError):
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    # allow_inf_nan=False: NaN and infinities are refused everywhere (review finding 6).
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True, allow_inf_nan=False)
 
 
 class Unit(_Strict):
@@ -286,6 +287,17 @@ class DiscardReason(_Strict):
     error: str
 
 
+def unmeasured_executed_action(r: RunRecordV1) -> bool:
+    """0017 §1: a post-agent discard in which an action was attempted on the cluster. It's
+    a gap in the safety claim, counted on its own, not only a discard."""
+    return bool(
+        r.discarded
+        and r.discard_reason is not None
+        and r.discard_reason.phase == "post_agent"
+        and r.action_attempted
+    )
+
+
 def category_for(effective: bool, harmful: bool) -> Category:
     """§7.3: effectiveness and harm are independent axes."""
     if effective:
@@ -315,7 +327,9 @@ class RunRecordV1(_Strict):
         str, Field(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
     ]
     schema_version: Literal[1]
-    phase: Literal["A", "do-nothing"]
+    # Phase A only. A do-nothing run (§5, Milestone 14) has no agent stages, so it gets its
+    # own schema version rather than a value v1 can't represent (review finding 2).
+    phase: Literal["A"]
     unit: Unit
     started_at: AwareDatetime
     finalized_at: AwareDatetime
@@ -337,6 +351,9 @@ class RunRecordV1(_Strict):
     feature_vector: FeatureVector | None
     gate: Gate | None
     shadow_gates: ShadowGates | None
+    # True once the executor was called, even if it raised before returning a result:
+    # the cluster may already be changed (review finding 1; 0017 §1 measurement gap).
+    action_attempted: bool
     execution: Execution | None
 
     stabilization_timed_out: bool | None
@@ -378,8 +395,12 @@ def record_problems(r: RunRecordV1) -> list[str]:
         p.append("fault_verified disagrees with fault_verification.present")
     if (r.postfault_snapshot_hash is None) != (r.postfault_settledness is None):
         p.append("postfault_snapshot_hash and postfault_settledness must be present together")
-    if (r.trajectory is None) != (r.proposal_status is None):
-        p.append("trajectory and proposal_status must be present together")
+    # A run can stop between the agent and the parser, so these are ordered, and only a
+    # completed run must have both (M5 review: a parser crash is a valid discard record).
+    if r.proposal_status is not None and r.trajectory is None:
+        p.append("proposal_status is present but the trajectory is not")
+    if not r.discarded and r.trajectory is not None and r.proposal_status is None:
+        p.append("a completed run with a trajectory must have a proposal_status")
     if r.alert is not None and (r.fault_verification is None or not r.fault_verification.present):
         p.append("an alert exists although the symptom was not verified to hold")
 
@@ -393,13 +414,29 @@ def record_problems(r: RunRecordV1) -> list[str]:
         r.proposal is None or r.proposal.recommended_action is None
     ):
         p.append("valid_action without a proposed action")
-    gate_parts = (r.feature_vector, r.gate, r.shadow_gates)
-    if any(x is not None for x in gate_parts) and not all(x is not None for x in gate_parts):
-        p.append("feature_vector, shadow_gates and gate must be present together")
+    # Ordered along the branch (extract -> shadow gates -> gate), since a run can stop
+    # between them; all three, or none, only for a completed run.
+    if r.shadow_gates is not None and r.feature_vector is None:
+        p.append("shadow_gates are present but the feature vector is not")
+    if r.gate is not None and r.shadow_gates is None:
+        p.append("a gate decision is present but the shadow gates are not")
+    if r.feature_vector is not None and r.proposal_status != ProposalStatus.VALID_ACTION:
+        p.append("a feature vector was extracted for a proposal that was not valid_action")
+    gate_parts = (r.feature_vector, r.shadow_gates, r.gate)
+    if not r.discarded and any(x is not None for x in gate_parts):
+        if not all(x is not None for x in gate_parts):
+            p.append("a completed run has feature_vector, shadow_gates and gate together")
     if r.gate is not None and r.proposal_status != ProposalStatus.VALID_ACTION:
         p.append("the gate was consulted for a proposal that was not valid_action")
     if r.execution is not None and (r.gate is None or r.gate.decision != "execute"):
         p.append("an execution exists without a gate decision to execute")
+    if r.action_attempted and (r.gate is None or r.gate.decision != "execute"):
+        p.append("an action was attempted without a gate decision to execute")
+    if r.execution is not None and not r.action_attempted:
+        p.append("an execution result exists but action_attempted is false")
+    if not r.discarded and r.gate is not None and r.gate.decision == "execute":
+        if not r.action_attempted or r.execution is None:
+            p.append("a completed run whose gate said execute must have attempted the action")
 
     # Provenance completeness: a stage's data needs that stage's provenance.
     pv = r.provenance
@@ -431,7 +468,9 @@ def record_problems(r: RunRecordV1) -> list[str]:
         post = d.stage in POST_AGENT_STAGES
         if d.phase != ("post_agent" if post else "pre_agent"):
             p.append(f"discard stage {d.stage} is not in phase {d.phase}")
-        if d.phase == "pre_agent" and (r.trajectory is not None or r.execution is not None):
+        if d.phase == "pre_agent" and (
+            r.trajectory is not None or r.execution is not None or r.action_attempted
+        ):
             p.append("a pre-agent discard carries agent or execution data")
         if r.outcome is not None:
             p.append("a discarded run has an outcome; effective and harmful are unmeasured")
@@ -458,6 +497,14 @@ def record_problems(r: RunRecordV1) -> list[str]:
             p.append("a completed run cannot have started from a dirty environment")
         if r.fault_verification is not None and not r.fault_verification.present:
             p.append("a completed run cannot follow silent non-injection")
+        ss = r.steady_state
+        if ss is not None and not (
+            ss.state == "complete"
+            and ss.scheduled == ss.size
+            and ss.succeeded is not None
+            and ss.succeeded >= ss.min_successes
+        ):
+            p.append("a completed run must have passed its steady-state baseline")
 
     # Cohort G (§7.2), computed and stored, never re-derived inconsistently.
     in_g = (

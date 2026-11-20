@@ -51,7 +51,7 @@ Both verifiers are stubs today, so this is inert until Milestone 7. That is also
 - If the harm checker is most likely to crash on the strangest agent actions, excluding those runs removes harmful runs preferentially and biases the harmful-action rate downward. So:
   - `discard_reason` encodes the **stage** that failed, not only the exception;
   - analysis can always separate **pre-agent** from **post-agent** discards;
-  - every post-agent discard whose `execution` is non-null is reported as a **measurement gap in the safety claim**, with its own count, not folded into the discard rate alone;
+  - every post-agent discard in which an action was **attempted** (`action_attempted`, true from the moment the executor is called, even if it raised before returning) is reported as a **measurement gap in the safety claim**, with its own count, not folded into the discard rate alone. `schema.unmeasured_executed_action` computes it. *(Amended at the Milestone 5 review: the first wording, "whose `execution` is non-null", missed an executor that crashed mid-apply, which is exactly the case most likely to have changed the cluster.)*;
   - if that count is non-trivial, the headline harmful-action rate carries a stated caveat naming how many executed actions went unmeasured.
 
 **Validator requirements this creates (Milestone 5):**

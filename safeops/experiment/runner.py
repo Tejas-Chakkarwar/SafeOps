@@ -98,8 +98,14 @@ class ExperimentRunner:
         if self._halt is not None:  # a failed quarantine halted this worker (review L2)
             raise self._halt
 
-        data: dict = {"unit": unit, "started_at": self._wall_clock()}
-        flags = {"action_attempted": False}
+        # Provenance as of now, when the code that runs is the code recorded (M5 review,
+        # finding 3). If it can't be captured, nothing was attempted: no record (R1).
+        data: dict = {
+            "unit": unit,
+            "started_at": self._wall_clock(),
+            "provenance": self.records.capture_provenance(unit),
+            "action_attempted": False,
+        }
 
         # Pre-run. A reset that fails outright counts as a dirty environment (review M2).
         # One that can't produce a result at all (a configuration, guard or credential
@@ -171,7 +177,7 @@ class ExperimentRunner:
                 stage = "route_gate"
                 if self._should_execute(decision):
                     stage = "execute"
-                    flags["action_attempted"] = True
+                    data["action_attempted"] = True  # before the call: it may raise mid-way
                     execution = data["execution"] = self.executor.apply(action)
                     stage = "executed_action"
                     executed_action = self._executed_action(action, execution)
@@ -189,7 +195,7 @@ class ExperimentRunner:
         except BaseException as exc:
             if not isinstance(exc, WorkloadGeneratorBusy):
                 self._stop_load_after_failure(exc)
-            self._handle_failure(data, flags, stage, exc)
+            self._handle_failure(data, stage, exc)
             raise  # _handle_failure always raises; this is never reached
 
         # Measurements are complete. Everything from here on is cleanup, and no cleanup
@@ -201,13 +207,35 @@ class ExperimentRunner:
         #   5. a failed recovery halts the worker, after the record exists
         post_clean, interrupt = self._cleanup()
         data["reset_verified"] = self._post_run_clean(post_clean)
-        try:
-            self._finalize(data)
-        finally:
-            if interrupt is None:
-                self._recover_if_dirty(post_clean)  # strictly after the record
+        self._finalize_then_recover(data, None, post_clean, interrupt)
         if interrupt is not None:
             raise interrupt
+
+    def _finalize_then_recover(self, data, discard, post_clean, interrupt):
+        """Write the record, then recover a dirty environment (strictly in that order).
+
+        A record that can't be written never stops recovery, and a recovery that fails
+        never hides the record failure: it is attached as a note (M5 review, finding 7).
+        Recovery is skipped after a second Ctrl-C; the next pre-run check finds the dirt.
+        """
+        record_error: Exception | None = None
+        path = None
+        try:
+            path = self._finalize(data, discard)
+        except Exception as exc:
+            record_error = exc
+        if interrupt is None:
+            try:
+                self._recover_if_dirty(post_clean)
+            except BaseException as recovery_exc:
+                if record_error is not None:
+                    recovery_exc.add_note(
+                        f"the run record also failed: {type(record_error).__name__}: {record_error}"
+                    )
+                raise
+        if record_error is not None:
+            raise record_error
+        return path
 
     def _cleanup(self) -> tuple[CleanStateResult, BaseException | None]:
         """Stop the load, reset, verify. Never raises: every failure becomes "not clean".
@@ -245,7 +273,7 @@ class ExperimentRunner:
         if path is not None:
             exc.add_note(f"run record: {path}")
 
-    def _handle_failure(self, data: dict, flags: dict, stage: str, exc: BaseException) -> None:
+    def _handle_failure(self, data: dict, stage: str, exc: BaseException) -> None:
         """Apply R1/R2 (decision 0017 §1) to a failure after the pre-run check. Always raises.
 
         - A stub (NotImplementedStage) or an abort (Ctrl-C) before R2 applies is not an
@@ -255,7 +283,7 @@ class ExperimentRunner:
         - From the agent on, the run is cleaned up, recorded as discarded with all its data,
           then recovered if dirty, in that order. Its exception surfaces as PostAgentDiscard.
         """
-        r2 = data.get("trajectory") is not None or flags["action_attempted"]
+        r2 = data.get("trajectory") is not None or data["action_attempted"]
         aborted = not isinstance(exc, Exception)
         if not r2 and (aborted or isinstance(exc, NotImplementedStage)):
             raise exc
@@ -265,11 +293,7 @@ class ExperimentRunner:
             raise exc
         post_clean, interrupt = self._cleanup()
         data["reset_verified"] = self._post_run_clean(post_clean)
-        try:
-            path = self._finalize(data, discard)
-        finally:
-            if interrupt is None:
-                self._recover_if_dirty(post_clean)
+        path = self._finalize_then_recover(data, discard, post_clean, interrupt)
         if aborted or isinstance(exc, NotImplementedStage) or interrupt is not None:
             self._note_record(exc, path)
             raise exc
@@ -396,11 +420,13 @@ def _cause(exc: BaseException, data: dict, aborted: bool) -> str:
 
 def build_runner() -> ExperimentRunner:
     """Wire the default components. Constructing them has no side effects."""
+    from safeops.faults.spec import FAULTS_DIR
+
     workload = WorkloadGenerator()  # shared: the injector measures on the running workload
     return ExperimentRunner(
         environment=EnvironmentManager(),
         workload=workload,
-        injector=FaultInjector(workload=workload),
+        injector=FaultInjector(workload=workload, faults_dir=FAULTS_DIR),
         alerts=AlertGenerator(),
         agent=Agent(),
         parser=ProposalParser(),
@@ -410,5 +436,5 @@ def build_runner() -> ExperimentRunner:
         executor=ActionExecutor(),
         effectiveness=EffectivenessVerifier(),
         harm=HarmChecker(),
-        records=RunRecordWriter(),
+        records=RunRecordWriter(faults_dir=FAULTS_DIR),  # one spec source for both
     )
