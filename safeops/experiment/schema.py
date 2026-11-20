@@ -868,12 +868,35 @@ def _reject_constant(name: str):
     raise ValueError(f"non-standard JSON constant {name}")
 
 
+def _non_finite_at(value, path: str = "$") -> str | None:
+    """Where a decoded float is not finite, or None. parse_constant never sees ordinary
+    numbers, and a number like 1e309 overflows to inf while decoding; allow_inf_nan
+    doesn't reach Any payloads. The value came straight from json.loads, so only dicts
+    and lists can contain more values (closeout cleanup, item 1)."""
+    if isinstance(value, float):
+        return None if math.isfinite(value) else path
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _non_finite_at(item, f"{path}.{key}")
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            found = _non_finite_at(item, f"{path}[{i}]")
+            if found is not None:
+                return found
+    return None
+
+
 def validate_record_json(text: str) -> RunRecordV1:
     """Parse and validate one record, against exactly its declared version."""
     try:
         raw = json.loads(text, parse_constant=_reject_constant)
     except ValueError as exc:  # JSONDecodeError, or a non-standard constant
         raise RecordValidationError(f"not standard JSON: {exc}") from exc
+    where = _non_finite_at(raw)
+    if where is not None:
+        raise RecordValidationError(f"not standard JSON: a non-finite number at {where}")
     if not isinstance(raw, dict):
         raise RecordValidationError("a run record is a JSON object")
     version = raw.get("schema_version")

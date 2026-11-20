@@ -267,3 +267,27 @@ def test_the_runner_path_still_writes_harm_evidence(tmp_path) -> None:
     r.run(UNIT)
     (rec,) = _records(tmp_path)
     assert rec["outcome"]["harmful"] is True and rec["outcome"]["harm_violations"]
+
+
+# --- final cleanup: numbers that overflow to infinity while decoding ---------------------------
+
+
+@pytest.mark.parametrize("number", ["1e400", "-1e400", "1e309"])
+@pytest.mark.parametrize("where", ["trajectory_result", "model_parameters"])
+def test_overflowing_numbers_in_any_payloads_are_refused(good, number, where) -> None:
+    """parse_constant never sees ordinary numbers; 1e309 looks like an ordinary value but
+    decodes to inf. It must be refused before validation, not coerced or dropped."""
+    marker = '"__NUMBER__"'
+    if where == "trajectory_result":
+        rec = _set(good, ("trajectory", 0, "result"), {"metrics": [{"x": "__NUMBER__"}]})
+    else:
+        rec = _set(good, ("provenance", "model_parameters"), {"nested": {"x": "__NUMBER__"}})
+    text = json.dumps(rec).replace(marker, number)
+    assert number in text and json.loads(text) is not None  # Python's parser accepts it
+    with pytest.raises(RecordValidationError, match="non-finite number at"):
+        validate_record_json(text)
+
+
+def test_finite_numbers_in_any_payloads_still_validate(good) -> None:
+    rec = _set(good, ("trajectory", 0, "result"), {"x": 1e308, "y": -2.5, "z": 0.0, "n": [1, 2.0]})
+    validate_record_json(json.dumps(rec))

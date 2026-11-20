@@ -16,6 +16,7 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 > - `get_metrics` evaluates workload metrics over a bounded current-incident window, never lifetime totals from earlier runs (0017 §4)
 > - two host/cluster clock readings per run, each a fresh server-stamped probe object created and removed in `testbed`; the probe kind is chosen here; the record structure arrives with a `schema_version` bump (0017 §6, §7)
 > - define the canonical serialization `trajectory[].result_digest` is taken over, then pin it in the schema (0018, cross-field amendment)
+> - tool outputs normalize non-finite numbers (Prometheus `"NaN"`, `"+Inf"`) at the tool boundary into an explicit, JSON-safe, deterministic representation that preserves that the value was non-finite; never `0`, another finite value, or a dropped field; the representation is decided and documented with `get_metrics` (0018, final cleanup)
 
 Completed:
 - Milestone 1 (`8cd8986`, review fixes `2f32bcb`). Acceptance command and rationale are in decision 0004.

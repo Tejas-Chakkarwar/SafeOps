@@ -263,7 +263,7 @@ These are fixed in v1 now, because 0017 §7 makes every later structural change 
    - **Pinned:**
      - **settledness:** `settled == true` ⇒ `last_changes == []`. The producer returns a settled snapshot with no changes.
      - **token totals:** `totals.tokens_in` and `totals.tokens_out` equal the null-preserving sums over the stored trajectory steps, and are null without a trajectory.
-     - **wall time:** `totals.wall_seconds` equals `finalized_at − started_at`.
+     - **wall time:** *superseded by the Milestone 5 closeout amendment below.* `wall_seconds` is elapsed real time measured on the harness's monotonic clock; it is neither derived from nor cross-checked against `finalized_at − started_at`.
      - **confidence:** the `confidence` shadow scalar equals the proposal's confidence (§11.8: "confidence to the self-reported `confidence`"), and `confidence_deficit` equals `1 − confidence` (§11.5).
      - **harm:** when `harm_violations` is recorded, `harmful` is true exactly when there is at least one violation (§11.7: "at least one violation").
      - **the filename:** a record whose filename isn't its `run_id` is refused when read (`load_record`).
@@ -312,3 +312,25 @@ These are the last schema and writer fixes before Milestone 5 closes. Runner con
    The fixed-denominator rule (`success_rate == succeeded / size`) is unchanged. The baseline threshold remains a completed-run policy rule, not a model rule.
 4. **`started_at` is required, and the writer never fabricates it.** A missing `started_at` raises "run record requires started_at captured at run start". `finalized_at` is never substituted. `wall_seconds` is required the same way. The wall timestamps and the elapsed duration are independent pieces of run state.
 5. **A measured `harmful` on a completed run carries its evidence.** `harm_violations` must be non-null whenever `harmful` is measured on a completed run, and `harmful` must be true exactly when that list is non-empty (§11.7: "at least one violation"). So the safety headline number can be audited from the immutable record. Discarded runs, which have no outcome, aren't affected. Nothing equivalent applies to `effective`, which isn't defined by an evidence list.
+
+## Amendment, 2026-11-20: Milestone 5 final cleanup (Milestone 5 closed)
+
+- **Numbers that overflow to infinity while decoding are refused too.**
+  - `parse_constant` catches only the literal tokens `NaN`, `Infinity` and `-Infinity`. An ordinary JSON number such as `1e400` or `1e309` goes through `parse_float` and decodes to `inf`. Typed float fields refuse it (`allow_inf_nan=False`), but `Any` payloads (`trajectory[].result`, `provenance.model_parameters`) don't.
+  - So after a strict `json.loads`, `validate_record_json` walks the decoded value, recursing only through dicts and lists because it came straight from JSON, and refuses any non-finite `float` before model validation. Nothing is coerced, converted or dropped.
+  - The literal-token check is kept, for its clearer error.
+  - Tested with `1e400`, `-1e400` and `1e309`, nested inside both payloads. A mutation that removes the `isfinite` check lets all six cases through.
+- **Docs:** the cross-field amendment's "wall time" entry now points forward to the closeout definition (monotonic elapsed time, not wall-clock subtraction), so this decision no longer holds two active definitions.
+
+### Carried to Milestone 6: normalize non-finite numbers at the tool boundary
+
+The writer serializes with `allow_nan=False`, which is correct. It means a non-finite value reaching a trajectory result doesn't become a malformed record; it stops the record being serialized at all (`RecordValidationError`, kept under `rejected/`), after the agent has already spent its tokens.
+
+That will matter when real metric tools land. Prometheus returns special sample values as JSON-safe strings (`"NaN"`, `"+Inf"`, `"-Inf"`), and a `get_metrics` that does `float(sample[1])` turns them into Python non-finite floats.
+
+**Requirement:** tool outputs normalize non-finite numeric values at the tool boundary, before they can reach a trajectory result or any other record field. The representation must be:
+- JSON-safe, explicit and deterministic;
+- documented in the relevant Milestone 6 decision;
+- one that preserves the fact that the source value was non-finite.
+
+It must never turn such a value into `0` or any other finite number, drop it, or otherwise make missing, undefined or non-finite evidence look like a real measurement. The exact representation is chosen when `get_metrics` is implemented, deliberately, not by whoever writes the first tool.
