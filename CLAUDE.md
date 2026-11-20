@@ -8,25 +8,21 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 
 ## Current milestone
 
-> **Milestone 5 — run record schema + writer.**
-> Done when: "Validator rejects malformed records; every run writes one" (design §14, verbatim).
+> **Milestone 6 — read-only tools + `safeops-reader` RBAC.**
+> Done when: "Outputs bounded; no tool can mutate under hostile args; `pods/log` granted `get` only" (design §14, verbatim).
 >
-> **First, before the run-record model is designed (decision 0017 §1, blocking):** fix the post-agent exception boundary in `safeops/experiment/runner.py` (the `except BaseException` that now spans the measurements). A verifier or harness failure after the agent has produced a trajectory or proposal must still produce an `infrastructure_failure` record keeping all available trajectory, proposal and execution data, with `effective`/`harmful` allowed to be unmeasured; then cleanup and recovery run, record first. Such a run is outside cohort G but never lost. This comes first because the schema must be able to represent a partly measured run; designed around fully measured runs only, that case gets bolted on wrong later.
->
-> Then, already decided and waiting for the record:
-> - the settled/unsettled post-fault condition (`SettledSnapshot`), not just its snapshot (0017 §2, 0013)
-> - `fault_backend` as backend-generic `{name, version}` from `InjectedFault.backend` (0003 F1, 0015); `image_digests` as the OCI index digests, plus third-party `running` digests (0007); `desired_state_hash`, `fault_definition_hash` (`FaultSpec.definition_sha256`), `snapshot_projection_version` 2 (0013)
-> - the unit's bounds (`fault_seed` 0 … 2^32 − 1, `trial_index` 0 … 999) in the schema (0014)
-> - recording discards and their reasons: pre-run dirty, no baseline, silent non-injection, failed injection, unmeasurable detection (0004 note, 0009, 0015)
-> - a live test of the deployed load generator's run boundary over the API-server proxy (0017 §5)
-> - strict `schema_version` behavior: a record is validated against exactly its declared version's fields, unknown fields are rejected, and later structural additions bump the version; no placeholder fields for later milestones (0017 §7)
-> - §11.8 says Pydantic; it is not a dependency yet, so adding it needs its own decision entry
+> Already decided and waiting for Milestone 6:
+> - `safeops-reader` gets no access to the workload namespace or its proxy, and the RBAC test asserts it (0009)
+> - `get_metrics` evaluates workload metrics over a bounded current-incident window, never lifetime totals from earlier runs (0017 §4)
+> - two host/cluster clock readings per run, each a fresh server-stamped probe object created and removed in `testbed`; the probe kind is chosen here; the record structure arrives with a `schema_version` bump (0017 §6, §7)
+> - define the canonical serialization `trajectory[].result_digest` is taken over, then pin it in the schema (0018, cross-field amendment)
 
 Completed:
 - Milestone 1 (`8cd8986`, review fixes `2f32bcb`). Acceptance command and rationale are in decision 0004.
 - Milestone 2 (`cdc9178`, review fixes `c3db4ef`, closeout `d5609eb`). Decisions 0006–0011.
 - Milestone 3 (`4e7b76d`, review fixes `f6a7173`, `e7c50ca`, third-review fixes `de48670`). Decisions 0012–0013.
 - Milestone 4 (`84dbf5c`, review fixes `e4f353e`, second-review fixes `137fad4`, closeout `e4893e5`). Decisions 0014–0017; amendments to 0009 and 0015.
+- Milestone 5 (`f287643`, review fixes `8731c17`, second-review fixes `a78eeaa`, fix list `74c9b37`, cross-field fixes `6a557f6`, final-review fixes `45fd43d`, closeout `14b0b87`). Decision 0018 and its amendments; 0017 §1, §6, §7 resolved or recorded.
 
 Update this line as milestones complete. Work on the current milestone only. The design document lists 17; do not run ahead. Milestone N's acceptance criterion must pass before N+1 starts.
 
