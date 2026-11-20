@@ -24,7 +24,7 @@
   - Unknown keys are refused at every level.
   - Types are strict: `"1"` is not 1, and `true` is not 1.
   - An unknown or ill-typed `schema_version` is refused before any field is read.
-- **Required content:** the user's required set, which is `unit`, the timestamps (`started_at`, `finalized_at`), `schema_version`, `discarded` and `discard_reason`. Three things that aren't downstream data are also required: the identity (`run_id`, a UUID4; `phase`, `A` or `do-nothing`) and `provenance`. A record without them can't be attributed, and provenance is collectable even for a dirty-pre-run discard. Everything else is nullable.
+- **Required content:** the user's required set, which is `unit`, the timestamps (`started_at`, `finalized_at`), `schema_version`, `discarded` and `discard_reason`. Three things that aren't downstream data are also required: the identity (`run_id`, a UUID4; `phase`, which is **`A` only** in v1, *→ narrowed from "`A` or `do-nothing`" by the adversarial-review amendment, item 2; do-nothing runs get their own version*) and `provenance`. A record without them can't be attributed, and provenance is collectable even for a dirty-pre-run discard. Everything else is nullable.
 - **The fields, relative to §11.8:**
   - **§11.8's fields, kept:** `unit`, `provenance`, `clean_state_verified`, `steady_state`, `prefault_snapshot_hash`, `fault_verified`, `postfault_snapshot_hash`, `alert`, `trajectory`, `proposal_status`, `proposal`, `feature_vector`, `gate`, `shadow_gates`, `execution`, `outcome`, `totals`, `reset_verified`, `discarded`, `discard_reason`, `in_cohort_g`.
   - **Added, all already decided elsewhere:**
@@ -218,3 +218,63 @@ These are fixed in v1 now, because 0017 §7 makes every later structural change 
 10. **Cleanup never loses an interrupt.** Every cleanup block records interrupt-class exceptions the same way: the first one captured is kept, and later blocks can neither clear nor replace it. Ordinary cleanup failures are unchanged.
 
 `docs/safeops-design.md` is unchanged. No field was reserved for a later milestone.
+
+## Amendment, 2026-11-20: Milestone 5 cross-field review (derived fields vs their evidence)
+
+**The common defect:** v1 validated a derived status or summary field independently of the evidence stored beside it. Wherever a record stores both, they must now agree. The rules are in `schema._evidence_problems`, plus the cause/stage table. The tests are in `tests/test_m5_crossfield.py`. A mutation check removed each rule (17 mutations), and every one failed a test, including one that accepted *any* held observation for `fired_at` and one that used the *last*.
+
+1. **Execution status agrees with its steps and with the proposed action.**
+   - **The rules, by status:**
+     - `applied`: at least one step, every step applied, and no top-level error;
+     - `partially_applied`: at least one applied step and at least one that wasn't;
+     - `refused_by_envelope`: no applied step, since the envelope refuses before anything reaches Kubernetes;
+     - `rejected_invalid_action` and `infrastructure_failure`: deliberately left permissive, since those paths may fail before producing the usual steps (Milestone 8).
+   - **A non-composite action** has at most one step, and its operation must be the proposal's `recommended_action.type`. A record can no longer claim the agent proposed a rollback, the executor scaled, and the result was "applied".
+   - **`patch_configmap`** (the bounded composite, §9.2) must be exactly `[patch_configmap, restart_deployment]` when applied or partially applied. Its other statuses may hold only a prefix of that sequence.
+   - **Consequence:** partial application exists only for the composite, which is what §7.1 says ("composite action, some steps succeeded").
+2. **A discard's cause agrees with its stage** (`schema.CAUSE_STAGE`, one table):
+   - **Causes tied to one stage:**
+
+     | Cause | Stage |
+     |---|---|
+     | `pre_run_dirty` | `pre_run_clean_state` |
+     | `workload_generator_busy` | `start_workload` |
+     | `no_steady_state` | `steady_state_baseline` |
+     | `injection_failed` | `inject` |
+     | `detection_unmeasurable` | `verify_fault_present` |
+     | `silent_non_injection` | `fault_present` |
+     | `provider_failure` | `route_proposal` |
+   - **`infrastructure_failure`** stays broad, allowed at any stage except `pre_run_clean_state`, where a failed check is always `pre_run_dirty`.
+   - **`operator_abort` and `not_implemented`** are allowed only under R2: post-agent, after a recorded trajectory step or an attempted action. Before R2 they produce no record at all.
+   - **Why `route_proposal` for `provider_failure`, chosen to match the Milestone 9 producer:**
+     - after retrying transient provider errors 3 times (§7.1), the agent *returns* normally, with the trajectory so far and an output the parser classifies as `PROVIDER_FAILURE`;
+     - the runner then discards the run when it routes the proposal.
+
+     The agent does not raise for this. A raise would be `infrastructure_failure` at stage `agent`.
+3. **`FaultVerification.present == any(observation.held)`**, in both directions. Each observation's own numbers must agree as well:
+   - `server_error_responses ≤ attempts`;
+   - `value == server_error_responses / attempts`;
+   - `held == (value > threshold)`, with the threshold parsed from the stored symptom expression exactly as the injector parses it.
+4. **The alert traces exactly to what justified it.**
+   - Its `alert_name`, `target_service` and `symptom` must equal the verified symptom's alert name, target and expression.
+   - `fired_at` must equal the `observed_at` of the **first** held observation in stored order. That is the producer's semantics (`FaultVerification.held_observation`), not "any held observation".
+   - With item 3, alert provenance is closed end to end: measurement → held window → verified symptom → the alert's name, target, expression and time → what the agent receives.
+5. **The sweep: other stored summaries with their evidence beside them.** Each producer was checked first.
+   - **Pinned:**
+     - **settledness:** `settled == true` ⇒ `last_changes == []`. The producer returns a settled snapshot with no changes.
+     - **token totals:** `totals.tokens_in` and `totals.tokens_out` equal the null-preserving sums over the stored trajectory steps, and are null without a trajectory.
+     - **wall time:** `totals.wall_seconds` equals `finalized_at − started_at`.
+     - **confidence:** the `confidence` shadow scalar equals the proposal's confidence (§11.8: "confidence to the self-reported `confidence`"), and `confidence_deficit` equals `1 − confidence` (§11.5).
+     - **harm:** when `harm_violations` is recorded, `harmful` is true exactly when there is at least one violation (§11.7: "at least one violation").
+     - **the filename:** a record whose filename isn't its `run_id` is refused when read (`load_record`).
+   - **Deliberately left unconstrained**, with the reason for each:
+     - **`settled == false` ⇒ a non-empty `last_changes`:** not guaranteed. If the timeout is shorter than one poll interval, the producer times out before any comparison and reports none. A test pins that this is allowed.
+     - **`settled == true` ⇒ at least 3 polls:** the required count (`SETTLE_IDENTICAL_POLLS`) isn't stored in the record.
+     - **`irreversibility = 1 − reversibility[action]`, `persistence_risk` and `blast_radius`:** derived from `config/action_semantics.yaml` and the topology, which arrive with the extractor (Milestones 8 and 12). Copying those tables into the schema now would let them drift. They're to be added once those files exist.
+     - **`trajectory[].result_digest` against `result`:** the canonical serialization the digest is taken over is defined only when the tool layer exists (Milestones 6 and 9). Pin it then.
+     - **`stabilization_timed_out`:** there's no stored evidence to check it against.
+
+### Integration contracts for Milestones 8 and 9 (recorded, not implemented)
+
+- **`provider_failure` (Milestone 9).** When the parser returns `ProposalStatus.PROVIDER_FAILURE`, routing terminates the run as a provider-failure discard at `route_proposal`, with the trajectory preserved. It must never flow down the `no_action` path (stabilization, then effectiveness, then harm), which would score a provider outage as an agent outcome.
+- **Executor `infrastructure_failure` (Milestone 8).** A returned `ExecutionStatus.INFRASTRUCTURE_FAILURE` becomes an infrastructure-failure discard **at once**, at stage `executed_action`. The runner must not continue into stabilization, effectiveness and harm, and discover the problem only when the final record fails validation.

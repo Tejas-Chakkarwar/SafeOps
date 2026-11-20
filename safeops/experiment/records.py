@@ -463,4 +463,9 @@ def load_record(path: Path):
     """Read and validate a finalized record (against exactly its declared version)."""
     from safeops.experiment.schema import validate_record_json
 
-    return validate_record_json(Path(path).read_text())
+    record = validate_record_json(Path(path).read_text())
+    if Path(path).stem != record.run_id:  # the filename is derived from run_id too
+        from safeops.experiment.schema import RecordValidationError
+
+        raise RecordValidationError(f"{Path(path).name} holds run {record.run_id}")
+    return record

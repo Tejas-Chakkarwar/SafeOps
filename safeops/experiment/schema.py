@@ -498,6 +498,138 @@ class RunRecordV1(_Strict):
         return self
 
 
+# The bounded composite (§9.2, §9.4): one SafeOps action, two Kubernetes writes, in order.
+COMPOSITE_STEPS: dict[ActionType, tuple[ActionType, ...]] = {
+    ActionType.PATCH_CONFIGMAP: (ActionType.PATCH_CONFIGMAP, ActionType.RESTART_DEPLOYMENT),
+}
+
+# The one stage each specific cause can come from (M5 cross-field review, item 2).
+# infrastructure_failure is broad: it can happen at any stage after the pre-run check.
+# operator_abort and not_implemented exist only under R2 (post-agent), and are checked
+# separately. provider_failure is the parser's status, discarded when the runner routes
+# it (decision 0018: the Milestone 9 agent returns, and the parser classifies).
+CAUSE_STAGE: dict[str, RunStage] = {
+    "pre_run_dirty": RunStage.PRE_RUN_CLEAN_STATE,
+    "workload_generator_busy": RunStage.START_WORKLOAD,
+    "no_steady_state": RunStage.STEADY_STATE_BASELINE,
+    "injection_failed": RunStage.INJECT,
+    "detection_unmeasurable": RunStage.VERIFY_FAULT_PRESENT,
+    "silent_non_injection": RunStage.FAULT_PRESENT,
+    "provider_failure": RunStage.ROUTE_PROPOSAL,
+}
+
+
+def _evidence_problems(r: RunRecordV1) -> list[str]:
+    """Derived fields must agree with the evidence stored beside them (M5 cross-field
+    review). Each rule restates what the producer computes, so a record whose summary
+    contradicts its own evidence can't validate."""
+    p: list[str] = []
+
+    # 1. Execution status <-> its steps <-> the proposed action.
+    e = r.execution
+    if e is not None:
+        applied = [step.status == "applied" for step in e.steps]
+        if e.status == ExecutionStatus.APPLIED:
+            if not applied or not all(applied) or e.error is not None:
+                p.append("applied needs at least one step, every step applied, and no error")
+        elif e.status == ExecutionStatus.PARTIALLY_APPLIED:
+            if not any(applied) or all(applied):
+                p.append("partially_applied needs at least one applied and one unapplied step")
+        elif e.status == ExecutionStatus.REFUSED_BY_ENVELOPE and any(applied):
+            p.append("refused_by_envelope can't have an applied step: it never reached the API")
+        action = r.proposal.recommended_action if r.proposal is not None else None
+        if action is not None:
+            ops = tuple(step.operation for step in e.steps)
+            expected = COMPOSITE_STEPS.get(action.type)
+            if expected is not None:
+                if e.status in (ExecutionStatus.APPLIED, ExecutionStatus.PARTIALLY_APPLIED):
+                    if ops != expected:
+                        p.append(f"{action.type} must execute as {list(expected)}, got {list(ops)}")
+                elif ops != expected[: len(ops)]:
+                    p.append(
+                        f"{action.type} steps {list(ops)} are not a prefix of {list(expected)}"
+                    )
+            elif any(op != action.type for op in ops) or len(ops) > 1:
+                p.append(f"the proposal was {action.type}, but the executor recorded {list(ops)}")
+
+    # 3. Fault verification: present <-> its observations; each observation's own numbers.
+    v = r.fault_verification
+    if v is not None:
+        held = [o.held for o in v.observations]
+        if v.present != any(held):
+            p.append(f"fault_verification.present is {v.present} but observations held {held}")
+        threshold = _threshold(v.symptom.expression)
+        for o in v.observations:
+            if o.server_error_responses > o.attempts:
+                p.append(f"window {o.window_id}: more 5xx than attempts")
+            elif not math.isclose(
+                o.value, o.server_error_responses / o.attempts, rel_tol=0.0, abs_tol=1e-12
+            ):
+                p.append(f"window {o.window_id}: value != server_error_responses / attempts")
+            if threshold is not None and o.held != (o.value > threshold):
+                p.append(f"window {o.window_id}: held disagrees with value > {threshold}")
+
+    # 4. The alert traces exactly to the verified symptom and the first held window.
+    a = r.alert
+    if a is not None and v is not None:
+        sym = v.symptom
+        if (a.alert_name, a.target_service, a.symptom) != (
+            sym.alert_name,
+            sym.target_service,
+            sym.expression,
+        ):
+            p.append("the alert's name, target or symptom differs from the verified symptom")
+        first = next((o for o in v.observations if o.held), None)
+        if first is not None and a.fired_at != first.observed_at:
+            p.append("alert.fired_at is not the first held observation's observed_at")
+
+    # 5. Sweep: other stored summaries with their evidence beside them.
+    sd = r.postfault_settledness
+    if sd is not None and sd.settled and sd.last_changes:
+        p.append("a settled post-fault state can't report last changes")
+    t = r.totals
+    if t is not None:
+        if r.trajectory is not None:
+            for key in ("tokens_in", "tokens_out"):
+                counts = [getattr(step, key) for step in r.trajectory]
+                derived = None if any(c is None for c in counts) else sum(counts)
+                if getattr(t, key) != derived:
+                    p.append(f"totals.{key} is {getattr(t, key)}, the steps give {derived}")
+        elif t.tokens_in is not None or t.tokens_out is not None:
+            p.append("token totals without a trajectory")
+        span = (r.finalized_at - r.started_at).total_seconds()
+        if not math.isclose(t.wall_seconds, max(0.0, span), rel_tol=0.0, abs_tol=1e-6):
+            p.append(f"totals.wall_seconds {t.wall_seconds} != finalized_at - started_at")
+    if r.shadow_gates is not None and r.proposal is not None:
+        if not math.isclose(
+            r.shadow_gates.confidence.confidence, r.proposal.confidence, rel_tol=0.0, abs_tol=1e-12
+        ):
+            p.append("the confidence shadow scalar is not the proposal's confidence (§11.8)")
+    if r.feature_vector is not None and r.proposal is not None:
+        if not math.isclose(
+            r.feature_vector.confidence_deficit,
+            1.0 - r.proposal.confidence,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            p.append("confidence_deficit is not 1 - the proposal's confidence (§11.5)")
+    o = r.outcome
+    if o is not None and o.harmful is not None and o.harm_violations is not None:
+        if o.harmful != bool(o.harm_violations):
+            p.append("harmful must be true exactly when there is at least one violation (§11.7)")
+    return p
+
+
+def _threshold(expression: str) -> float | None:
+    """The symptom's threshold, parsed the way the injector parses it."""
+    from safeops.faults.spec import FaultSpecError, parse_expression
+
+    try:
+        return parse_expression(expression).threshold
+    except FaultSpecError:
+        return None
+
+
 def record_problems(r: RunRecordV1) -> list[str]:
     """Cross-field rules. Hand-written and tested against fabricated records."""
     p: list[str] = []
@@ -615,6 +747,8 @@ def record_problems(r: RunRecordV1) -> list[str]:
     if r.execution is not None and pv.action_semantics_hash is None:
         p.append("an execution exists but action_semantics_hash is missing")
 
+    p.extend(_evidence_problems(r))
+
     # Discards.
     if r.discarded != (r.discard_reason is not None):
         p.append("discard_reason must be set exactly when discarded is true")
@@ -637,6 +771,15 @@ def record_problems(r: RunRecordV1) -> list[str]:
         ):
             p.append("silent_non_injection needs a fault_verification that did not hold")
         p.extend(_stage_problems(r, d.stage))
+        required = CAUSE_STAGE.get(d.cause)
+        if required is not None and d.stage != required:
+            p.append(f"cause {d.cause} comes only from stage {required}, not {d.stage}")
+        if d.cause == "infrastructure_failure" and d.stage == RunStage.PRE_RUN_CLEAN_STATE:
+            p.append("a failed pre-run check is pre_run_dirty, not infrastructure_failure")
+        if d.cause in ("operator_abort", "not_implemented") and not (
+            d.phase == "post_agent" and (bool(r.trajectory) or r.action_attempted)
+        ):
+            p.append(f"{d.cause} is recorded only under R2 (after a trajectory step or attempt)")
         if d.cause == "no_steady_state" and (
             r.steady_state is None or d.stage != "steady_state_baseline"
         ):

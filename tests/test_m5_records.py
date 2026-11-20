@@ -106,7 +106,8 @@ PROPOSAL = Rec(
 )
 FEATURES = Rec(
     {
-        k: 0.0
+        # confidence_deficit is 1 - the proposal's confidence (§11.5), the rest fabricated.
+        k: (1.0 - 0.82 if k == "confidence_deficit" else 0.0)
         for k in (
             "irreversibility",
             "blast_radius",
@@ -1081,6 +1082,8 @@ def _strip_agent(rec: dict) -> dict:
         "postaction_snapshot_hash",
     ):
         rec = _set(rec, (k,), None)
+    rec = _set(rec, ("totals", "tokens_in"), None)  # no trajectory, so no token totals
+    rec = _set(rec, ("totals", "tokens_out"), None)
     return _set(rec, ("action_attempted",), False)
 
 
@@ -1184,6 +1187,7 @@ def test_review2_trajectory_steps_are_numbered_in_order(good) -> None:
     two["step"] = 2
     renumbered = _set(good, ("trajectory",), [good["trajectory"][0], two])
     renumbered = _set(renumbered, ("totals", "tokens_in"), 2400)
+    renumbered = _set(renumbered, ("totals", "tokens_out"), 160)
     _check(renumbered)
 
 

@@ -58,7 +58,7 @@ class _Seeds:
         return Rec(
             {
                 "safeops": {"risk_score": 0.1},
-                "confidence": {"confidence": 0.9},
+                "confidence": {"confidence": 0.82},
                 "random": {"draw": 0.5},
             }
         ).to_record()
@@ -201,8 +201,36 @@ def test_every_proposal_status_is_covered_above() -> None:
     assert covered == {s.value for s in ProposalStatus}
 
 
+# Steps each status really produces (the cross-field review): a refusal never reaches the
+# API, and partial application exists only for the two-step composite.
+_STEPS = {
+    "refused_by_envelope": [],
+    "rejected_invalid_action": [
+        {"operation": "rollback_deployment", "status": "failed", "error": "422"}
+    ],
+    "infrastructure_failure": [],
+}
+PATCH_POOL = {
+    "type": "patch_configmap",
+    "target": {"kind": "ConfigMap", "ns": "testbed", "name": "db-pool-config"},
+    "params": {"max_pool_size": 20},
+}
+
+
 def _with_execution(good: dict, status: str) -> dict:
     rec = _set(good, ("execution", "status"), status)
+    if status == "partially_applied":
+        rec = _set(rec, ("proposal", "recommended_action"), PATCH_POOL)
+        rec = _set(
+            rec,
+            ("execution", "steps"),
+            [
+                {"operation": "patch_configmap", "status": "applied", "error": None},
+                {"operation": "restart_deployment", "status": "failed", "error": "timeout"},
+            ],
+        )
+    elif status in _STEPS:
+        rec = _set(rec, ("execution", "steps"), _STEPS[status])
     in_g = status == "applied"
     rec = _set(rec, ("in_cohort_g",), in_g)
     return _set(rec, ("outcome", "category"), good["outcome"]["category"] if in_g else None)
@@ -339,6 +367,8 @@ def test_a_mixed_trajectory_records_null_totals(tmp_path) -> None:
 def test_a_partial_trajectory_with_no_proposal_is_a_valid_discard(good) -> None:
     rec = _strip_agent(good)
     rec = _set(rec, ("trajectory",), good["trajectory"])  # steps done before the crash
+    rec = _set(rec, ("totals", "tokens_in"), good["totals"]["tokens_in"])
+    rec = _set(rec, ("totals", "tokens_out"), good["totals"]["tokens_out"])
     rec = _as_discard(rec, RunStage.AGENT)
     _check(rec)
     with pytest.raises(RecordValidationError, match="proposal_status from stage parse"):
