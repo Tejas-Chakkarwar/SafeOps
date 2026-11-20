@@ -94,7 +94,6 @@ def run(
     except (InvalidRunUnit, FaultSpecError) as exc:
         _fail("run", f"{exc}.", EXIT_USAGE)
 
-    from safeops.cluster import CommandError, CredentialError, GuardError
     from safeops.environment.workload import SteadyStateError
     from safeops.experiment.runner import PreRunDiscard, build_runner
     from safeops.faults.injector import (
@@ -115,7 +114,7 @@ def run(
         _fail("run", f"discarded, no steady-state baseline: {exc}.{where}", EXIT_STEADY_STATE)
     except FaultSpecError as exc:
         _fail("run", f"{exc}.{where}", EXIT_USAGE)
-    except (GuardError, CredentialError, CommandError) as exc:
+    except _cluster_errors() as exc:  # incl. WorkerQuarantined, ConfigurationError (finding 6)
         _fail("run", f"{type(exc).__name__}: {exc}.{where}", EXIT_CLUSTER)
 
 

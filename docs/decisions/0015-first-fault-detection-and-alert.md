@@ -69,7 +69,7 @@ The design's example expression is `http_5xx_rate > 0.2 for 2m` (§9.5). If veri
   - `namespace` from `config/cluster.yaml`, never the spec;
   - `fired_at` from the observation.
 - **Tests** (`tests/test_m4_faults.py`):
-  - a **sentinel** spec whose fault id, affected service (deliberately ≠ target), remediation lists and injection values are all disjoint from its symptom. No such value, whole or as a component, appears in any Alert field or in the Alert's repr.
+  - a **sentinel** spec whose fault id, affected service (≠ target in a variant built past the loader, since review finding 2 now makes the loader require them equal), remediation lists and injection values are all disjoint from its symptom. No such value, whole or as a component, appears in any Alert field or in the Alert's repr.
   - a **differential** test: changing every non-symptom field leaves the Alert identical, while changing the symptom changes it.
   - a structural test of the generator's input type.
 - **Mutation check, done:** making the injector copy `affected_service` into the verified symptom, and separately making the generator ignore the symptom, each failed the sentinel and differential tests.
@@ -114,3 +114,28 @@ The design's example expression is `http_5xx_rate > 0.2 for 2m` (§9.5). If veri
   - about 43 s in total.
 
   Across a 300-run campaign that's about 3.6 h, against about 10 h or more for a literal two-minute `for` (two minutes of observation plus the same settling).
+
+## Amendment, 2026-11-19: Milestone 4 adversarial review
+
+Each fix has a regression test in the "Milestone 4 adversarial review" section of `tests/test_m4_faults.py`. A mutation check undid each fix in turn, and every one made its test fail.
+
+1. **Alert names come from a fixed list.**
+   - **The problem:** `alert_name` only had to be CamelCase, so a spec could fire `BadDeploymentConfigRollbackOrders`, which writes the fault id and the fix into the agent's view. The sentinel test couldn't see it, because its alert name was clean.
+   - **The fix:** `ALERT_NAMES` maps each metric to the names it may fire as (`http_5xx_rate` → `HighErrorRate`). Alert names describe symptoms, never faults (ITBench; `reference-review.md`).
+2. **The alert target must be the injected resource's owner.** The open attribution item above is now enforced, not just noted.
+   - **The problem:** the harness measures 5xx at the entry point and attributes them to no service. Yet a spec could name any service as the target, including `postgres`, which serves no HTTP. The agent would read that as a fact nobody measured.
+   - **The fix:** `symptoms[].target_service` must equal the owner of the injected Deployment, which is never a stateful service.
+   - A fault whose alert legitimately targets another service (for example `upstream-dependency-503`, Milestone 11) needs its own attribution check before this rule is relaxed for it.
+3. **A pre-agent discard stops the load it started.**
+   - **The problem:** after `FaultNotPresent`, or any failure between `start_workload` and the agent, the generator kept running. The next `safeops run` then hit `WorkloadGeneratorBusy`, which was misfiled as exit 4. Milestone 4 makes such discards routine.
+   - **The fix:** the runner stops the load best-effort and re-raises the original exception. A failed stop is attached as a note, so it never replaces the original.
+   - Load this run didn't start is never stopped: if `start_workload` raises `Busy`, the generator belongs to someone else (decision 0009, W5).
+   - An injected fault is still left for the next run's pre-run reset.
+   - This settles only the pre-agent half of 0004's mid-run cleanup note. Recording discards, and failures after the agent starts, remain Milestone 5.
+4. **A detection window that isn't a whole number of attempts is refused before the cluster changes.** Before, it was found inside `verify_fault_present`, after the PUT.
+5. **A duplicated env name is refused.** Editing one of two duplicates could report an injection the container never sees.
+6. **`safeops run` maps environment errors to exit 5**, the same as every other command: `WorkerQuarantined`, `ConfigurationError` and `QuarantineFailed` no longer produce a raw traceback.
+7. **`affected_service` must be the injected Deployment's owner**, so evaluator metadata describes the fault that was actually injected.
+8. **The topology is read-only.** Its mappings are `MappingProxyType`, and its lists are tuples. `IncidentRuntimeContext` and the harm checker share one `ServiceTopology`, so a bug in the extractor or the gate can't rewrite the scope rule that harm is judged by. This is defense in depth: LLM output can't reach Python objects.
+9. **Docs.** Decision 0004's exit-code table gains code 7.
+   - **A limitation of settledness:** polls are 5 s apart, so a change that reverts between two polls is invisible. Settledness is an observation at that sampling rate, not proof of quiescence. For the faults so far, the measured diff between the pre-fault and post-fault baselines was exactly the fault's own change (see "Live acceptance").

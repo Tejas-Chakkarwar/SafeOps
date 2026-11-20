@@ -89,20 +89,28 @@ class ExperimentRunner:
             pre_clean = CleanStateResult(False, (f"pre-run reset failed: {exc}",))
         self._require_pre_run_clean(pre_clean)
         self.workload.start_workload()
-        steady_state = self.workload.verify_steady_state()
-        self._require_steady_state(steady_state)
-        prefault = env.capture_snapshot()
-        fault = self.injector.inject(unit.fault_id, unit.fault_seed)
-        verification = self.injector.verify_fault_present(fault)
-        self._require_fault_present(verification)
-        # Harm baseline (§5, Rule 2), taken once the projection has settled; flagged if it
-        # never settled, never silently a mid-transition snapshot (decision 0013).
-        postfault = env.capture_settled_snapshot()
+        # From here until the agent starts, every failure is a pre-run discard (§11.1). The
+        # load this run started is stopped again, so a discard never leaves the generator
+        # busy for the next run (Milestone 4 review, finding 3). An injected fault is left
+        # for the next run's pre-run reset. Recording the discard is Milestone 5.
+        try:
+            steady_state = self.workload.verify_steady_state()
+            self._require_steady_state(steady_state)
+            prefault = env.capture_snapshot()
+            fault = self.injector.inject(unit.fault_id, unit.fault_seed)
+            verification = self.injector.verify_fault_present(fault)
+            self._require_fault_present(verification)
+            # Harm baseline (§5, Rule 2), taken once the projection has settled; flagged if
+            # it never settled, never silently a mid-transition snapshot (decision 0013).
+            postfault = env.capture_settled_snapshot()
 
-        # Information wall (§6): only the alert, built from the verified symptom, crosses
-        # into the runtime. The fault and its spec stay on this side.
-        alert = self.alerts.build_alert(verification)
-        context = self._runtime_context(alert)
+            # Information wall (§6): only the alert, built from the verified symptom,
+            # crosses into the runtime. The fault and its spec stay on this side.
+            alert = self.alerts.build_alert(verification)
+            context = self._runtime_context(alert)
+        except Exception as exc:
+            self._stop_load_after_discard(exc)
+            raise
         raw_output, trajectory = self.agent.investigate(context)
         proposal = self.parser.parse(raw_output)
 
@@ -164,6 +172,14 @@ class ExperimentRunner:
             reset_verified=reset_verified,
         )
         self._recover_if_dirty(post_clean)  # strictly after the record
+
+    def _stop_load_after_discard(self, exc: Exception) -> None:
+        """Best-effort stop of the load this run started. A stop failure is attached to the
+        original exception, never raised in its place."""
+        try:
+            self.workload.stop_workload()
+        except Exception as stop_exc:
+            exc.add_note(f"stop_workload after the discard also failed: {stop_exc}")
 
     # Runner hooks: points where the runner interprets a stage's result.
 

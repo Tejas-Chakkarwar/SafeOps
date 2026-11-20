@@ -64,7 +64,7 @@ def test_every_deployment_has_hard_and_safe_ranges() -> None:
 
 def test_db_pool_config_numeric_keys_have_both_ranges() -> None:
     keys = TOPO.resources["db-pool-config"].approved_keys
-    assert keys["max_pool_size"] == {"hard_range": [1, 100], "safe_range": [5, 30]}
+    assert keys["max_pool_size"] == {"hard_range": (1, 100), "safe_range": (5, 30)}
     assert TOPO.resources["db-pool-config"].persistence_affecting is True
 
 

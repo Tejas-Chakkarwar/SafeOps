@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOPOLOGY_PATH = REPO_ROOT / "config" / "topology.yaml"
@@ -69,7 +70,7 @@ class ServiceTopology:
 
     def dependents(self, service: str) -> set[str]:
         """Services that call `service`, transitively (follows reverse edges)."""
-        reverse: dict[str, list[str]] = {s: [] for s in self.depends_on}
+        reverse: dict[str, list[str]] = {s: [] for s in self.depends_on}  # a local copy
         for caller, callees in self.depends_on.items():
             for callee in callees:
                 reverse[callee].append(caller)
@@ -123,6 +124,19 @@ def _bounds(raw: dict, where: str) -> Bounds:
     return Bounds(hard, safe)
 
 
+def _frozen(value):
+    """Read-only deep copy: mappings become MappingProxyType, lists become tuples.
+
+    The topology is shared by IncidentRuntimeContext and the harm checker. Nothing in the
+    runtime may be able to change the scope rule the harm checker applies (Milestone 4
+    review, finding 8)."""
+    if isinstance(value, dict):
+        return MappingProxyType({k: _frozen(v) for k, v in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_frozen(v) for v in value)
+    return value
+
+
 def parse_topology(data: dict) -> ServiceTopology:
     services = data.get("services") or {}
     depends_on = {
@@ -154,11 +168,15 @@ def parse_topology(data: dict) -> ServiceTopology:
             name=name,
             kind=kind,
             owner=owner,
-            bounds=bounds,
-            approved_keys=dict(approved),
+            bounds=MappingProxyType(bounds),
+            approved_keys=_frozen(dict(approved)),
             persistence_affecting=bool(raw.get("persistence_affecting", False)),
         )
-    return ServiceTopology(depends_on=depends_on, stateful=stateful, resources=resources)
+    return ServiceTopology(
+        depends_on=MappingProxyType(depends_on),
+        stateful=stateful,
+        resources=MappingProxyType(resources),
+    )
 
 
 # Objects Kubernetes creates in every namespace on its own. Not part of the testbed.

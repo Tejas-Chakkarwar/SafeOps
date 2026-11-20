@@ -113,7 +113,14 @@ class SetContainerEnv:
             raise FaultInjectionError(
                 f"Deployment/{injection.name} has no container {injection.container!r}"
             )
-        entry = next((e for e in container.get("env") or [] if e.get("name") == env), None)
+        matches = [e for e in container.get("env") or [] if e.get("name") == env]
+        if len(matches) > 1:
+            # Which duplicate the container sees isn't ours to guess: changing the "wrong"
+            # one would report an injection that never happened (review finding 5).
+            raise FaultInjectionError(
+                f"{injection.name}/{injection.container} defines {env!r} {len(matches)} times"
+            )
+        entry = matches[0] if matches else None
         if entry is None or "valueFrom" in entry or not isinstance(entry.get("value"), str):
             raise FaultInjectionError(
                 f"{injection.name}/{injection.container} has no plain env value {env!r} to change"
@@ -208,8 +215,21 @@ class FaultInjector:
         spec = self.load(fault_id)
         return self.inject_spec(spec, fault_seed)
 
+    def detection_attempts(self, spec: FaultSpec) -> int:
+        """Attempts per detection window: ``window_s x rate_rps``, a whole number."""
+        expr = spec.symptoms[0].parsed
+        rate = self._load_workload().settings.rate_rps
+        attempts = expr.window_s * rate
+        if attempts != int(attempts) or attempts <= 0:
+            raise FaultSpecError(
+                f"symptom window {expr.window_s}s at {rate} req/s is not a whole number of attempts"
+            )
+        return int(attempts)
+
     def inject_spec(self, spec: FaultSpec, fault_seed: int) -> InjectedFault:
         index, variant = spec.variant_for(fault_seed)
+        # Everything that can be refused is refused before the cluster changes (finding 4).
+        self.detection_attempts(spec)
         previous = self._backend(spec).apply(spec.injection, variant)
         return InjectedFault(
             spec=spec,
@@ -233,13 +253,7 @@ class FaultInjector:
         symptom = fault.spec.symptoms[0]
         expr = symptom.parsed
         workload = self._load_workload()
-        attempts_f = expr.window_s * workload.settings.rate_rps
-        if attempts_f != int(attempts_f) or attempts_f <= 0:
-            raise FaultSpecError(
-                f"symptom window {expr.window_s}s at {workload.settings.rate_rps} req/s is not"
-                " a whole number of attempts"
-            )
-        attempts = int(attempts_f)
+        attempts = self.detection_attempts(fault.spec)
         started = self._clock()
         observations: list[SymptomObservation] = []
         while True:

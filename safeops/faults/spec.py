@@ -35,6 +35,10 @@ ACTION_TYPES = frozenset(
 
 # Symptom metrics the harness can evaluate on its own measurement path (decision 0015).
 SUPPORTED_METRICS = frozenset({"http_5xx_rate"})
+# The alert names each metric may fire as. Alert names describe symptoms, never faults or
+# fixes (ITBench practice; reference-review.md), so they come from this fixed list and a
+# spec author can't write ground truth into one (Milestone 4 review, finding 1).
+ALERT_NAMES = {"http_5xx_rate": frozenset({"HighErrorRate"})}
 # "<metric> > <threshold> over <N>s": a ratio over one fixed window, not a sustained
 # "for" condition (decision 0015 says why the design's "for 2m" isn't used).
 _EXPRESSION = re.compile(
@@ -206,7 +210,12 @@ def parse_fault_spec(raw: bytes, fault_id: str, topology) -> FaultSpec:
             target,
             _str(f"symptoms[{i}].expression", s["expression"]),
         )
-        parse_expression(symptom.expression)
+        metric = parse_expression(symptom.expression).metric
+        if symptom.alert_name not in ALERT_NAMES[metric]:
+            raise FaultSpecError(
+                f"symptoms[{i}].alert_name {symptom.alert_name!r} is not an alert name for"
+                f" {metric} (allowed: {sorted(ALERT_NAMES[metric])})"
+            )
         symptoms.append(symptom)
 
     inj = _keys("injection", data["injection"], _INJECTION_KEYS)
@@ -219,6 +228,22 @@ def parse_fault_spec(raw: bytes, fault_id: str, topology) -> FaultSpec:
     resource = topology.resources.get(name)
     if resource is None or resource.kind != "Deployment":
         raise FaultSpecError(f"injection target Deployment/{name} is not in the topology")
+    owner = resource.owner
+    # Evaluator metadata must describe the fault actually injected (review finding 7).
+    if affected != owner:
+        raise FaultSpecError(
+            f"affected_service {affected!r} is not the owner ({owner!r}) of Deployment/{name}"
+        )
+    # The harness measures 5xx at the workload's entry point; it does not attribute them to
+    # a service. Until a fault brings its own attribution check, its alert may only name the
+    # service that owns the injected resource, and never a stateful one (finding 2; 0015).
+    for i, symptom in enumerate(symptoms):
+        if symptom.target_service != owner or owner in topology.stateful:
+            raise FaultSpecError(
+                f"symptoms[{i}].target_service {symptom.target_service!r} must be {owner!r},"
+                f" the owner of the injected Deployment/{name}: nothing attributes the"
+                " measured 5xx to any other service"
+            )
     container = _str("injection.target.container", target["container"], _K8S_NAME)
     variants = inj["variants"]
     if not isinstance(variants, list) or not variants:

@@ -50,6 +50,7 @@ It must terminate at `EnvironmentManager.reset_environment()` with `NotImplement
 | 4 | no valid steady-state baseline (`safeops steady-state`; decision 0009) |
 | 5 | guard refusal, missing or expired credential, or failed cluster command (decision 0009) |
 | 6 | the environment did not verify clean: `safeops verify` / `safeops reset` (decision 0013) |
+| 7 | `safeops run` was discarded before the agent started: silent non-injection, a failed injection, an unmeasurable detection window, or a dirty pre-run environment (decision 0015) |
 
 A separate code for "reached a stub" lets scripts tell "not built yet" apart from "called wrongly".
 
