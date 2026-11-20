@@ -118,7 +118,8 @@ def run(
     try:
         _run_stage("run", lambda: build_runner().run(unit), where)
     except (RecordValidationError, RecordWriteError) as exc:
-        _fail("run", f"run record not written: {exc}.{where}", EXIT_RECORD)
+        # Neutral: the record may be installed with only its durability unconfirmed.
+        _fail("run", f"run record problem: {exc}.{where}", EXIT_RECORD)
     except PostAgentDiscard as exc:
         _fail("run", f"{exc}.{recorded(exc)}{where}", EXIT_POST_AGENT_DISCARD)
     except (PreRunDiscard, FaultNotPresent, FaultInjectionError, FaultVerificationFailed) as exc:

@@ -278,3 +278,18 @@ These are fixed in v1 now, because 0017 §7 makes every later structural change 
 
 - **`provider_failure` (Milestone 9).** When the parser returns `ProposalStatus.PROVIDER_FAILURE`, routing terminates the run as a provider-failure discard at `route_proposal`, with the trajectory preserved. It must never flow down the `no_action` path (stabilization, then effectiveness, then harm), which would score a provider outage as an agent outcome.
 - **Executor `infrastructure_failure` (Milestone 8).** A returned `ExecutionStatus.INFRASTRUCTURE_FAILURE` becomes an infrastructure-failure discard **at once**, at stage `executed_action`. The runner must not continue into stabilization, effectiveness and harm, and discover the problem only when the final record fails validation.
+
+## Amendment, 2026-11-20: Milestone 5 final review
+
+The tests are in the "final review" section of `tests/test_m5_crossfield.py`. A mutation check removed each fix, and every one failed a test.
+
+1. **`reset_verified` follows the discard phase.** The post-run cleanup runs only after the agent starts. So a pre-agent discard has `reset_verified: null` (none ran), and a post-agent discard, like a completed run, records `true` or `false`. Before, a pre-agent discard claiming a verified reset was accepted, and so was a post-agent discard with no verdict. Either would have skewed reset reliability as computed from records.
+2. **No applied step after one that wasn't applied.** Steps run in order and stop at the first failure: the composite restarts only after its patch succeeded (§9.2). Before, "patch failed, then restart applied" passed as `partially_applied`.
+3. **The schema holds the writer's bounds:** `postfault_settledness.last_changes` has at most `MAX_LAST_CHANGES` (50) entries, and `discard_reason.error` at most `MAX_DISCARD_ERROR` (2000) characters. One constant serves both the writer and the schema. Before, 5,000 changes and a 100 kB error validated.
+4. **The CLI's wording.** Exit 9 now reads "run record problem: …", so it no longer says "not written" about a record that is installed with only its durability unconfirmed. The exception's own message carries which of the two happened.
+
+**Deliberately unconstrained: the order of the timestamps.** (`started_at` ≤ `injected_at` ≤ `observed_at` ≤ `fired_at` ≤ `finalized_at`)
+- These are wall-clock times, and a wall clock can step backwards (an NTP correction, sleep and resume).
+- A hard ordering rule would reject a run that crossed such a step, which moves it to `rejected/` and out of the dataset.
+- Those are exactly the runs decision 0017 §6 wants kept and flagged, through the two-reading host and cluster clock comparison at Milestones 6 and 12.
+- So ordering is a Milestone 12 flag, never a v1 validation rule.

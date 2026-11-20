@@ -26,6 +26,7 @@ from typing import Annotated, Any, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from safeops.enums import ActionType, ExecutionStatus, ProposalStatus, RunStage
+from safeops.experiment.records import MAX_DISCARD_ERROR, MAX_LAST_CHANGES
 from safeops.experiment.unit import FAULT_ID_PATTERN, MAX_FAULT_SEED, MAX_TRIAL_INDEX
 
 SCHEMA_VERSION = 1
@@ -219,7 +220,8 @@ class Settledness(_Strict):
     settled: bool
     polls: Annotated[int, Field(ge=1)]
     elapsed_s: Annotated[float, Field(ge=0.0)]
-    last_changes: list[str]
+    # The writer keeps at most MAX_LAST_CHANGES; the schema holds the same bound (final review).
+    last_changes: Annotated[list[str], Field(max_length=MAX_LAST_CHANGES)]
 
 
 class Alert(_Strict):
@@ -331,7 +333,7 @@ class DiscardReason(_Strict):
     stage: RunStage
     phase: Literal["pre_agent", "post_agent"]
     cause: DiscardCause
-    error: str
+    error: Annotated[str, Field(max_length=MAX_DISCARD_ERROR)]
 
 
 # What each stage writes into the record, in run order (stage names as in the runner).
@@ -529,6 +531,10 @@ def _evidence_problems(r: RunRecordV1) -> list[str]:
     e = r.execution
     if e is not None:
         applied = [step.status == "applied" for step in e.steps]
+        # Steps run in order and stop at the first failure: the composite restarts only
+        # after its patch succeeded (§9.2). No applied step after an unapplied one.
+        if any(not a and b for a, b in zip(applied, applied[1:], strict=False)):
+            p.append("an applied step follows a step that was not applied")
         if e.status == ExecutionStatus.APPLIED:
             if not applied or not all(applied) or e.error is not None:
                 p.append("applied needs at least one step, every step applied, and no error")
@@ -772,6 +778,12 @@ def record_problems(r: RunRecordV1) -> list[str]:
             p.append("silent_non_injection needs a fault_verification that did not hold")
         p.extend(_stage_problems(r, d.stage))
         required = CAUSE_STAGE.get(d.cause)
+        # The post-run cleanup runs (and records its verdict) only after the agent starts:
+        # never for a pre-agent discard, always for a post-agent one (final review).
+        if d.phase == "pre_agent" and r.reset_verified is not None:
+            p.append("a pre-agent discard runs no post-run reset, so reset_verified is null")
+        if d.phase == "post_agent" and r.reset_verified is None:
+            p.append("a post-agent discard is cleaned up first, so reset_verified is set")
         if required is not None and d.stage != required:
             p.append(f"cause {d.cause} comes only from stage {required}, not {d.stage}")
         if d.cause == "infrastructure_failure" and d.stage == RunStage.PRE_RUN_CLEAN_STATE:

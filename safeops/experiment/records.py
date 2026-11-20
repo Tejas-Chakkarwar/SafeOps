@@ -36,6 +36,7 @@ from safeops.enums import RunStage
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RUNS_DIR = REPO_ROOT / "data" / "runs"
 MAX_LAST_CHANGES = 50  # bound the settledness diff kept in a record
+MAX_DISCARD_ERROR = 2000  # bound the error text kept in a discard reason
 
 
 class RecordWriteError(Exception):
@@ -380,7 +381,7 @@ class RunRecordWriter:
                 "stage": discard.stage,
                 "phase": discard.phase,
                 "cause": discard.cause,
-                "error": discard.error[:2000],
+                "error": discard.error[:MAX_DISCARD_ERROR],
             },
             "in_cohort_g": in_g,
         }

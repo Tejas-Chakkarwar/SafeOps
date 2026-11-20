@@ -1064,6 +1064,8 @@ def _as_discard(rec: dict, stage: str, cause: str = "infrastructure_failure") ->
     rec = _set(rec, ("in_cohort_g",), False)
     rec = _set(rec, ("outcome",), None)
     phase = "post_agent" if stage in POST_AGENT_STAGES else "pre_agent"
+    if phase == "pre_agent":
+        rec = _set(rec, ("reset_verified",), None)  # no post-run cleanup before the agent
     return _set(
         rec, ("discard_reason",), {"stage": stage, "phase": phase, "cause": cause, "error": "x"}
     )

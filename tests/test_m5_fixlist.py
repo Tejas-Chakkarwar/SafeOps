@@ -172,7 +172,7 @@ def test_statuses_without_a_proposal_complete_without_one(good, status) -> None:
 
 def _provider_failure(good: dict, **reason) -> dict:
     rec = _completed_without_gate(good, "provider_failure", None)
-    for k in ("stabilization_timed_out", "postaction_snapshot_hash", "reset_verified"):
+    for k in ("stabilization_timed_out", "postaction_snapshot_hash"):  # cleanup still ran
         rec = _set(rec, (k,), None)
     rec = _as_discard(rec, RunStage.ROUTE_PROPOSAL, reason.get("cause", "provider_failure"))
     return rec

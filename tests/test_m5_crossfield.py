@@ -14,6 +14,7 @@ from safeops.experiment.runner import PreRunDiscard
 from safeops.experiment.schema import CAUSE_STAGE, RecordValidationError
 from tests.test_m5_records import (
     UNIT,
+    Fixed,
     _as_discard,
     _check,
     _records,
@@ -390,3 +391,80 @@ def test_records_from_the_runner_still_validate_end_to_end(tmp_path) -> None:
     (rec,) = _records(tmp_path / "ok")
     _check(rec)
     assert json.loads(json.dumps(rec)) == rec
+
+
+# --- final review ------------------------------------------------------------------------------
+
+
+def test_final_reset_verified_follows_the_discard_phase(tmp_path, good) -> None:
+    """A pre-agent discard runs no post-run reset; a post-agent one always does first."""
+    dirty = _discard_records(tmp_path)["pre_run_dirty"]
+    assert dirty["reset_verified"] is None
+    with pytest.raises(RecordValidationError, match="pre-agent discard runs no post-run reset"):
+        _check(_set(dirty, ("reset_verified",), True))
+    rec = good
+    for k in ("stabilization_timed_out", "postaction_snapshot_hash"):
+        rec = _set(rec, (k,), None)
+    post = _as_discard(rec, RunStage.STABILIZATION)
+    _check(post)
+    with pytest.raises(RecordValidationError, match="post-agent discard is cleaned up first"):
+        _check(_set(post, ("reset_verified",), None))
+
+
+def test_final_the_runner_writes_reset_verified_per_phase(tmp_path) -> None:
+    from safeops.experiment.runner import PostAgentDiscard
+
+    r = _runner(tmp_path / "post", harm=Fixed(raises=KeyError("x")))
+    with pytest.raises(PostAgentDiscard):
+        r.run(UNIT)
+    (post,) = _records(tmp_path / "post")
+    assert post["reset_verified"] is True
+
+
+def test_final_no_applied_step_after_an_unapplied_one(good) -> None:
+    restarted_anyway = [
+        _step("patch_configmap", "failed", "422"),
+        _step("restart_deployment", "applied"),
+    ]
+    with pytest.raises(RecordValidationError, match="applied step follows"):
+        _check(_exec(good, "partially_applied", restarted_anyway, None, PATCH_POOL))
+    in_order = [_step("patch_configmap", "applied"), _step("restart_deployment", "failed", "x")]
+    _check(_exec(good, "partially_applied", in_order, None, PATCH_POOL))
+
+
+def test_final_record_bounds_match_the_writer(good, tmp_path) -> None:
+    from safeops.experiment.records import MAX_DISCARD_ERROR, MAX_LAST_CHANGES
+
+    unsettled = _set(good, ("postfault_settledness", "settled"), False)
+    _check(_set(unsettled, ("postfault_settledness", "last_changes"), ["c"] * MAX_LAST_CHANGES))
+    with pytest.raises(RecordValidationError):
+        _check(
+            _set(
+                unsettled, ("postfault_settledness", "last_changes"), ["c"] * (MAX_LAST_CHANGES + 1)
+            )
+        )
+    dirty = _discard_records(tmp_path)["pre_run_dirty"]
+    _check(_set(dirty, ("discard_reason", "error"), "x" * MAX_DISCARD_ERROR))
+    with pytest.raises(RecordValidationError):
+        _check(_set(dirty, ("discard_reason", "error"), "x" * (MAX_DISCARD_ERROR + 1)))
+
+
+def test_final_cli_wording_does_not_deny_an_installed_record(monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from safeops import cli
+    from safeops.experiment import runner
+    from safeops.experiment.records import RecordWriteError
+
+    class Installed:
+        def run(self, unit):
+            raise RecordWriteError(
+                "run record x.json is installed, but confirming it durable failed"
+            )
+
+    monkeypatch.setattr(runner, "build_runner", lambda: Installed())
+    result = CliRunner().invoke(
+        cli.app, ["run", "--fault", "bad-deployment-config", "--seed", "0", "--trial", "0"]
+    )
+    assert result.exit_code == cli.EXIT_RECORD
+    assert "not written" not in result.output and "is installed" in result.output
