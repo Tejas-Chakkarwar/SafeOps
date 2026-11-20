@@ -13,7 +13,7 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 >
 > Also lands in Milestone 4, already decided:
 > - a bounded **post-fault settledness** check before the harm-baseline snapshot: poll the canonical projection until it's identical across two consecutive intervals, and flag it if it doesn't settle. It's separate from Milestone 3's health stabilization, and observed from cluster state, never declared per fault (decision 0013, third review)
-> - `Alert` and `IncidentRuntimeContext` live outside `safeops.faults`; the fault id is validated before it's used as a path; the seed range is decided (decision 0004 notes)
+> - `Alert` and `IncidentRuntimeContext` live outside `safeops.faults`; the fault id is validated before it's used as a path; `--seed` and `--trial` need an upper bound chosen at Milestone 4, since values above 2^53 lose precision in JSON and some RNGs take 32- or 64-bit seeds (decision 0004 open item)
 > - `memory-limit-low` lowers request and limit together (decision 0011)
 > - the Milestone 4 reference reading first: ITBench `scenarios/sre/` and the AIOpsLab fault library, as a short targeted pass
 
