@@ -110,16 +110,17 @@ def check_steady_state(steady_state: SteadyState) -> None:
         )
 
 
-def _inconsistency(summary: dict, s: WorkloadSettings) -> str | None:
+def _inconsistency(summary: dict, s: WorkloadSettings, size: int | None = None) -> str | None:
     """Why a 'complete' window summary can't be right, or None if it's consistent."""
 
     def is_int(v):
         return isinstance(v, int) and not isinstance(v, bool)
 
+    expected = s.window_attempts if size is None else size
     size, scheduled = summary.get("size"), summary.get("scheduled")
     succeeded, failed = summary.get("succeeded"), summary.get("failed")
-    if size != s.window_attempts:
-        return f"window size {size!r}, configured {s.window_attempts}"
+    if size != expected:
+        return f"window size {size!r}, configured {expected}"
     if scheduled != size:
         return f"scheduled {scheduled!r} of {size}"
     if not (is_int(succeeded) and is_int(failed)):
@@ -130,6 +131,35 @@ def _inconsistency(summary: dict, s: WorkloadSettings) -> str | None:
         got = summary.get("deadline_s")
         return f"measured with deadline {got!r}s, configured {s.attempt_deadline_s}s"
     return None
+
+
+def _server_error_inconsistency(summary: dict) -> str | None:
+    """The 5xx count a fault-detection window needs (decision 0015) must fit the others."""
+    errors, failed = summary.get("server_error_responses"), summary.get("failed")
+    if not isinstance(errors, int) or isinstance(errors, bool):
+        return "server_error_responses missing or not an integer"
+    if not 0 <= errors <= failed:
+        return f"server_error_responses {errors} outside 0..failed ({failed})"
+    responded = summary.get("error_responses")
+    if isinstance(responded, int) and errors > responded:
+        return f"server_error_responses {errors} > error_responses {responded}"
+    return None
+
+
+@dataclass(frozen=True)
+class WindowMeasurement:
+    """One fixed-denominator window, cross-checked. ``summary`` is set only if measured."""
+
+    window_id: str | None
+    state: str  # complete | failed | timeout
+    size: int
+    scheduled: int
+    summary: dict | None
+    failure: str | None = None
+
+    @property
+    def measured(self) -> bool:
+        return self.state == "complete" and self.summary is not None
 
 
 class WorkloadGenerator:
@@ -184,38 +214,18 @@ class WorkloadGenerator:
             raise
         self._started_at = self._clock()
 
-    def _failed(self, window_id, scheduled, reason: str) -> SteadyState:
-        s = self.settings
-        return SteadyState(
-            window_id,
-            "failed",
-            s.window_attempts,
-            scheduled,
-            None,
-            s.min_successes,
-            None,
-            None,
-            reason,
-        )
+    def _collect(self, attempts: int) -> WindowMeasurement:
+        """Open a window of ``attempts`` scheduled attempts and wait for it to close.
 
-    def verify_steady_state(self) -> SteadyState:
-        """Measure one fixed-denominator window after the warmup. Doesn't judge it.
-
-        The runner's _require_steady_state hook and the CLI apply check_steady_state().
         The generator's summary isn't trusted: every count is cross-checked, and a summary
-        that can't be right becomes a measurement failure, never a baseline (review W1-W4).
-        Losing the generator or its window mid-measurement is also a measurement failure (W6).
+        that can't be right is a measurement failure (review W1-W4). Losing the generator or
+        its window mid-measurement is also a measurement failure (W6).
         """
         from safeops.cluster import CommandError
 
         s = self.settings
-        if self._started_at is None:
-            raise SteadyStateMeasurementFailed("verify_steady_state called before start_workload")
-        remaining = self._started_at + s.warmup_s - self._clock()
-        if remaining > 0:
-            self._sleep(remaining)
         try:
-            window_id = self._proxy().control({"action": "measure", "attempts": s.window_attempts})[
+            window_id = self._proxy().control({"action": "measure", "attempts": attempts})[
                 "window_id"
             ]
             deadline = self._clock() + s.window_poll_timeout_s
@@ -224,38 +234,94 @@ class WorkloadGenerator:
                 if summary.get("state") in ("complete", "failed"):
                     break
                 if self._clock() > deadline:
-                    return SteadyState(
+                    return WindowMeasurement(
                         window_id,
                         "timeout",
-                        s.window_attempts,
+                        attempts,
                         int(summary.get("scheduled", 0)),
-                        None,
-                        s.min_successes,
-                        None,
                         None,
                         f"window not closed after {s.window_poll_timeout_s}s",
                     )
                 self._sleep(s.window_poll_interval_s)
         except CommandError as exc:
-            return self._failed(None, 0, f"generator or window lost during measurement: {exc}")
+            return WindowMeasurement(
+                None,
+                "failed",
+                attempts,
+                0,
+                None,
+                f"generator or window lost during measurement: {exc}",
+            )
 
-        scheduled = summary.get("scheduled")
+        scheduled = int(summary.get("scheduled") or 0)
         if summary.get("state") == "failed":
-            return self._failed(window_id, int(scheduled or 0), summary.get("failure") or "failed")
-        problem = _inconsistency(summary, s)
+            return WindowMeasurement(
+                window_id, "failed", attempts, scheduled, None, summary.get("failure") or "failed"
+            )
+        problem = _inconsistency(summary, s, attempts)
         if problem is not None:
-            return self._failed(window_id, int(scheduled or 0), f"inconsistent summary: {problem}")
+            return WindowMeasurement(
+                window_id, "failed", attempts, scheduled, None, f"inconsistent summary: {problem}"
+            )
+        return WindowMeasurement(window_id, "complete", attempts, scheduled, dict(summary))
+
+    def verify_steady_state(self) -> SteadyState:
+        """Measure one fixed-denominator window after the warmup. Doesn't judge it.
+
+        The runner's _require_steady_state hook and the CLI apply check_steady_state().
+        """
+        s = self.settings
+        if self._started_at is None:
+            raise SteadyStateMeasurementFailed("verify_steady_state called before start_workload")
+        remaining = self._started_at + s.warmup_s - self._clock()
+        if remaining > 0:
+            self._sleep(remaining)
+        m = self._collect(s.window_attempts)
+        if not m.measured:
+            return SteadyState(
+                m.window_id,
+                m.state,
+                s.window_attempts,
+                m.scheduled,
+                None,
+                s.min_successes,
+                None,
+                None,
+                m.failure,
+            )
+        summary = m.summary
         return SteadyState(
-            window_id=window_id,
+            window_id=m.window_id,
             state="complete",
             size=s.window_attempts,
-            scheduled=scheduled,
+            scheduled=summary["scheduled"],
             succeeded=summary["succeeded"],
             min_successes=s.min_successes,
             success_rate=summary.get("success_rate"),
             p95_latency_ms=summary.get("p95_latency_ms"),
             failure=None,
         )
+
+    def measure_window(self, attempts: int) -> WindowMeasurement:
+        """Measure one more window while load is running (fault detection; decision 0015).
+
+        Requires the 5xx count as well as the steady-state cross-checks. Doesn't judge it.
+        """
+        if self._started_at is None:
+            return WindowMeasurement(None, "failed", attempts, 0, None, "load is not running")
+        m = self._collect(attempts)
+        if m.measured:
+            problem = _server_error_inconsistency(m.summary)
+            if problem is not None:
+                return WindowMeasurement(
+                    m.window_id,
+                    "failed",
+                    attempts,
+                    m.scheduled,
+                    None,
+                    f"inconsistent summary: {problem}",
+                )
+        return m
 
     def stop_workload(self) -> None:
         """Stop the load generator."""

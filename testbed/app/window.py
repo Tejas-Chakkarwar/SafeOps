@@ -126,11 +126,20 @@ class Window:
         ]
         latencies = [a.completed - a.dispatched for a in ok if a.completed is not None]
         p95 = _percentile(latencies, 0.95)
+        # A 5xx answered inside the deadline. A late 5xx is already counted under
+        # timed_out_or_no_response, so the buckets stay disjoint (decision 0015).
+        late_or_missing = {id(a) for a in no_response}
+        server_errors = [
+            a
+            for a in self.attempts
+            if id(a) not in late_or_missing and a.status is not None and 500 <= a.status <= 599
+        ]
         out.update(
             succeeded=len(ok),
             failed=self.size - len(ok),
             timed_out_or_no_response=len(no_response),
             error_responses=self.size - len(ok) - len(no_response),
+            server_error_responses=len(server_errors),
             success_rate=len(ok) / self.size,
             p95_latency_ms=None if p95 is None else round(p95 * 1000, 2),
             max_dispatch_lag_ms=round(max(a.dispatched - a.due for a in self.attempts) * 1000, 2),

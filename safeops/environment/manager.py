@@ -23,6 +23,11 @@ from dataclasses import dataclass
 STABILIZATION_TIMEOUT_S = 120  # design §5
 STABILIZATION_POLL_S = 2.0
 CHAOS_API_GROUP = "chaos-mesh.org"
+# Post-fault settledness (decision 0013, Milestone 4 requirement; values: decision 0015).
+# Settled = the canonical projection identical across two consecutive polling intervals.
+SETTLE_POLL_S = 5.0  # the testbed's readiness probe period, so a pod can flip once per poll
+SETTLE_TIMEOUT_S = 60.0
+SETTLE_IDENTICAL_POLLS = 3  # three identical polls span two intervals
 
 
 class EnvironmentStateError(Exception):
@@ -47,6 +52,23 @@ class QuarantineFailed(EnvironmentStateError):
 class CleanStateResult:
     clean: bool
     problems: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SettledSnapshot:
+    """The post-fault harm baseline and whether the state had settled when it was taken.
+
+    Settled is not healthy: a fault that leaves pods in ImagePullBackOff can be perfectly
+    settled. Not settled means the projection was still changing at the timeout; the
+    snapshot is then the last poll, and the run is flagged (Milestone 5), never silently
+    treated as a clean baseline.
+    """
+
+    snapshot: object  # safeops.environment.snapshot.Snapshot
+    settled: bool
+    polls: int
+    elapsed_s: float
+    last_changes: tuple[str, ...] = ()  # diff between the last two polls if not settled
 
 
 # Inventory of every other namespaced kind the testbed could hold (Milestone 3 review, H1).
@@ -207,6 +229,7 @@ class EnvironmentManager:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         stabilization_timeout_s: float = STABILIZATION_TIMEOUT_S,
+        settle_timeout_s: float = SETTLE_TIMEOUT_S,
     ) -> None:
         self._kubectl = kubectl
         self._node = node
@@ -216,6 +239,7 @@ class EnvironmentManager:
         self._clock = clock
         self._sleep = sleep
         self.stabilization_timeout_s = stabilization_timeout_s
+        self.settle_timeout_s = settle_timeout_s
         self._cfg = None
         self._topology = None
 
@@ -375,6 +399,31 @@ class EnvironmentManager:
         pods = self._items("pods")
         replicasets = self._items("replicasets")
         return snapshot.build(objects, slices, pods, replicasets, self.topology)
+
+    def capture_settled_snapshot(self) -> SettledSnapshot:
+        """Post-fault snapshot, taken once the state has settled (decision 0013).
+
+        Polls the canonical projection every SETTLE_POLL_S until SETTLE_IDENTICAL_POLLS
+        consecutive polls are identical, or SETTLE_TIMEOUT_S passes. Observed from the
+        cluster, never declared per fault. Separate from wait_stabilization_window, which
+        waits for health and stays what reset and verify use.
+        """
+        from safeops.environment import snapshot as snap
+
+        started = self._clock()
+        current = self.capture_snapshot()
+        polls, identical, changes = 1, 1, ()
+        while identical < SETTLE_IDENTICAL_POLLS:
+            if self._clock() - started + SETTLE_POLL_S > self.settle_timeout_s:
+                return SettledSnapshot(current, False, polls, self._clock() - started, changes)
+            self._sleep(SETTLE_POLL_S)
+            previous, current = current, self.capture_snapshot()
+            polls += 1
+            changes = tuple(snap.diff(previous, current))
+            if not changes and previous.digest() != current.digest():
+                changes = ("canonical digest changed",)  # belt and braces over diff()
+            identical = identical + 1 if not changes else 1
+        return SettledSnapshot(current, True, polls, self._clock() - started)
 
     def wait_stabilization_window(self) -> bool:
         """Wait until every deployment's observed generation matches the desired one with

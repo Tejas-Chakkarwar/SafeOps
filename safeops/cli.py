@@ -7,6 +7,7 @@ from typing import Annotated
 
 import typer
 
+from safeops.experiment.unit import MAX_FAULT_SEED, MAX_TRIAL_INDEX
 from safeops.stubs import NotImplementedStage
 
 # Exit codes (decisions 0004, 0009).
@@ -15,6 +16,7 @@ EXIT_NOT_IMPLEMENTED = 3
 EXIT_STEADY_STATE = 4  # no valid steady-state baseline
 EXIT_CLUSTER = 5  # guard refusal, missing or expired credential, failed cluster command
 EXIT_DIRTY = 6  # the environment did not verify clean (decision 0013)
+EXIT_DISCARDED = 7  # the run was discarded before the agent started (decision 0015)
 
 # pretty_exceptions_show_locals=False: a traceback must never dump local variables,
 # because they may later hold API keys or tokens (CLAUDE.md, Secrets).
@@ -44,9 +46,15 @@ def run(
     fault: Annotated[
         str | None, typer.Option("--fault", help="Fault id, e.g. bad-deployment-config.")
     ] = None,
-    seed: Annotated[int | None, typer.Option("--seed", min=0, help="Fault seed.")] = None,
+    seed: Annotated[
+        int | None,
+        typer.Option("--seed", min=0, max=MAX_FAULT_SEED, help="Fault seed, 0..2^32-1."),
+    ] = None,
     trial: Annotated[
-        int | None, typer.Option("--trial", min=0, help="Trial index, 0..k-1.")
+        int | None,
+        typer.Option(
+            "--trial", min=0, max=MAX_TRIAL_INDEX, help="Trial index, 0..k-1 (k <= 1000)."
+        ),
     ] = None,
     dry_run: Annotated[
         bool,
@@ -76,15 +84,39 @@ def run(
     if not fault.strip():
         _fail("run", "--fault must not be empty.", EXIT_USAGE)
 
-    from safeops.experiment.runner import RunUnit, build_runner
+    from safeops.experiment.unit import InvalidRunUnit, RunUnit
+    from safeops.faults.spec import FaultSpecError, fault_path
 
-    unit = RunUnit(fault_id=fault, fault_seed=seed, trial_index=trial)
-    _run_stage(
-        "run",
-        lambda: build_runner().run(unit),
-        f" Run unit: fault_id={unit.fault_id}, fault_seed={unit.fault_seed},"
-        f" trial_index={unit.trial_index}.",
+    try:
+        unit = RunUnit(fault_id=fault, fault_seed=seed, trial_index=trial)
+        if not fault_path(unit.fault_id).is_file():  # validated before it becomes a path
+            raise FaultSpecError(f"no fault spec for {unit.fault_id!r} under faults/")
+    except (InvalidRunUnit, FaultSpecError) as exc:
+        _fail("run", f"{exc}.", EXIT_USAGE)
+
+    from safeops.cluster import CommandError, CredentialError, GuardError
+    from safeops.environment.workload import SteadyStateError
+    from safeops.experiment.runner import PreRunDiscard, build_runner
+    from safeops.faults.injector import (
+        FaultInjectionError,
+        FaultNotPresent,
+        FaultVerificationFailed,
     )
+
+    where = (
+        f" Run unit: fault_id={unit.fault_id}, fault_seed={unit.fault_seed},"
+        f" trial_index={unit.trial_index}."
+    )
+    try:
+        _run_stage("run", lambda: build_runner().run(unit), where)
+    except (PreRunDiscard, FaultNotPresent, FaultInjectionError, FaultVerificationFailed) as exc:
+        _fail("run", f"discarded before the agent: {exc}.{where}", EXIT_DISCARDED)
+    except SteadyStateError as exc:
+        _fail("run", f"discarded, no steady-state baseline: {exc}.{where}", EXIT_STEADY_STATE)
+    except FaultSpecError as exc:
+        _fail("run", f"{exc}.{where}", EXIT_USAGE)
+    except (GuardError, CredentialError, CommandError) as exc:
+        _fail("run", f"{type(exc).__name__}: {exc}.{where}", EXIT_CLUSTER)
 
 
 @app.command("steady-state")

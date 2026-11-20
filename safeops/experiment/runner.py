@@ -11,7 +11,7 @@ tests/test_run_sequence.py enforces that.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from safeops.agent.loop import Agent
 from safeops.agent.parser import ProposalParser
@@ -20,8 +20,9 @@ from safeops.environment.manager import CleanStateResult, EnvironmentManager, Qu
 from safeops.environment.workload import WorkloadGenerator, check_steady_state
 from safeops.executor.executor import ActionExecutor
 from safeops.experiment.records import RunRecordWriter
+from safeops.experiment.unit import RunUnit
 from safeops.faults.alerts import AlertGenerator
-from safeops.faults.injector import FaultInjector
+from safeops.faults.injector import FaultInjector, FaultNotPresent
 from safeops.features.extractor import RiskFeatureExtractor
 from safeops.gate.always_act import AlwaysActGate
 from safeops.gate.shadow import ShadowGateScorer
@@ -35,13 +36,7 @@ class PreRunDiscard(Exception):
     (§11.1), and the worker was quarantined and rebuilt."""
 
 
-@dataclass(frozen=True)
-class RunUnit:
-    """The experimental unit (§10.1)."""
-
-    fault_id: str
-    fault_seed: int
-    trial_index: int
+__all__ = ["ExperimentRunner", "PreRunDiscard", "RunUnit", "build_runner"]
 
 
 class ExperimentRunner:
@@ -76,6 +71,8 @@ class ExperimentRunner:
         self.harm = harm
         self.records = records
         self._halt: Exception | None = None
+        self._topology = None
+        self._wall_clock = lambda: datetime.now(UTC)
 
     def run(self, unit: RunUnit) -> None:
         env = self.environment
@@ -96,11 +93,15 @@ class ExperimentRunner:
         self._require_steady_state(steady_state)
         prefault = env.capture_snapshot()
         fault = self.injector.inject(unit.fault_id, unit.fault_seed)
-        self._require_fault_present(self.injector.verify_fault_present(fault))
-        postfault = env.capture_snapshot()  # harm baseline (§5, Rule 2)
+        verification = self.injector.verify_fault_present(fault)
+        self._require_fault_present(verification)
+        # Harm baseline (§5, Rule 2), taken once the projection has settled; flagged if it
+        # never settled, never silently a mid-transition snapshot (decision 0013).
+        postfault = env.capture_settled_snapshot()
 
-        # Information wall (§6): only the symptom-built alert crosses into the runtime.
-        alert = self.alerts.build_alert(fault)
+        # Information wall (§6): only the alert, built from the verified symptom, crosses
+        # into the runtime. The fault and its spec stay on this side.
+        alert = self.alerts.build_alert(verification)
         context = self._runtime_context(alert)
         raw_output, trajectory = self.agent.investigate(context)
         proposal = self.parser.parse(raw_output)
@@ -119,7 +120,7 @@ class ExperimentRunner:
         env.wait_stabilization_window()
         postaction = env.capture_snapshot()
         effective = self.effectiveness.verify(steady_state)
-        harm = self.harm.check(executed_action, context, postfault, postaction)
+        harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)
 
         # Measurements are complete. Everything from here on is cleanup, and no cleanup
         # failure may erase the run (§11.1; Milestone 3 third review). Order:
@@ -147,6 +148,8 @@ class ExperimentRunner:
             unit=unit,
             steady_state=steady_state,
             prefault=prefault,
+            fault=fault,
+            fault_verification=verification,
             postfault=postfault,
             alert=alert,
             trajectory=trajectory,
@@ -185,13 +188,25 @@ class ExperimentRunner:
         """
         check_steady_state(steady_state)
 
-    @stub(milestone=4)
-    def _require_fault_present(self, present: bool) -> None:
-        """Silent non-injection: discard before the agent starts (§11.2)."""
+    def _require_fault_present(self, verification) -> None:
+        """Silent non-injection: discard before the agent starts (§11.2).
 
-    @stub(milestone=4)
+        Raises FaultNotPresent, a pre-run discard. Recording the discard is Milestone 5.
+        """
+        if not verification.present:
+            raise FaultNotPresent(
+                f"silent non-injection; run discarded before the agent: {verification.reason}"
+            )
+
     def _runtime_context(self, alert):
         """Build IncidentRuntimeContext(alert, topology, now). It holds no fault spec (§6)."""
+        from safeops.context import IncidentRuntimeContext
+
+        if self._topology is None:
+            from safeops.topology import load_topology
+
+            self._topology = load_topology()
+        return IncidentRuntimeContext(alert=alert, topology=self._topology, now=self._wall_clock())
 
     @stub(milestone=8)
     def _gate_eligible_action(self, proposal):
@@ -236,10 +251,11 @@ class ExperimentRunner:
 
 def build_runner() -> ExperimentRunner:
     """Wire the default components. Constructing them has no side effects."""
+    workload = WorkloadGenerator()  # shared: the injector measures on the running workload
     return ExperimentRunner(
         environment=EnvironmentManager(),
-        workload=WorkloadGenerator(),
-        injector=FaultInjector(),
+        workload=workload,
+        injector=FaultInjector(workload=workload),
         alerts=AlertGenerator(),
         agent=Agent(),
         parser=ProposalParser(),

@@ -23,6 +23,13 @@ COMPONENTS = {
 }
 
 
+class _Opaque:
+    """A stage result the runner only passes along (any attribute is another _Opaque)."""
+
+    def __getattr__(self, name: str) -> _Opaque:
+        return _Opaque()
+
+
 class _Recorder:
     """Records (Owner, method) calls and checks each call against the real signature."""
 
@@ -39,7 +46,7 @@ class _Recorder:
                 def call(*args, **kwargs):
                     inspect.signature(real).bind(None, *args, **kwargs)  # TypeError on mismatch
                     recorder.calls.append((owner.__name__, method))
-                    return (object(), object()) if method == "investigate" else object()
+                    return (_Opaque(), _Opaque()) if method == "investigate" else _Opaque()
 
                 return call
 
@@ -115,9 +122,10 @@ def test_runner_stops_at_first_stub_in_sequence_order(offline_runner_factory) ->
     assert exc.value.milestone == expected.milestone
 
 
-def test_milestone3_first_stub_is_fault_injection() -> None:
-    """After Milestone 3 every lifecycle stage is real; the next stub is Milestone 4's injector.
-    (At Milestone 1 it was reset_environment; decision 0004.)"""
+def test_milestone4_first_stub_is_the_agent() -> None:
+    """After Milestone 4 injection, fault verification, the settled post-fault snapshot, the
+    alert and the runtime context are real; the next stub is the agent (Milestone 9).
+    (Milestone 1: reset_environment, decision 0004; Milestone 3: FaultInjector.inject.)"""
     stage = first_stub()
     assert stage is not None
-    assert (stage.qualname, stage.milestone) == ("FaultInjector.inject", 4)
+    assert (stage.qualname, stage.milestone) == ("Agent.investigate", 9)

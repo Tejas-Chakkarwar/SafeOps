@@ -58,7 +58,7 @@ RUN_SEQUENCE: tuple[Stage, ...] = (
     Stage("inject fault", FaultInjector, "inject"),
     Stage("verify fault present", FaultInjector, "verify_fault_present"),
     Stage("handle fault verification", ExperimentRunner, "_require_fault_present"),
-    Stage("capture post-fault snapshot", EnvironmentManager, "capture_snapshot"),
+    Stage("capture settled post-fault snapshot", EnvironmentManager, "capture_settled_snapshot"),
     Stage("build alert (symptoms only)", AlertGenerator, "build_alert"),
     Stage("build runtime context", ExperimentRunner, "_runtime_context"),
     Stage("agent investigates", Agent, "investigate"),

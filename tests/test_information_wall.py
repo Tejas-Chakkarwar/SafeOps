@@ -11,7 +11,8 @@ import ast
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PROTECTED = ("safeops.agent", "safeops.features", "safeops.gate")
+# safeops.context is the neutral module those packages consume (Alert, IncidentRuntimeContext).
+PROTECTED = ("safeops.agent", "safeops.features", "safeops.gate", "safeops.context")
 FORBIDDEN = "safeops.faults"
 
 

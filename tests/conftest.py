@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
-from safeops.environment.manager import CleanStateResult
+from safeops.environment.manager import CleanStateResult, SettledSnapshot
 from safeops.environment.snapshot import Snapshot
 from safeops.environment.workload import SteadyState
+from safeops.faults.injector import FaultVerification, SymptomObservation
+from safeops.faults.spec import Symptom
+
+FIXED_TIME = datetime(2026, 11, 19, 18, 0, 0, tzinfo=UTC)
 
 
 class FakeEnvironment:
@@ -27,6 +33,10 @@ class FakeEnvironment:
         self.calls.append("capture_snapshot")
         return Snapshot({})
 
+    def capture_settled_snapshot(self) -> SettledSnapshot:
+        self.calls.append("capture_settled_snapshot")
+        return SettledSnapshot(Snapshot({}), True, 3, 10.0)
+
     def wait_stabilization_window(self) -> bool:
         self.calls.append("wait_stabilization_window")
         return True
@@ -46,6 +56,25 @@ class FakeWorkload:
         pass
 
 
+class FakeInjector:
+    """Injects nothing; reports the declared symptom as measured to hold."""
+
+    def __init__(self, present: bool = True) -> None:
+        self.present = present
+        self.calls: list[str] = []
+
+    def inject(self, fault_id: str, fault_seed: int):
+        self.calls.append("inject")
+        return ("fake-injected-fault", fault_id, fault_seed)
+
+    def verify_fault_present(self, fault, timeout_s=None) -> FaultVerification:
+        self.calls.append("verify_fault_present")
+        symptom = Symptom("HighErrorRate", "orders", "http_5xx_rate > 0.2 over 30s")
+        value = 1.0 if self.present else 0.0
+        obs = SymptomObservation("w2", 300, int(300 * value), value, self.present, FIXED_TIME)
+        return FaultVerification(self.present, symptom, (obs,), None if self.present else "absent")
+
+
 @pytest.fixture
 def offline_runner_factory():
     """build_runner() with every implemented, cluster-touching stage replaced by a fake;
@@ -58,6 +87,8 @@ def offline_runner_factory():
         r = real_build()
         r.environment = FakeEnvironment()
         r.workload = FakeWorkload()
+        r.injector = FakeInjector()
+        r.alerts._namespace = "testbed"  # no cluster config read in offline tests
         return r
 
     return factory
