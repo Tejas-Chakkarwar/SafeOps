@@ -51,6 +51,21 @@ When Milestone 5 replaces the writer stub, **at least the settled/unsettled cond
 
 Don't redesign the loadgen metrics.
 
+## 5. Milestone 5: a live test of the deployed load generator's run boundary
+
+- `tests/test_m4_fixlist.py` covers the run-boundary logic offline. It uses the real `loadgen.py` and real `Window` objects, with only `prometheus_client` and `app.common` replaced by stand-ins. That is enough for the logic.
+- Nothing live yet proves that the **deployed image** behaves the same way over the real HTTP and API-server-proxy path.
+
+**Requirement:** a live test in `tests/cluster/` that:
+1. starts the workload generator;
+2. measures at least one window;
+3. stops it;
+4. starts it again;
+5. reads `/stats`;
+6. checks that the previous run's window is no longer listed and returns 404 by id, that `dispatched_total` restarted from zero for the new run, and that the new run measures a window normally.
+
+It is a live assertion of the measurement infrastructure's run boundary. Write it at Milestone 5, not as part of the Milestone 4 closeout.
+
 ## Not carried
 
 The Milestone 4 fix list's code changes (the loadgen run boundary, backend provenance, load cleanup on a lost start, the window invariant, the threshold rename) are recorded in decision 0015's third amendment and decision 0009's amendment, not here.

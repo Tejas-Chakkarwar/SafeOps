@@ -47,7 +47,7 @@ The design's example expression is `http_5xx_rate > 0.2 for 2m` (§9.5). If veri
   - It is built **only** from a verification in which the harness measured that expression holding. `build_alert` refuses a verification where it didn't.
   - `fired_at` is the time the holding window was read, not the injection time.
   - So everything the agent reads in the alert was true of the cluster at `fired_at`.
-- **`verify_fault_present` measures at most three windows** (`VERIFY_MAX_WINDOWS`), with a 150 s wall-clock safety cap. The first window usually overlaps the rollout. Three windows with no hold is silent non-injection, which costs about 97 s, only on a run that is discarded anyway. *(The first version used a 95 s timeout; see the second-review amendment for why that was replaced.)*
+- **`verify_fault_present` measures at most three windows** (`VERIFY_MAX_WINDOWS`), with a 150 s wall-clock safety cap *(→ not a strict ceiling: it is a between-window threshold, and verification can overrun it by up to one window; see the fix-list amendment, item 8)*. The first window usually overlaps the rollout. Three windows with no hold is silent non-injection, which costs about 97 s, only on a run that is discarded anyway. *(The first version used a 95 s timeout; see the second-review amendment for why that was replaced.)*
 
 ### What the measurement does and doesn't attribute
 
@@ -149,7 +149,7 @@ The regression tests are in the "second pass" section of `tests/test_m4_faults.p
    - **The fix:** the guarded block now runs from `verify_steady_state` through `harm.check`. This is cleanup, not classification. Whatever Milestone 5 decides about a run that fails mid-way, its post-run cleanup stops the load as well.
 2. **Verification uses a fixed number of windows, not a time budget.**
    - **The problem:** each window really takes about 32.4 s (30 s of scheduling, the 1 s deadline, the generator's 0.5 s settle, and polling). The third window started at about 64.8 s, and the 95 s budget let it run only because 64.8 + 30 ≤ 95, a margin of 0.2 s. A little polling jitter meant two windows instead of three. Whether a run was discarded, and the live test that asserts three windows, depended on that.
-   - **The fix:** `VERIFY_MAX_WINDOWS = 3`. The new 150 s cap is only a safety net against an unusually slow generator. It's tested at window durations of 29, 32.4, 33 and 40 s, and separately with 80 s windows to show the cap still bites.
+   - **The fix:** `VERIFY_MAX_WINDOWS = 3`. The new 150 s cap is only a safety net against an unusually slow generator. It's tested at window durations of 29, 32.4, 33 and 40 s, and separately with 80 s windows to show the cap still bites. *(→ It doesn't bite as a hard cap: it is a between-window threshold, and the two 80 s windows return at about 160 s. See the fix-list amendment, item 8, for the corrected semantics.)*
 3. **A symptom window the collector can never see close is refused before injection.** The window collector gives up after `window_poll_timeout_s` (60 s), but the spec grammar allowed windows up to 300 s, so any `over 58s` or longer would discard every run as unmeasurable. `detection_attempts` now requires `window_s + attempt_deadline_s + 1.5 s` (the generator's settle margin plus one poll) to be under the poll timeout. It's checked in `inject_spec`, before the cluster changes. The steady-state window and its 60 s timeout (decision 0009) are unchanged.
 4. **An unsettled baseline reports the most recent change it saw.** Before, a timeout that landed right after two matching polls reported `last_changes = ()`.
 5. **Ctrl-C also stops the load.** The guard catches `BaseException`, stops the load best-effort, and re-raises the original exception. A failed stop is attached to it as a note.
@@ -160,9 +160,10 @@ The tests are in `tests/test_m4_fixlist.py`. A mutation check undid each fix, an
 
 - **Backend provenance is derived, not claimed (item 3).**
   - `InjectedFault.backend` is now a frozen `FaultBackendRef(name, version)`, a required field built from the backend that actually ran. Before, it was a mutable dict defaulting to `{"name": "kubernetes-api", "version": None}`.
-  - `_backend()` refuses a backend whose name differs from the spec's `injection.backend`.
+  - `_backend()` also refuses a backend whose name differs from the spec's `injection.backend`. **With one backend, this check is defensive and currently unreachable:** the mechanism check just above already limits `injection.backend` to `kubernetes-api`, which is `SetContainerEnv.name`. It is kept on purpose, for a future edit that adds a mechanism but returns the wrong backend class. The test reaches it only by substituting a mis-named backend class.
   - This is still the backend-generic shape of 0003 F1. Milestone 5 decides how it serializes.
 - **A start whose response was lost still gets its load stopped (item 4).** `start_workload()` now runs inside the guarded block.
+  - **The principle:** `WorkloadGeneratorBusy` is excluded from cleanup because it proves this invocation never acquired the load. Every other `start_workload` failure is treated as *ambiguous after send*: the control call may have reached the generator and started it, so the load may be ours, and it gets best-effort cleanup. The bullets below follow from this.
   - **With one deliberate exception:** `WorkloadGeneratorBusy`, the 409 from a generator that was already running, means the load is someone else's. It is never stopped (0009, W5).
   - The fix list said the existing handler "cleans it up correctly". Moved as-is, it would have stopped a concurrent run's load, and `test_review_load_this_run_did_not_start_is_never_stopped` would have failed. So the handler skips that one exception.
   - `WorkloadGeneratorBusy` is raised only by `start_workload`.

@@ -8,19 +8,24 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 
 ## Current milestone
 
-> **Milestone 4 — first fault + alert generator.**
-> Done when injection reliably produces measurable errors, silent non-injection is caught, and the alert is built from symptoms only (design §14).
+> **Milestone 5 — run record schema + writer.**
+> Done when: "Validator rejects malformed records; every run writes one" (design §14, verbatim).
 >
-> Also lands in Milestone 4, already decided:
-> - a bounded **post-fault settledness** check before the harm-baseline snapshot: poll the canonical projection until it's identical across two consecutive intervals, and flag it if it doesn't settle. It's separate from Milestone 3's health stabilization, and observed from cluster state, never declared per fault (decision 0013, third review)
-> - `Alert` and `IncidentRuntimeContext` live outside `safeops.faults`; the fault id is validated before it's used as a path; `--seed` is bounded to unsigned 32-bit (`0 … 2^32 − 1`) and `--trial` to `0 … 999` (decision 0014)
-> - `memory-limit-low` lowers request and limit together (decision 0011)
-> - the Milestone 4 reference reading first: ITBench `scenarios/sre/` and the AIOpsLab fault library, as a short targeted pass
+> **First, before the run-record model is designed (decision 0017 §1, blocking):** fix the post-agent exception boundary in `safeops/experiment/runner.py` (the `except BaseException` that now spans the measurements). A verifier or harness failure after the agent has produced a trajectory or proposal must still produce an `infrastructure_failure` record keeping all available trajectory, proposal and execution data, with `effective`/`harmful` allowed to be unmeasured; then cleanup and recovery run, record first. Such a run is outside cohort G but never lost. This comes first because the schema must be able to represent a partly measured run; designed around fully measured runs only, that case gets bolted on wrong later.
+>
+> Then, already decided and waiting for the record:
+> - the settled/unsettled post-fault condition (`SettledSnapshot`), not just its snapshot (0017 §2, 0013)
+> - `fault_backend` as backend-generic `{name, version}` from `InjectedFault.backend` (0003 F1, 0015); `image_digests` as the OCI index digests, plus third-party `running` digests (0007); `desired_state_hash`, `fault_definition_hash` (`FaultSpec.definition_sha256`), `snapshot_projection_version` 2 (0013)
+> - the unit's bounds (`fault_seed` 0 … 2^32 − 1, `trial_index` 0 … 999) in the schema (0014)
+> - recording discards and their reasons: pre-run dirty, no baseline, silent non-injection, failed injection, unmeasurable detection (0004 note, 0009, 0015)
+> - a live test of the deployed load generator's run boundary over the API-server proxy (0017 §5)
+> - §11.8 says Pydantic; it is not a dependency yet, so adding it needs its own decision entry
 
 Completed:
 - Milestone 1 (`8cd8986`, review fixes `2f32bcb`). Acceptance command and rationale are in decision 0004.
 - Milestone 2 (`cdc9178`, review fixes `c3db4ef`, closeout `d5609eb`). Decisions 0006–0011.
 - Milestone 3 (`4e7b76d`, review fixes `f6a7173`, `e7c50ca`, third-review fixes `de48670`). Decisions 0012–0013.
+- Milestone 4 (`84dbf5c`, review fixes `e4f353e`, second-review fixes `137fad4`, closeout `e4893e5`). Decisions 0014–0017; amendments to 0009 and 0015.
 
 Update this line as milestones complete. Work on the current milestone only. The design document lists 17; do not run ahead. Milestone N's acceptance criterion must pass before N+1 starts.
 

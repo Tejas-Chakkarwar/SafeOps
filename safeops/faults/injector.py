@@ -224,6 +224,10 @@ class FaultInjector:
         if (inj.backend, inj.action) != ("kubernetes-api", "set_container_env"):
             raise FaultSpecError(f"injection {inj.backend}/{inj.action} is not implemented")
         backend = SetContainerEnv(self._k(), self._ns())
+        # Defensive, and currently unreachable: with one backend the check above already
+        # limits inj.backend to "kubernetes-api", which is SetContainerEnv.name. Kept on
+        # purpose for a future edit that adds a mechanism to that check but returns the
+        # wrong backend class here, which would otherwise mislabel run provenance.
         if backend.name != inj.backend:
             raise FaultSpecError(
                 f"spec names backend {inj.backend!r} but {backend.name!r} was selected"
