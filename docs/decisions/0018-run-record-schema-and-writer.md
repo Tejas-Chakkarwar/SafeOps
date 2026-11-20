@@ -140,3 +140,23 @@ No v1 record existed yet, so these schema changes are fixes to v1 itself, not a 
 - **The problem:** two "present together" rules rejected legitimate post-agent discards. A run that crashed in the parser (trajectory, no `proposal_status`), or between the extractor and the gate (feature vector, no gate), went to `rejected/` instead of the dataset: the very loss 0017 §1 exists to prevent.
 - **The fix:** those rules are now ordered along the branch, and all-or-nothing only for a completed run.
 - **The systematic test that should have existed:** a crash at **every** pre-agent and post-agent stage must produce one valid record in the dataset. Restoring the old rules fails three of those stages.
+
+## Amendment, 2026-11-20: Milestone 5 adversarial review, second pass
+
+These are still fixes to v1, since no record exists yet. The tests are in the "second pass" section of `tests/test_m5_records.py`. A mutation check undid each fix, and every one failed a test.
+
+1. **A discard's stage must match the data the record carries.**
+   - **The problem:** records claiming a discard at `start_workload`, `verify_fault_present` or `alert`, while carrying a steady state, a fault, a verified symptom and an alert, were accepted.
+   - **The fix:** `schema.STAGE_PRODUCES` maps every stage, in run order, to the record fields it writes. A discard at stage S means S raised. So:
+     - nothing from S or any later stage may be present;
+     - the core data from every earlier stage must be present;
+     - a branch stage's data is required only when the discard is inside the branch;
+     - `action_attempted` must agree with the stage (false before `execute`, true at or after it).
+   - A test pins the table to the stage lists, and the crash-at-every-stage sweep checks it against the real runner.
+   - **This also split a stage.** The table showed that `steady_state` covered two calls: measuring the window (which records it) and checking it. So the baseline check is now its own stage, `steady_state_baseline`, the same way `fault_present` follows `verify_fault_present`, and `no_steady_state` must be discarded there.
+2. **A completed `valid_action` run must have its frozen feature vector**, shadow gates and gate. §10.2 says the vector is frozen for every valid proposal, even under always-act, and replay depends on it. Before, such a record without them validated, and it would have silently fallen out of every replayed strategy.
+3. **The pre-run dirty path** now uses the same record-then-recover helper as the other paths. A record failure no longer skips the rebuild (shown with `OSError`), and if the rebuild then fails too, the record failure is attached as a note.
+4. **The trajectory's internal references.** Steps must be numbered 1 to n in order, and the proposal's evidence may cite only steps that exist. These feed `evidence_sufficiency` and `prerequisites_unverified` at Milestone 12.
+5. **Durability.**
+   - After the hard link, the directory is fsynced too, because the link is a directory entry. Otherwise a host crash during the destructive recovery that follows could lose a record `finalize` had reported as written.
+   - Both the file and the directory also get `F_FULLFSYNC` where it exists: on macOS, a plain `fsync` leaves data in the drive's cache.

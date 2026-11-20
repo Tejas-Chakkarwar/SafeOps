@@ -38,6 +38,7 @@ PRE_AGENT_STAGES = (
     "pre_run_clean_state",
     "start_workload",
     "steady_state",
+    "steady_state_baseline",
     "prefault_snapshot",
     "inject",
     "verify_fault_present",
@@ -287,6 +288,65 @@ class DiscardReason(_Strict):
     error: str
 
 
+# What each stage writes into the record, in run order (stage names as in the runner).
+# A discard at stage S means S raised: nothing from S or after it can be present, and the
+# core data from before it must be (M5 second review, finding 1). The pre-run check's
+# result (clean_state_verified) comes before every stage.
+STAGE_PRODUCES: dict[str, tuple[str, ...]] = {
+    "pre_run_clean_state": (),
+    "start_workload": (),
+    "steady_state": ("steady_state",),
+    "steady_state_baseline": (),
+    "prefault_snapshot": ("prefault_snapshot_hash",),
+    "inject": ("fault",),
+    "verify_fault_present": ("fault_verification", "fault_verified"),
+    "fault_present": (),
+    "postfault_snapshot": ("postfault_snapshot_hash", "postfault_settledness"),
+    "alert": ("alert",),
+    "runtime_context": (),
+    "agent": ("trajectory",),
+    "parse": ("proposal_status", "proposal"),
+    "route_proposal": (),
+    "extract": ("feature_vector",),
+    "shadow_gates": ("shadow_gates",),
+    "gate": ("gate",),
+    "route_gate": (),
+    "execute": ("execution",),
+    "executed_action": (),
+    "stabilization": ("stabilization_timed_out",),
+    "postaction_snapshot": ("postaction_snapshot_hash",),
+    "effectiveness": (),
+    "harm": (),
+}
+_STAGE_ORDER = tuple(STAGE_PRODUCES)
+# Only traversed when the proposal is gate-eligible (and, from execute on, executed).
+_BRANCH_STAGES = ("extract", "shadow_gates", "gate", "route_gate", "execute", "executed_action")
+
+
+def _stage_problems(r: RunRecordV1, stage: str) -> list[str]:
+    p: list[str] = []
+    i = _STAGE_ORDER.index(stage)
+    for later in _STAGE_ORDER[i:]:
+        for name in STAGE_PRODUCES[later]:
+            if getattr(r, name) is not None:
+                p.append(f"discarded at {stage}, yet carries {name} from stage {later}")
+    for earlier in _STAGE_ORDER[:i]:
+        # A branch stage's data is required only when the discard is inside the branch.
+        if earlier in _BRANCH_STAGES and stage not in _BRANCH_STAGES:
+            continue
+        for name in STAGE_PRODUCES[earlier]:
+            if getattr(r, name) is None:
+                p.append(
+                    f"discarded at {stage}, yet {name} from earlier stage {earlier} is missing"
+                )
+    execute = _STAGE_ORDER.index("execute")
+    if r.action_attempted and i < execute:
+        p.append(f"discarded at {stage}, before execute, yet action_attempted is true")
+    if stage in ("execute", "executed_action") and not r.action_attempted:
+        p.append(f"discarded at {stage}, so the executor was called, yet action_attempted is false")
+    return p
+
+
 def unmeasured_executed_action(r: RunRecordV1) -> bool:
     """0017 §1: a post-agent discard in which an action was attempted on the cluster. It's
     a gap in the safety claim, counted on its own, not only a discard."""
@@ -404,6 +464,17 @@ def record_problems(r: RunRecordV1) -> list[str]:
     if r.alert is not None and (r.fault_verification is None or not r.fault_verification.present):
         p.append("an alert exists although the symptom was not verified to hold")
 
+    # The trajectory's own references (M5 second review, finding 4): steps are numbered
+    # 1..n in order, and the proposal's evidence cites only steps that exist.
+    if r.trajectory is not None:
+        numbers = [step.step for step in r.trajectory]
+        if numbers != list(range(1, len(numbers) + 1)):
+            p.append(f"trajectory steps must be numbered 1..n in order, got {numbers}")
+        if r.proposal is not None:
+            unknown = sorted(set(r.proposal.evidence) - set(numbers))
+            if unknown:
+                p.append(f"the proposal's evidence cites steps {unknown} not in the trajectory")
+
     # Branch-only stages.
     if r.proposal is not None and r.proposal_status not in (
         ProposalStatus.VALID_ACTION,
@@ -482,8 +553,11 @@ def record_problems(r: RunRecordV1) -> list[str]:
             r.fault_verification is None or r.fault_verification.present
         ):
             p.append("silent_non_injection needs a fault_verification that did not hold")
-        if d.cause == "no_steady_state" and r.steady_state is None:
-            p.append("no_steady_state needs the steady_state that failed")
+        p.extend(_stage_problems(r, d.stage))
+        if d.cause == "no_steady_state" and (
+            r.steady_state is None or d.stage != "steady_state_baseline"
+        ):
+            p.append("no_steady_state needs stage steady_state_baseline and the failing window")
     else:
         # A completed run: the whole core chain, measured outcome, cleanup verdict.
         missing = [e for e in _CORE_CHAIN if not present[e]]
@@ -493,6 +567,10 @@ def record_problems(r: RunRecordV1) -> list[str]:
             p.append("a completed run must have effective and harmful measured")
         if r.reset_verified is None:
             p.append("a completed run must record reset_verified")
+        if r.proposal_status == ProposalStatus.VALID_ACTION and r.feature_vector is None:
+            # §10.2: Phase A freezes the vector for every valid proposal, even under
+            # always-act; replay depends on it (M5 second review, finding 2).
+            p.append("a completed valid_action run must have its frozen feature vector and gate")
         if r.clean_state_verified is False:
             p.append("a completed run cannot have started from a dirty environment")
         if r.fault_verification is not None and not r.fault_verification.present:

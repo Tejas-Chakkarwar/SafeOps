@@ -119,11 +119,16 @@ class ExperimentRunner:
         try:
             self._require_pre_run_clean(pre_clean)
         except PreRunDiscard as exc:
-            # The record first, then the rebuild (same order as post-run; decision 0013).
-            self._note_record(
-                exc, self._finalize(data, Discard("pre_run_clean_state", "pre_run_dirty", str(exc)))
+            # The record first, then the rebuild (same order as post-run; decision 0013). A
+            # record failure never skips the rebuild (M5 second review, finding 3).
+            path = self._finalize_then_recover(
+                data,
+                Discard("pre_run_clean_state", "pre_run_dirty", str(exc)),
+                pre_clean,
+                None,
+                recover=lambda: self._quarantine("pre-run: " + "; ".join(pre_clean.problems[:10])),
             )
-            self._quarantine("pre-run: " + "; ".join(pre_clean.problems[:10]))
+            self._note_record(exc, path)
             raise
 
         # From the start of the load until the measurements are complete, any failure stops
@@ -138,6 +143,7 @@ class ExperimentRunner:
             self.workload.start_workload()
             stage = "steady_state"
             steady_state = data["steady_state"] = self.workload.verify_steady_state()
+            stage = "steady_state_baseline"  # the check, after the window is recorded
             self._require_steady_state(steady_state)
             stage = "prefault_snapshot"
             data["prefault"] = env.capture_snapshot()
@@ -211,7 +217,7 @@ class ExperimentRunner:
         if interrupt is not None:
             raise interrupt
 
-    def _finalize_then_recover(self, data, discard, post_clean, interrupt):
+    def _finalize_then_recover(self, data, discard, post_clean, interrupt, recover=None):
         """Write the record, then recover a dirty environment (strictly in that order).
 
         A record that can't be written never stops recovery, and a recovery that fails
@@ -226,7 +232,10 @@ class ExperimentRunner:
             record_error = exc
         if interrupt is None:
             try:
-                self._recover_if_dirty(post_clean)
+                if recover is None:
+                    self._recover_if_dirty(post_clean)
+                else:
+                    recover()
             except BaseException as recovery_exc:
                 if record_error is not None:
                     recovery_exc.add_note(

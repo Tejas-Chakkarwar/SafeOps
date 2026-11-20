@@ -21,6 +21,7 @@ safeops.cluster and the environment modules are imported inside methods.
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
@@ -397,8 +398,16 @@ class RunRecordWriter:
             with os.fdopen(fd, "w") as fh:
                 fh.write(text)
                 fh.flush()
-                os.fsync(fh.fileno())
+                _durable_sync(fh.fileno())
             os.link(tmp, final)  # fails if the record exists: never overwritten
+            # The link is a directory entry: sync the directory too, or a crash during the
+            # destructive recovery that follows could lose a record finalize reported as
+            # written (M5 second review, finding 5).
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                _durable_sync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except FileExistsError as exc:
             raise RecordWriteError(f"run record {final} already exists; never overwritten") from exc
         except OSError as exc:
@@ -407,6 +416,18 @@ class RunRecordWriter:
             tmp.unlink(missing_ok=True)
         os.chmod(final, 0o444)
         return final
+
+
+def _durable_sync(fd: int) -> None:
+    """fsync, plus F_FULLFSYNC where it exists: on macOS plain fsync leaves data in the
+    drive's cache, so it isn't durable across a power loss."""
+    os.fsync(fd)
+    full = getattr(fcntl, "F_FULLFSYNC", None)
+    if full is not None:
+        try:
+            fcntl.fcntl(fd, full)
+        except OSError:
+            pass  # not supported on this file system; the fsync above still happened
 
 
 def load_record(path: Path):

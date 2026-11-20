@@ -1016,6 +1016,7 @@ def test_review_a_crash_at_every_pre_agent_stage_writes_a_valid_record(tmp_path,
     target = {
         "start_workload": (r.workload, "start_workload"),
         "steady_state": (r.workload, "verify_steady_state"),
+        "steady_state_baseline": (r, "_require_steady_state"),
         "prefault_snapshot": (r.environment, "capture_snapshot"),
         "inject": (r.injector, "inject"),
         "verify_fault_present": (r.injector, "verify_fault_present"),
@@ -1045,3 +1046,158 @@ def test_review_a_nan_inside_an_untyped_tool_result_never_reaches_the_dataset(tm
     with pytest.raises(RecordValidationError, match="kept at"):
         r.run(UNIT)
     assert _records(tmp_path) == []
+
+
+# --- Milestone 5 adversarial review, second pass -------------------------------------------------
+
+
+def _as_discard(rec: dict, stage: str, cause: str = "infrastructure_failure") -> dict:
+    """A completed record turned into a discard at `stage`, keeping all its data."""
+    from safeops.experiment.schema import POST_AGENT_STAGES
+
+    rec = _set(rec, ("discarded",), True)
+    rec = _set(rec, ("in_cohort_g",), False)
+    rec = _set(rec, ("outcome",), None)
+    phase = "post_agent" if stage in POST_AGENT_STAGES else "pre_agent"
+    return _set(
+        rec, ("discard_reason",), {"stage": stage, "phase": phase, "cause": cause, "error": "x"}
+    )
+
+
+def _strip_agent(rec: dict) -> dict:
+    for k in (
+        "trajectory",
+        "proposal_status",
+        "proposal",
+        "feature_vector",
+        "gate",
+        "shadow_gates",
+        "execution",
+        "stabilization_timed_out",
+        "postaction_snapshot_hash",
+    ):
+        rec = _set(rec, (k,), None)
+    return _set(rec, ("action_attempted",), False)
+
+
+@pytest.mark.parametrize("stage", ["start_workload", "verify_fault_present", "alert"])
+def test_review2_a_discard_stage_must_match_the_data_present(good, stage) -> None:
+    """Finding 1: discarded "at start_workload" while carrying a steady state, a fault,
+    a verified symptom and an alert was accepted."""
+    with pytest.raises(RecordValidationError, match=f"discarded at {stage}, yet carries"):
+        _check(_as_discard(_strip_agent(good), stage))
+
+
+def test_review2_earlier_core_data_must_be_present_for_a_later_discard(good) -> None:
+    rec = _as_discard(_strip_agent(good), "runtime_context")
+    _check(rec)  # consistent: everything up to the alert, nothing after
+    with pytest.raises(RecordValidationError, match="prefault_snapshot_hash from earlier"):
+        _check(_set(rec, ("prefault_snapshot_hash",), None))
+
+
+def test_review2_branch_data_is_required_only_inside_the_branch(good) -> None:
+    rec = _set(good, ("execution",), None)
+    with pytest.raises(RecordValidationError, match="execution"):
+        _check(_as_discard(rec, "executed_action"))  # past execute: its result must exist
+    no_branch = _as_discard(_strip_agent(good), "agent")
+    _check(no_branch)  # before the branch, none of it is required
+
+
+def test_review2_attempt_and_stage_agree(good) -> None:
+    with pytest.raises(RecordValidationError, match="before execute, yet action_attempted"):
+        rec = _set(_strip_agent(good), ("action_attempted",), True)
+        _check(_as_discard(rec, "alert"))
+    gated = _set(good, ("execution",), None)
+    gated = _set(gated, ("action_attempted",), False)
+    with pytest.raises(RecordValidationError, match="executor was called"):
+        _check(_as_discard(gated, "execute"))
+
+
+def test_review2_the_stage_table_covers_every_stage_in_order() -> None:
+    from safeops.experiment.schema import STAGE_PRODUCES
+
+    assert tuple(STAGE_PRODUCES) == PRE_AGENT_STAGES + POST_AGENT_STAGES
+
+
+def test_review2_a_completed_valid_action_run_needs_its_frozen_vector(good) -> None:
+    """Finding 2: replay (§10.2) depends on the vector for every valid proposal."""
+    rec = good
+    for k in ("feature_vector", "gate", "shadow_gates", "execution"):
+        rec = _set(rec, (k,), None)
+    rec = _set(rec, ("action_attempted",), False)
+    rec = _set(rec, ("in_cohort_g",), False)
+    rec = _set(rec, ("outcome", "category"), None)
+    with pytest.raises(RecordValidationError, match="frozen feature vector"):
+        _check(rec)
+
+
+@pytest.mark.parametrize("quarantine_fails", [False, True])
+def test_review2_a_pre_run_record_failure_never_skips_the_rebuild(
+    tmp_path, quarantine_fails
+) -> None:
+    """Finding 3: the pre-run path now uses the same record-then-recover helper."""
+    from safeops.environment.manager import QuarantineFailed
+
+    r = _runner(tmp_path)
+    r.environment.clean = False
+    events: list[str] = []
+
+    def broken_finalize(**fields):
+        events.append("finalize")
+        raise RecordWriteError("disk full")
+
+    def rebuild(reason=""):
+        events.append("quarantine")
+        if quarantine_fails:
+            raise QuarantineFailed("still dirty")
+
+    r.records.finalize = broken_finalize
+    r.environment.quarantine_and_rebuild = rebuild
+    expected = QuarantineFailed if quarantine_fails else RecordWriteError
+    with pytest.raises(expected) as exc:
+        r.run(UNIT)
+    assert events == ["finalize", "quarantine"]
+    if quarantine_fails:
+        assert any("run record also failed" in n for n in exc.value.__notes__)
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [(("proposal", "evidence"), [7, 99]), (("proposal", "evidence"), [0])],
+    ids=["evidence beyond the trajectory", "evidence step 0"],
+)
+def test_review2_evidence_cites_only_existing_steps(good, path, value) -> None:
+    """Finding 4."""
+    with pytest.raises(RecordValidationError, match="evidence cites steps"):
+        _check(_set(good, path, value))
+
+
+def test_review2_trajectory_steps_are_numbered_in_order(good) -> None:
+    doubled = _set(good, ("trajectory",), good["trajectory"] * 2)
+    with pytest.raises(RecordValidationError, match="numbered 1..n"):
+        _check(doubled)
+    two = copy.deepcopy(good["trajectory"][0])
+    two["step"] = 2
+    renumbered = _set(good, ("trajectory",), [good["trajectory"][0], two])
+    renumbered = _set(renumbered, ("totals", "tokens_in"), 2400)
+    _check(renumbered)
+
+
+def test_review2_the_directory_is_synced_after_the_record_is_linked(tmp_path, monkeypatch) -> None:
+    """Finding 5: the hard link is a directory entry; it must be durable before recovery."""
+    from safeops.experiment import records as records_mod
+
+    synced: list[str] = []
+    real = records_mod._durable_sync
+
+    def spy(fd):
+        mode = os.fstat(fd).st_mode
+        kind = "dir" if stat.S_ISDIR(mode) else "file"
+        if kind == "dir":
+            assert list(tmp_path.joinpath("runs").glob("*.json")), "synced before the link"
+        synced.append(kind)
+        real(fd)
+
+    monkeypatch.setattr(records_mod, "_durable_sync", spy)
+    _runner(tmp_path).run(UNIT)
+    assert synced == ["file", "dir"]
