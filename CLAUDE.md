@@ -20,7 +20,7 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 Completed:
 - Milestone 1 (`8cd8986`, review fixes `2f32bcb`). Acceptance command and rationale are in decision 0004.
 - Milestone 2 (`cdc9178`, review fixes `c3db4ef`, closeout `d5609eb`). Decisions 0006–0011.
-- Milestone 3 (`4e7b76d`, review fixes `f6a7173`, `e7c50ca`, third-review fixes in the closing commit). Decisions 0012–0013.
+- Milestone 3 (`4e7b76d`, review fixes `f6a7173`, `e7c50ca`, third-review fixes `de48670`). Decisions 0012–0013.
 
 Update this line as milestones complete. Work on the current milestone only. The design document lists 17; do not run ahead. Milestone N's acceptance criterion must pass before N+1 starts.
 

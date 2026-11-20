@@ -20,7 +20,7 @@
   - `ready_endpoint_count` counts EndpointSlice endpoints with `ready: true` (not null).
   - `endpoint_owner_services` resolves each endpoint's pod through **ownerReferences** (Pod → ReplicaSet → Deployment, or Pod → StatefulSet), then through the topology. It never uses labels, which a rogue pod could copy. So `orders-svc` repointed at inventory pods reports owner `inventory`, even though the endpoints look healthy.
 - **Scope:** every projected-kind object in `testbed` is included except `kube-root-ca.crt`, so an unexpected object appears as `unexpected` and a removed one as `missing`.
-- **Projection version:** `snapshot_projection_version` is 1. Changing the projection bumps it, and `load_desired_state` refuses a file from another version.
+- **Projection version:** `snapshot_projection_version` is 2. Changing the semantic projection requires incrementing it, and `load_desired_state` refuses a file from another version.
 
 ## Reset (`EnvironmentManager.reset_environment`, runtime phase)
 
