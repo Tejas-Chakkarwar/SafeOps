@@ -17,6 +17,15 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 > - two host/cluster clock readings per run, each a fresh server-stamped probe object created and removed in `testbed`; the probe kind is chosen here; the record structure arrives with a `schema_version` bump (0017 §6, §7)
 > - define the canonical serialization `trajectory[].result_digest` is taken over, then pin it in the schema (0018, cross-field amendment)
 > - tool outputs normalize non-finite numbers (Prometheus `"NaN"`, `"+Inf"`) at the tool boundary into an explicit, JSON-safe, deterministic representation that preserves that the value was non-finite; never `0`, another finite value, or a dropped field; the representation is decided and documented with `get_metrics` (0018, final cleanup)
+>
+> **Evidence-consistency invariant (applies from Milestone 6 on).** Every status, boolean, classification, digest, truncation indicator, aggregate, or other derived value written into the run record is validated against the evidence stored beside it, in `schema._evidence_problems`. Write the invariant, with negative and mutation tests proving contradictory records are rejected, **in the same change that introduces the field**. Never defer it to review: Milestone 5 needed several review rounds to close exactly this defect class. In Milestone 6 that means in particular:
+> - a tool result ↔ its `result_digest`
+> - bounded or truncated output ↔ its truncation marker and any original or returned-size metadata
+> - a tool's success, failure or status ↔ the result or error evidence stored with it
+> - any derived metric value ↔ the raw or bounded evidence kept in the trajectory
+> - non-finite normalization ↔ the explicit representation chosen for the original non-finite value
+>
+> The rule carries forward to every later milestone. For example, Milestone 7's verdicts are validated against the measurements and evidence they're derived from, never trusted as independent booleans. It's a record-integrity rule, not permission to add redundant evidence fields: validate only relationships where both the derived value and its defining evidence are already part of the approved record model.
 
 Completed:
 - Milestone 1 (`8cd8986`, review fixes `2f32bcb`). Acceptance command and rationale are in decision 0004.
