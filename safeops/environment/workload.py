@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 WORKLOAD_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "workload.yaml"
+# A window closes about this long after its last attempt's deadline: the generator's 0.5 s
+# settle margin plus one poll. A window that closes after window_poll_timeout_s can never
+# be seen to close, so it is refused up front (steady-state and detection windows alike).
+WINDOW_CLOSE_MARGIN_S = 1.5
 
 
 class SteadyStateError(Exception):
@@ -54,6 +58,18 @@ class WorkloadSettings:
             raise ValueError("min_successes must be in 1..window_attempts")
         if self.rate_rps <= 0 or self.attempt_deadline_s <= 0 or self.window_attempts <= 0:
             raise ValueError("rate, deadline and window size must be positive")
+        closes = self.closes_after_s(self.window_attempts)
+        if closes >= self.window_poll_timeout_s:
+            # Every steady-state window would time out and every run be discarded (fix list,
+            # item 5). The same invariant guards detection windows (FaultInjector).
+            raise ValueError(
+                f"a {self.window_attempts}-attempt window closes about {closes:g}s after it"
+                f" opens, past the {self.window_poll_timeout_s:g}s window poll timeout"
+            )
+
+    def closes_after_s(self, attempts: int) -> float:
+        """How long after opening a window of ``attempts`` scheduled attempts it closes."""
+        return attempts / self.rate_rps + self.attempt_deadline_s + WINDOW_CLOSE_MARGIN_S
 
 
 def load_workload_settings(path: Path = WORKLOAD_CONFIG_PATH) -> WorkloadSettings:
@@ -110,13 +126,15 @@ def check_steady_state(steady_state: SteadyState) -> None:
         )
 
 
-def _inconsistency(summary: dict, s: WorkloadSettings, size: int | None = None) -> str | None:
+def _inconsistency(
+    summary: dict, s: WorkloadSettings, expected_size: int | None = None
+) -> str | None:
     """Why a 'complete' window summary can't be right, or None if it's consistent."""
 
     def is_int(v):
         return isinstance(v, int) and not isinstance(v, bool)
 
-    expected = s.window_attempts if size is None else size
+    expected = s.window_attempts if expected_size is None else expected_size
     size, scheduled = summary.get("size"), summary.get("scheduled")
     succeeded, failed = summary.get("succeeded"), summary.get("failed")
     if size != expected:

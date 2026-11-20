@@ -153,3 +153,29 @@ The regression tests are in the "second pass" section of `tests/test_m4_faults.p
 3. **A symptom window the collector can never see close is refused before injection.** The window collector gives up after `window_poll_timeout_s` (60 s), but the spec grammar allowed windows up to 300 s, so any `over 58s` or longer would discard every run as unmeasurable. `detection_attempts` now requires `window_s + attempt_deadline_s + 1.5 s` (the generator's settle margin plus one poll) to be under the poll timeout. It's checked in `inject_spec`, before the cluster changes. The steady-state window and its 60 s timeout (decision 0009) are unchanged.
 4. **An unsettled baseline reports the most recent change it saw.** Before, a timeout that landed right after two matching polls reported `last_changes = ()`.
 5. **Ctrl-C also stops the load.** The guard catches `BaseException`, stops the load best-effort, and re-raises the original exception. A failed stop is attached to it as a note.
+
+## Amendment, 2026-11-19: Milestone 4 fix list (after both reviews)
+
+The tests are in `tests/test_m4_fixlist.py`. A mutation check undid each fix, and every one made a test fail. One test had to be added (the backend version) before the "hardcoded backend" mutation failed.
+
+- **Backend provenance is derived, not claimed (item 3).**
+  - `InjectedFault.backend` is now a frozen `FaultBackendRef(name, version)`, a required field built from the backend that actually ran. Before, it was a mutable dict defaulting to `{"name": "kubernetes-api", "version": None}`.
+  - `_backend()` refuses a backend whose name differs from the spec's `injection.backend`.
+  - This is still the backend-generic shape of 0003 F1. Milestone 5 decides how it serializes.
+- **A start whose response was lost still gets its load stopped (item 4).** `start_workload()` now runs inside the guarded block.
+  - **With one deliberate exception:** `WorkloadGeneratorBusy`, the 409 from a generator that was already running, means the load is someone else's. It is never stopped (0009, W5).
+  - The fix list said the existing handler "cleans it up correctly". Moved as-is, it would have stopped a concurrent run's load, and `test_review_load_this_run_did_not_start_is_never_stopped` would have failed. So the handler skips that one exception.
+  - `WorkloadGeneratorBusy` is raised only by `start_workload`.
+- **One window invariant covers both kinds of window (item 5).**
+  - `WorkloadSettings.__post_init__` now refuses a steady-state window that would close at or after `window_poll_timeout_s`. A window closes `attempts / rate + attempt_deadline_s + 1.5 s` after it opens (the generator's settle margin plus one poll), via `WorkloadSettings.closes_after_s`. For example, 600 attempts would close at about 62.5 s, past the 60 s timeout, so every baseline would be lost.
+  - The detection-window check in `FaultInjector.detection_attempts` stays, and now uses the same helper, because it validates a per-spec window the settings can't see.
+  - The committed configuration has 27.5 s of headroom.
+- **`_inconsistency`'s parameter is `expected_size` (item 6).** It no longer shares a name with the `size` read from the summary.
+- **A metric missing from `ALERT_NAMES` is a `FaultSpecError`, not a raw `KeyError` (item 7).**
+- **`VERIFY_TIMEOUT_S` is now `VERIFY_NO_NEW_WINDOW_AFTER_S` (item 8).**
+  - It is a **between-window threshold**: no new window starts once 150 s have passed. It is checked only after a window returns, so verification can run past it by up to one window (two 80 s windows return at about 160 s).
+  - The reason string now reports the actual elapsed time as well as the threshold.
+  - The deterministic bound stays `VERIFY_MAX_WINDOWS = 3`, so timing jitter can't change a silent-non-injection classification. The collector's own poll timeout bounds each window.
+  - The constructor argument is now `no_new_window_after_s`. `verify_fault_present` keeps §11.2's parameter name `timeout_s`, documented as this threshold.
+  - **Possible, not built:** a true wall-clock ceiling would need the window collector to accept a remaining time budget, ending a window early when the budget ran out. That would make a window's denominator depend on timing, which is exactly what fixed-denominator windows avoid, so it would need its own decision.
+- **Carried requirements** (the post-agent failure record, persisting settledness, an all-failures metric, current-incident metric windows) are in decision 0017.

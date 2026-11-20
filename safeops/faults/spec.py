@@ -211,10 +211,13 @@ def parse_fault_spec(raw: bytes, fault_id: str, topology) -> FaultSpec:
             _str(f"symptoms[{i}].expression", s["expression"]),
         )
         metric = parse_expression(symptom.expression).metric
-        if symptom.alert_name not in ALERT_NAMES[metric]:
+        allowed = ALERT_NAMES.get(metric)
+        if not allowed:  # a metric added to SUPPORTED_METRICS but not here (fix list, item 7)
+            raise FaultSpecError(f"metric {metric} has no alert names in ALERT_NAMES")
+        if symptom.alert_name not in allowed:
             raise FaultSpecError(
                 f"symptoms[{i}].alert_name {symptom.alert_name!r} is not an alert name for"
-                f" {metric} (allowed: {sorted(ALERT_NAMES[metric])})"
+                f" {metric} (allowed: {sorted(allowed)})"
             )
         symptoms.append(symptom)
 

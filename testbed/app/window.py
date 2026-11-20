@@ -73,6 +73,11 @@ class Window:
             raise ValueError("settle margin must be non-negative")
 
     @property
+    def frozen(self) -> bool:
+        """True once the summary is computed and fixed for good."""
+        return self._frozen is not None
+
+    @property
     def full(self) -> bool:
         return len(self.attempts) >= self.size
 

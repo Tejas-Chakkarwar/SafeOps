@@ -108,6 +108,15 @@ def control(body: dict, query: dict) -> Response:
                 and path.startswith("/")
             ):
                 return Response(400, {"error": "start needs rate_rps > 0, deadline_s > 0, path"})
+            if _collecting is not None:
+                # A window can't outlive the run it was measuring (decision 0009 amendment).
+                return Response(409, {"error": "a window is still collecting"})
+            # A successful start is the run boundary: the previous run's windows and
+            # counters go, so every run measures against an identically light process
+            # (Milestone 4 fix list, A1). Stop does not clear, so a finished run stays
+            # inspectable until the next start. Window ids keep increasing.
+            _windows.clear()
+            _state["dispatched_total"] = 0
             stop = threading.Event()
             _state["generation"] += 1
             _state.update(running=True, rate_rps=rate, deadline_s=deadline, path=path, stop=stop)
@@ -156,14 +165,21 @@ def stats(body: dict, query: dict) -> Response:
         return Response(200, window.summary(now))
 
 
+def _freeze_once(windows, now: float) -> None:
+    """Freeze every window that has closed. Already-frozen windows are skipped: their
+    summary never changes, and re-reading one would copy it on every tick (fix list, A2)."""
+    for window in windows:
+        if not window.frozen:
+            window.summary(now)  # computes and freezes once complete; no-op otherwise
+
+
 def _freeze_closed_windows() -> None:
     """Freeze each window the moment it closes, not when someone happens to read it (M1)."""
     while True:
         time.sleep(0.1)
         now = time.monotonic()
         with _lock:
-            for window in _windows.values():
-                window.summary(now)  # computes and freezes once complete; no-op otherwise
+            _freeze_once(_windows.values(), now)
 
 
 threading.Thread(target=_freeze_closed_windows, daemon=True, name="window-freezer").start()

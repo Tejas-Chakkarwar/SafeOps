@@ -17,7 +17,11 @@ from safeops.agent.loop import Agent
 from safeops.agent.parser import ProposalParser
 from safeops.cluster import CommandError
 from safeops.environment.manager import CleanStateResult, EnvironmentManager, QuarantineFailed
-from safeops.environment.workload import WorkloadGenerator, check_steady_state
+from safeops.environment.workload import (
+    WorkloadGenerator,
+    WorkloadGeneratorBusy,
+    check_steady_state,
+)
 from safeops.executor.executor import ActionExecutor
 from safeops.experiment.records import RunRecordWriter
 from safeops.experiment.unit import RunUnit
@@ -88,14 +92,16 @@ class ExperimentRunner:
         except CommandError as exc:
             pre_clean = CleanStateResult(False, (f"pre-run reset failed: {exc}",))
         self._require_pre_run_clean(pre_clean)
-        self.workload.start_workload()
-        # From here until the measurements are complete, any failure stops the load this
-        # run started, so it never leaves the generator busy for the next run. That holds
-        # for a pre-agent discard (Milestone 4 review, finding 3), for a stub or crash after
-        # the agent starts (second review, finding 1), and for Ctrl-C (finding 5). It is
-        # cleanup, not classification: how such a run is recorded is Milestone 5, and an
-        # injected fault is left for the next run's pre-run reset.
+        # From the start of the load until the measurements are complete, any failure stops
+        # the load, so it never leaves the generator busy for the next run. That holds for a
+        # pre-agent discard (Milestone 4 review, finding 3), a stub or crash after the agent
+        # starts (second review, finding 1), Ctrl-C (finding 5), and a start whose control
+        # response was lost: the generator may be running anyway (fix list, item 4). The one
+        # exception is WorkloadGeneratorBusy, which means the load is someone else's (0009,
+        # W5). This is cleanup, not classification: how such a run is recorded is Milestone
+        # 5, and an injected fault is left for the next run's pre-run reset.
         try:
+            self.workload.start_workload()
             steady_state = self.workload.verify_steady_state()
             self._require_steady_state(steady_state)
             prefault = env.capture_snapshot()
@@ -129,7 +135,8 @@ class ExperimentRunner:
             effective = self.effectiveness.verify(steady_state)
             harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)
         except BaseException as exc:
-            self._stop_load_after_failure(exc)
+            if not isinstance(exc, WorkloadGeneratorBusy):
+                self._stop_load_after_failure(exc)
             raise
 
         # Measurements are complete. Everything from here on is cleanup, and no cleanup

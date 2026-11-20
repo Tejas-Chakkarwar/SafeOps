@@ -121,3 +121,23 @@ Prometheus may show workload metrics to the agent (`loadgen_attempts_total`, `lo
 ## Amendment, 2026-11-19 (Milestone 3): testbed lifecycle rights
 
 As planned above, `experiment-controller` gained its `testbed` rights at Milestone 3, through Role `experiment-controller-testbed-lifecycle`. The exact verbs and the reasons are in decision 0013. There's still no Secret access, no `pods/exec`, and no chaos creation. The proxy Role in `safeops-workload` is unchanged.
+
+## Amendment, 2026-11-19 (Milestone 4 fix list): a successful `start` is the run boundary
+
+- **The problem:** the generator lives outside `testbed`, so resets never touch it, and its process-global state grew with every run.
+  - `_windows` kept every window ever measured, each holding its 300 `Attempt`s. Since Milestone 4, one run measures a baseline window plus up to three detection windows.
+  - `dispatched_total` and the `/stats` window list were lifetime totals.
+  - The freezer woke every 100 ms and, holding the same lock the scheduler takes for each dispatch, called `summary()` on every historical window. For a frozen window that returns a fresh dict copy, so this was an allocation loop over all past windows, ten times a second.
+  - So later runs were measured by a progressively heavier process than early ones: run-order-dependent lock contention inside the evaluator's own measurement path.
+- **The fix, in `testbed/app/loadgen.py` and `window.py`:**
+  - A successful `start` is the run boundary. Once its preconditions pass, under the state lock and before the new run is marked active, it refuses if a window is still collecting (a window can't outlive its run), then clears `_windows` and resets `dispatched_total` to 0.
+  - `stop` doesn't clear, so a finished run stays inspectable until the next start.
+  - Window ids keep increasing. The existing `generation` counter still guards stale scheduler threads.
+  - The freezer skips windows that are already frozen, using a public `Window.frozen` property. `summary()` still returns a defensive copy to callers.
+- **Tests:** `tests/test_m4_fixlist.py`.
+  - start → measure → stop → start drops the old window (no longer listed, 404 by id), restarts `dispatched_total`, and measures again.
+  - 50 cycles keep exactly the current run's window.
+  - A start while a window is collecting is refused.
+  - The freezer still freezes at the moment of close, and never re-reads a frozen window.
+- **Not changed:** the Prometheus counters `loadgen_attempts_total` and `loadgen_attempt_duration_seconds` stay lifetime totals. Decision 0017 §4 makes `get_metrics` (Milestone 6) responsible for never presenting earlier runs' totals as current evidence.
+- **Changing `loadgen.py` changes the loadgen image digest.** The testbed digest is untouched, as 0007 requires.

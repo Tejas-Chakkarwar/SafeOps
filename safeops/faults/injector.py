@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -34,13 +34,13 @@ from safeops.faults.spec import (
 # fault silent. The first usually overlaps the rollout (decision 0015). A fixed count, so
 # whether a run is discarded never depends on timing jitter (second review, finding 2).
 VERIFY_MAX_WINDOWS = 3
-# Wall-clock safety cap on the whole verification. Three 30 s windows take about 97 s
-# (each ~32.4 s: scheduling, the 1 s deadline, the generator's 0.5 s settle, polling), so
-# the cap only bites if the generator is unusually slow.
-VERIFY_TIMEOUT_S = 150.0
-# A window closes about this long after its last attempt's deadline: the generator's 0.5 s
-# settle margin plus one poll. Used to refuse windows the collector could never see close.
-WINDOW_CLOSE_MARGIN_S = 1.5
+# A between-window threshold, not a wall-clock cap: once this much time has passed, no
+# *new* window starts. It is checked only after a window returns, so verification can run
+# past it by up to one window (bounded by the collector's own poll timeout). Three 30 s
+# windows take about 97 s (each ~32.4 s: scheduling, the 1 s deadline, the generator's
+# 0.5 s settle, polling), so it only matters if the generator is unusually slow. The
+# deterministic bound is VERIFY_MAX_WINDOWS (fix list, item 8; decision 0015).
+VERIFY_NO_NEW_WINDOW_AFTER_S = 150.0
 
 
 class FaultInjectionError(Exception):
@@ -59,6 +59,15 @@ class FaultNotPresent(Exception):
 
 
 @dataclass(frozen=True)
+class FaultBackendRef:
+    """Which fault backend injected a fault (decision 0003 F1): backend-generic provenance,
+    taken from the backend that actually ran, never a hardcoded claim (fix list, item 3)."""
+
+    name: str
+    version: str | None
+
+
+@dataclass(frozen=True)
 class InjectedFault:
     """Evaluator ground truth about what was injected. Never crosses the wall (§6)."""
 
@@ -68,7 +77,7 @@ class InjectedFault:
     variant: Variant
     previous_value: str
     injected_at: datetime
-    backend: dict = field(default_factory=lambda: {"name": "kubernetes-api", "version": None})
+    backend: FaultBackendRef
 
 
 @dataclass(frozen=True)
@@ -107,6 +116,7 @@ class SetContainerEnv:
     """
 
     name = "kubernetes-api"
+    version: str | None = None  # the Kubernetes API itself; decision 0003 F1
 
     def __init__(self, kubectl, namespace: str) -> None:
         self._k = kubectl
@@ -173,7 +183,7 @@ class FaultInjector:
         topology=None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        verify_timeout_s: float = VERIFY_TIMEOUT_S,
+        no_new_window_after_s: float = VERIFY_NO_NEW_WINDOW_AFTER_S,
     ) -> None:
         self._kubectl = kubectl
         self._workload = workload
@@ -181,7 +191,7 @@ class FaultInjector:
         self._topology = topology
         self._clock = clock
         self._wall_clock = wall_clock
-        self.verify_timeout_s = verify_timeout_s
+        self.no_new_window_after_s = no_new_window_after_s
         self._namespace: str | None = None
 
     def _k(self):
@@ -213,7 +223,12 @@ class FaultInjector:
         inj = spec.injection
         if (inj.backend, inj.action) != ("kubernetes-api", "set_container_env"):
             raise FaultSpecError(f"injection {inj.backend}/{inj.action} is not implemented")
-        return SetContainerEnv(self._k(), self._ns())
+        backend = SetContainerEnv(self._k(), self._ns())
+        if backend.name != inj.backend:
+            raise FaultSpecError(
+                f"spec names backend {inj.backend!r} but {backend.name!r} was selected"
+            )
+        return backend
 
     def load(self, fault_id: str) -> FaultSpec:
         return load_fault_spec(fault_id, self._faults_dir, self._topology)
@@ -233,7 +248,7 @@ class FaultInjector:
             raise FaultSpecError(
                 f"symptom window {expr.window_s}s at {rate} req/s is not a whole number of attempts"
             )
-        closes_after = expr.window_s + settings.attempt_deadline_s + WINDOW_CLOSE_MARGIN_S
+        closes_after = settings.closes_after_s(int(attempts))
         if closes_after >= settings.window_poll_timeout_s:
             # The collector gives up after window_poll_timeout_s, so every window would be
             # lost and every run discarded as unmeasurable (second review, finding 3).
@@ -247,7 +262,8 @@ class FaultInjector:
         index, variant = spec.variant_for(fault_seed)
         # Everything that can be refused is refused before the cluster changes (finding 4).
         self.detection_attempts(spec)
-        previous = self._backend(spec).apply(spec.injection, variant)
+        backend = self._backend(spec)
+        previous = backend.apply(spec.injection, variant)
         return InjectedFault(
             spec=spec,
             fault_seed=fault_seed,
@@ -255,6 +271,7 @@ class FaultInjector:
             variant=variant,
             previous_value=previous,
             injected_at=self._wall_clock(),
+            backend=FaultBackendRef(backend.name, backend.version),
         )
 
     def verify_fault_present(
@@ -264,10 +281,10 @@ class FaultInjector:
 
         Measures fixed-denominator windows of ``window_s x rate_rps`` scheduled attempts
         on the running workload, until one shows the declared expression holding, or
-        VERIFY_MAX_WINDOWS have not, or (a safety cap) ``timeout_s`` has passed. Never
-        judged from Prometheus.
+        VERIFY_MAX_WINDOWS have not. ``timeout_s`` (§11.2's name) is a between-window
+        threshold: no new window starts once it has passed. Never judged from Prometheus.
         """
-        timeout_s = self.verify_timeout_s if timeout_s is None else timeout_s
+        timeout_s = self.no_new_window_after_s if timeout_s is None else timeout_s
         symptom = fault.spec.symptoms[0]
         expr = symptom.parsed
         workload = self._load_workload()
@@ -296,13 +313,17 @@ class FaultInjector:
             elapsed = self._clock() - started
             if len(observations) >= VERIFY_MAX_WINDOWS or elapsed >= timeout_s:
                 worst = max(o.value for o in observations)
-                why = "" if len(observations) >= VERIFY_MAX_WINDOWS else f", cut at {timeout_s:g}s"
+                why = (
+                    ""
+                    if len(observations) >= VERIFY_MAX_WINDOWS
+                    else f"; no new window after {timeout_s:g}s"
+                )
                 return FaultVerification(
                     False,
                     symptom,
                     tuple(observations),
                     f"{symptom.expression!r} never held in {len(observations)} window(s) of"
-                    f" {attempts} attempts (max {worst:.3f}){why}",
+                    f" {attempts} attempts (max {worst:.3f}), after {elapsed:.0f}s{why}",
                 )
 
     def clear(self, fault: InjectedFault) -> None:

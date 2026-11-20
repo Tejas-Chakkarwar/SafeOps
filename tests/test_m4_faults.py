@@ -10,6 +10,7 @@ import copy
 import dataclasses
 import importlib.util
 import sys
+import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -37,7 +38,8 @@ from safeops.experiment.unit import (
 from safeops.faults.alerts import AlertGenerator
 from safeops.faults.injector import (
     VERIFY_MAX_WINDOWS,
-    VERIFY_TIMEOUT_S,
+    VERIFY_NO_NEW_WINDOW_AFTER_S,
+    FaultBackendRef,
     FaultInjectionError,
     FaultInjector,
     FaultNotPresent,
@@ -60,6 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TOPOLOGY = load_topology()
 SPEC = load_fault_spec("bad-deployment-config")
 T0 = datetime(2026, 11, 19, 18, 0, 0, tzinfo=UTC)
+K8S_API = FaultBackendRef("kubernetes-api", None)
 
 
 # --- fault id: validated before it is ever a path ----------------------------------------------
@@ -473,7 +476,9 @@ class FakeDetectionWorkload:
 
 
 def _fault() -> InjectedFault:
-    return InjectedFault(SPEC, 0, 3, SPEC.injection.variants[3], "http://inventory-svc:8080", T0)
+    return InjectedFault(
+        SPEC, 0, 3, SPEC.injection.variants[3], "http://inventory-svc:8080", T0, K8S_API
+    )
 
 
 def _verify(errors: list[int | None]) -> tuple[FaultVerification, FakeDetectionWorkload]:
@@ -506,7 +511,7 @@ def test_silent_non_injection_is_reported_after_a_bounded_number_of_windows() ->
     assert not v.present
     assert len(wl.sizes) == VERIFY_MAX_WINDOWS == 3  # a fixed count, never a fourth
     assert "never held" in v.reason
-    assert VERIFY_TIMEOUT_S == 150.0
+    assert VERIFY_NO_NEW_WINDOW_AFTER_S == 150.0
 
 
 def test_a_lost_detection_window_is_an_infrastructure_failure_not_absence() -> None:
@@ -642,7 +647,7 @@ def _alert_strings(alert: Alert) -> list[str]:
 
 def _held(spec) -> FaultVerification:
     clock = [0.0]
-    fault = InjectedFault(spec, 0, 0, spec.injection.variants[0], "5", T0)
+    fault = InjectedFault(spec, 0, 0, spec.injection.variants[0], "5", T0, K8S_API)
     inj = _injector(None, FakeDetectionWorkload([300], clock), clock=lambda: clock[0])
     return inj.verify_fault_present(fault)
 
@@ -864,7 +869,8 @@ def test_review_a_bad_detection_window_is_refused_before_the_cluster_changes() -
     k = FakeKubectl(_orders_deployment())
 
     class Slow:
-        settings = dataclasses.replace(SETTINGS, rate_rps=0.33)
+        # Not a WorkloadSettings: that refuses this rate itself now (fix list, item 5).
+        settings = types.SimpleNamespace(rate_rps=0.33)
 
     with pytest.raises(FaultSpecError, match="whole number"):
         _injector(k, Slow()).inject("bad-deployment-config", 0)
@@ -1027,7 +1033,7 @@ def test_review2_the_wall_clock_cap_still_bounds_a_slow_generator() -> None:
     clock = [0.0]
     wl = FakeDetectionWorkload([0, 0, 0], clock, window_takes_s=80.0)
     v = _injector(None, wl, clock=lambda: clock[0]).verify_fault_present(_fault())
-    assert not v.present and len(v.observations) == 2 and "cut at 150s" in v.reason
+    assert not v.present and len(v.observations) == 2 and "no new window after 150s" in v.reason
 
 
 @pytest.mark.parametrize(("window_s", "ok"), [(30, True), (57, True), (58, False), (300, False)])
