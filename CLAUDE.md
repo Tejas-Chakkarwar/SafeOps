@@ -19,6 +19,7 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 > - the unit's bounds (`fault_seed` 0 … 2^32 − 1, `trial_index` 0 … 999) in the schema (0014)
 > - recording discards and their reasons: pre-run dirty, no baseline, silent non-injection, failed injection, unmeasurable detection (0004 note, 0009, 0015)
 > - a live test of the deployed load generator's run boundary over the API-server proxy (0017 §5)
+> - strict `schema_version` behavior: a record is validated against exactly its declared version's fields, unknown fields are rejected, and later structural additions bump the version; no placeholder fields for later milestones (0017 §7)
 > - §11.8 says Pydantic; it is not a dependency yet, so adding it needs its own decision entry
 
 Completed:

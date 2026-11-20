@@ -1,6 +1,6 @@
-# 0017 — Requirements carried from Milestone 4 into Milestones 5, 6 and 11
+# 0017 — Requirements carried from Milestone 4 into later milestones
 
-**Status:** Accepted (2026-11-19), recorded at the Milestone 4 closeout; §6 added at the final review. **Recorded, not implemented.** Each item names the milestone that must satisfy it before that milestone's acceptance criterion counts as met.
+**Status:** Accepted (2026-11-19), recorded at the Milestone 4 closeout; §6 added at the final review and rewritten before Milestone 5; §7 added before Milestone 5. **Recorded, not implemented.** Each item names the milestone that must satisfy it before that milestone's acceptance criterion counts as met.
 **Design refs:** §5, §7.1, §7.2, §11.1, §11.3, §11.8; decisions 0009, 0011, 0013, 0015
 
 ## 1. BLOCKING for Milestone 5: a verifier or harness exception after the agent starts must still produce a record
@@ -66,19 +66,58 @@ Don't redesign the loadgen metrics.
 
 It is a live assertion of the measurement infrastructure's run boundary. Write it at Milestone 5, not as part of the Milestone 4 closeout.
 
-## 6. Milestones 6 and 12: the host and node clocks must be compared each run
+## 6. Milestones 6 and 12: host and cluster clocks are compared twice per run
 
-- The harness stamps `Alert.fired_at`, `IncidentRuntimeContext.now` and `InjectedFault.injected_at` with the **host's** clock (macOS). Kubernetes events, container logs and Prometheus samples carry the **kind node's** clock, which is the Docker Desktop VM's.
-- Measured at the final Milestone 4 review (2026-11-19), node minus host was +0.05 to +0.14 s, and that includes `docker exec` latency. That's harmless today.
-- But Docker Desktop's VM clock can drift, for example after the host sleeps, and nothing would notice. The alert would then claim an onset the cluster's own timeline contradicts.
+**Why.**
+- The harness stamps `Alert.fired_at`, `IncidentRuntimeContext.now` and `InjectedFault.injected_at` with the **host's** clock (macOS).
+- Kubernetes events, container logs and Prometheus samples carry the **cluster's** clock: the API server and control plane inside the kind environment, which runs in Docker Desktop's VM.
+- If the two disagree, the alert claims an onset that the cluster's own timeline contradicts.
+- The drift worth catching is seconds to minutes, not milliseconds: Docker Desktop's VM clock after the host sleeps and resumes, or any other clock adjustment. A high-precision synchronization protocol is unnecessary.
 
-**Requirement:**
-- **Milestone 6:** before the agent's time-windowed tools (`last_minutes`, the metric `window`) are trusted, the harness measures the host–node clock offset at the start of each run and records it in the run record.
-- **Milestone 12:** a run whose offset exceeds a bound is flagged, before the `telemetry_conflict` rule "event timeline contradicts claimed failure onset" (§11.5) compares the two clocks. The bound is decided then, from the measured offsets.
+**What was observed so far.** At the final Milestone 4 review, `docker exec … date` minus the host clock read +0.05 to +0.14 s. That is **only an upper bound**, because it includes the command's own latency. It is not a measured clock offset.
 
-The mechanism is open:
-- reading the node's time over decision 0012's host-side `docker exec` would widen that capability's stated use (clean-state inspection only), so it needs its own decision;
-- an API-server-side source, such as a response `Date` header, needs none.
+**Requirement for Milestone 6: two readings per run, both recorded.**
+1. One reading **before the load and the incident begin**.
+2. One reading **after the experimental measurements are complete and before any destructive recovery**.
+
+One reading can't tell a constant offset from a clock jump during the run. A Phase A campaign runs for hours on a laptop, and a sleep and resume mid-run would leave the first reading clean while the agent later sees timestamps on both sides of the jump.
+
+**Requirement for Milestone 12:** flag a run if either
+- the absolute offset at either reading exceeds a bound, or
+- the change between the two readings exceeds a bound.
+
+Both bounds are decided at Milestone 12, from measured values. This happens before the `telemetry_conflict` rule "event timeline contradicts claimed failure onset" (§11.5) compares the two clocks.
+
+**Mechanism: a fresh server-stamped object per reading.** Each reading creates a new, short-lived probe object, through the existing guarded runtime Kubernetes path in `testbed`:
+1. record the host time immediately before sending the create request;
+2. create a uniquely named probe object in `testbed`;
+3. take that new object's server-populated `metadata.creationTimestamp`;
+4. record the host time immediately after the create and read complete;
+5. estimate the offset as `creationTimestamp − midpoint(host before, host after)`, so request latency isn't counted as offset;
+6. delete the probe, and **verify it is gone** before proceeding;
+7. **fail clearly** if the probe can't be created, read or removed.
+
+Constraints on the probe:
+- **It must not be present during** the workload, agent execution, canonical snapshots or harm measurement. The measurement must never become part of the system under test.
+- **The probe kind is chosen and recorded at Milestone 6**, together with the runtime create, read and delete RBAC it needs, once that is verified. It is not fixed here.
+- **What the timestamp means:** it is the **API-server and control-plane clock as observed inside the kind environment**, at one-second resolution plus request latency. It is not a high-precision reading of a physical node clock. It can't characterize the 0.05–0.14 s figure above, and it doesn't need to: its job is to detect offsets or jumps of seconds to minutes.
+
+**Rejected mechanisms:**
+- **The `creationTimestamp` of an object created during reset.** It records the server time when *that* object was created; reading it again later is not a fresh sample.
+- **Host-side `docker exec`.** It would widen decision 0012 beyond its clean-state-only scope, so it would need its own decision.
+- **The API server's `Date` response header.** It isn't available in the current implementation: the guarded `Kubectl` wrapper exposes response bodies and stdout, not HTTP response headers. It stays closed unless a later milestone explicitly extends the wrapper to expose it.
+
+**No placeholder field in the Milestone 5 schema.** The eventual shape is at least two readings plus their change and its interpretation, not one scalar. Milestone 6 adds that structure with a `schema_version` bump (§7).
+
+## 7. Milestone 5: strict schema-version behavior
+
+The run record carries `schema_version` (§11.8). Milestone 5 makes it mean something:
+- A record declaring schema version N is validated against **exactly** the fields defined for version N.
+- Fields that version doesn't define are **rejected**.
+- A later milestone's structural addition, such as §6's clock readings at Milestone 6, **requires a schema-version bump**, never a speculative field reserved in advance.
+- A reader must not silently accept a record whose declared version doesn't match its structure.
+
+So the Milestone 6 change is routine, and Milestone 5 reserves nothing for it.
 
 ## Not carried
 
