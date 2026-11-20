@@ -30,9 +30,17 @@ from safeops.faults.spec import (
     load_fault_spec,
 )
 
-# How long verify_fault_present keeps measuring windows before calling the fault silent.
-# Room for three 30 s windows: the rollout overlaps the first (decision 0015).
-VERIFY_TIMEOUT_S = 95.0
+# verify_fault_present measures at most this many detection windows before calling the
+# fault silent. The first usually overlaps the rollout (decision 0015). A fixed count, so
+# whether a run is discarded never depends on timing jitter (second review, finding 2).
+VERIFY_MAX_WINDOWS = 3
+# Wall-clock safety cap on the whole verification. Three 30 s windows take about 97 s
+# (each ~32.4 s: scheduling, the 1 s deadline, the generator's 0.5 s settle, polling), so
+# the cap only bites if the generator is unusually slow.
+VERIFY_TIMEOUT_S = 150.0
+# A window closes about this long after its last attempt's deadline: the generator's 0.5 s
+# settle margin plus one poll. Used to refuse windows the collector could never see close.
+WINDOW_CLOSE_MARGIN_S = 1.5
 
 
 class FaultInjectionError(Exception):
@@ -218,11 +226,20 @@ class FaultInjector:
     def detection_attempts(self, spec: FaultSpec) -> int:
         """Attempts per detection window: ``window_s x rate_rps``, a whole number."""
         expr = spec.symptoms[0].parsed
-        rate = self._load_workload().settings.rate_rps
+        settings = self._load_workload().settings
+        rate = settings.rate_rps
         attempts = expr.window_s * rate
         if attempts != int(attempts) or attempts <= 0:
             raise FaultSpecError(
                 f"symptom window {expr.window_s}s at {rate} req/s is not a whole number of attempts"
+            )
+        closes_after = expr.window_s + settings.attempt_deadline_s + WINDOW_CLOSE_MARGIN_S
+        if closes_after >= settings.window_poll_timeout_s:
+            # The collector gives up after window_poll_timeout_s, so every window would be
+            # lost and every run discarded as unmeasurable (second review, finding 3).
+            raise FaultSpecError(
+                f"symptom window {expr.window_s}s closes about {closes_after:g}s after it opens,"
+                f" past the {settings.window_poll_timeout_s:g}s window poll timeout"
             )
         return int(attempts)
 
@@ -246,8 +263,9 @@ class FaultInjector:
         """Confirm the symptom is observable before the agent starts (§11.2).
 
         Measures fixed-denominator windows of ``window_s x rate_rps`` scheduled attempts
-        on the running workload, until one shows the declared expression holding, or until
-        another window would overrun ``timeout_s``. Never judged from Prometheus.
+        on the running workload, until one shows the declared expression holding, or
+        VERIFY_MAX_WINDOWS have not, or (a safety cap) ``timeout_s`` has passed. Never
+        judged from Prometheus.
         """
         timeout_s = self.verify_timeout_s if timeout_s is None else timeout_s
         symptom = fault.spec.symptoms[0]
@@ -275,14 +293,16 @@ class FaultInjector:
             observations.append(obs)
             if obs.held:
                 return FaultVerification(True, symptom, tuple(observations))
-            if self._clock() - started + expr.window_s > timeout_s:
+            elapsed = self._clock() - started
+            if len(observations) >= VERIFY_MAX_WINDOWS or elapsed >= timeout_s:
                 worst = max(o.value for o in observations)
+                why = "" if len(observations) >= VERIFY_MAX_WINDOWS else f", cut at {timeout_s:g}s"
                 return FaultVerification(
                     False,
                     symptom,
                     tuple(observations),
                     f"{symptom.expression!r} never held in {len(observations)} window(s) of"
-                    f" {attempts} attempts within {timeout_s:g}s (max {worst:.3f})",
+                    f" {attempts} attempts (max {worst:.3f}){why}",
                 )
 
     def clear(self, fault: InjectedFault) -> None:

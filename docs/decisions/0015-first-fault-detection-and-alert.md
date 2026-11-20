@@ -47,7 +47,7 @@ The design's example expression is `http_5xx_rate > 0.2 for 2m` (§9.5). If veri
   - It is built **only** from a verification in which the harness measured that expression holding. `build_alert` refuses a verification where it didn't.
   - `fired_at` is the time the holding window was read, not the injection time.
   - So everything the agent reads in the alert was true of the cluster at `fired_at`.
-- **`verify_fault_present` timeout: 95 s, room for three 30 s windows.** The first window usually overlaps the rollout. If a whole timeout passes with no window holding, that's silent non-injection, which costs about 95 s, only on a run that is discarded anyway.
+- **`verify_fault_present` measures at most three windows** (`VERIFY_MAX_WINDOWS`), with a 150 s wall-clock safety cap. The first window usually overlaps the rollout. Three windows with no hold is silent non-injection, which costs about 97 s, only on a run that is discarded anyway. *(The first version used a 95 s timeout; see the second-review amendment for why that was replaced.)*
 
 ### What the measurement does and doesn't attribute
 
@@ -139,3 +139,17 @@ Each fix has a regression test in the "Milestone 4 adversarial review" section o
 8. **The topology is read-only.** Its mappings are `MappingProxyType`, and its lists are tuples. `IncidentRuntimeContext` and the harm checker share one `ServiceTopology`, so a bug in the extractor or the gate can't rewrite the scope rule that harm is judged by. This is defense in depth: LLM output can't reach Python objects.
 9. **Docs.** Decision 0004's exit-code table gains code 7.
    - **A limitation of settledness:** polls are 5 s apart, so a change that reverts between two polls is invisible. Settledness is an observation at that sampling rate, not proof of quiescence. For the faults so far, the measured diff between the pre-fault and post-fault baselines was exactly the fault's own change (see "Live acceptance").
+
+## Amendment, 2026-11-19: Milestone 4 adversarial review, second pass
+
+The regression tests are in the "second pass" section of `tests/test_m4_faults.py`. A mutation check undid each fix in turn, and every one made its test fail. One test initially survived its mutation, because it timed out on a differing pair of polls; it was rewritten until it didn't.
+
+1. **The load is stopped on any failure before measurements are complete, not only before the agent.**
+   - **The problem:** every real Milestone 4 run ends at the agent stub (`NotImplementedStage` inside `Agent.investigate`). That was outside the first pass's `try`, so `safeops run` always left the generator running, and the next run failed with `WorkloadGeneratorBusy`.
+   - **The fix:** the guarded block now runs from `verify_steady_state` through `harm.check`. This is cleanup, not classification. Whatever Milestone 5 decides about a run that fails mid-way, its post-run cleanup stops the load as well.
+2. **Verification uses a fixed number of windows, not a time budget.**
+   - **The problem:** each window really takes about 32.4 s (30 s of scheduling, the 1 s deadline, the generator's 0.5 s settle, and polling). The third window started at about 64.8 s, and the 95 s budget let it run only because 64.8 + 30 ≤ 95, a margin of 0.2 s. A little polling jitter meant two windows instead of three. Whether a run was discarded, and the live test that asserts three windows, depended on that.
+   - **The fix:** `VERIFY_MAX_WINDOWS = 3`. The new 150 s cap is only a safety net against an unusually slow generator. It's tested at window durations of 29, 32.4, 33 and 40 s, and separately with 80 s windows to show the cap still bites.
+3. **A symptom window the collector can never see close is refused before injection.** The window collector gives up after `window_poll_timeout_s` (60 s), but the spec grammar allowed windows up to 300 s, so any `over 58s` or longer would discard every run as unmeasurable. `detection_attempts` now requires `window_s + attempt_deadline_s + 1.5 s` (the generator's settle margin plus one poll) to be under the poll timeout. It's checked in `inject_spec`, before the cluster changes. The steady-state window and its 60 s timeout (decision 0009) are unchanged.
+4. **An unsettled baseline reports the most recent change it saw.** Before, a timeout that landed right after two matching polls reported `last_changes = ()`.
+5. **Ctrl-C also stops the load.** The guard catches `BaseException`, stops the load best-effort, and re-raises the original exception. A failed stop is attached to it as a note.

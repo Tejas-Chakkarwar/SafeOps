@@ -232,6 +232,9 @@ def test_run_reaches_the_agent_with_a_symptom_only_alert(env) -> None:
         with pytest.raises(NotImplementedStage) as exc:
             runner.run(RunUnit("bad-deployment-config", 0, 0))
         assert exc.value.stage == "Agent.investigate"
+        # The run itself stopped the load it started, before this test's own cleanup
+        # (second review, finding 1).
+        assert runner.workload._proxy().stats()["running"] is False
     finally:
         runner.workload.stop_workload()  # mid-run cleanup is Milestone 5 (decision 0004)
         env.reset_environment()

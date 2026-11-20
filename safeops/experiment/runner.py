@@ -89,10 +89,12 @@ class ExperimentRunner:
             pre_clean = CleanStateResult(False, (f"pre-run reset failed: {exc}",))
         self._require_pre_run_clean(pre_clean)
         self.workload.start_workload()
-        # From here until the agent starts, every failure is a pre-run discard (§11.1). The
-        # load this run started is stopped again, so a discard never leaves the generator
-        # busy for the next run (Milestone 4 review, finding 3). An injected fault is left
-        # for the next run's pre-run reset. Recording the discard is Milestone 5.
+        # From here until the measurements are complete, any failure stops the load this
+        # run started, so it never leaves the generator busy for the next run. That holds
+        # for a pre-agent discard (Milestone 4 review, finding 3), for a stub or crash after
+        # the agent starts (second review, finding 1), and for Ctrl-C (finding 5). It is
+        # cleanup, not classification: how such a run is recorded is Milestone 5, and an
+        # injected fault is left for the next run's pre-run reset.
         try:
             steady_state = self.workload.verify_steady_state()
             self._require_steady_state(steady_state)
@@ -108,27 +110,27 @@ class ExperimentRunner:
             # crosses into the runtime. The fault and its spec stay on this side.
             alert = self.alerts.build_alert(verification)
             context = self._runtime_context(alert)
-        except Exception as exc:
-            self._stop_load_after_discard(exc)
+            raw_output, trajectory = self.agent.investigate(context)
+            proposal = self.parser.parse(raw_output)
+
+            features = shadow_scores = decision = execution = executed_action = None
+            action = self._gate_eligible_action(proposal)
+            if action is not None:
+                features = self.extractor.extract(proposal, trajectory, context)
+                shadow_scores = self.shadow_gates.score(features)
+                decision = self.gate.decide(features)
+                if self._should_execute(decision):
+                    execution = self.executor.apply(action)
+                    executed_action = self._executed_action(action, execution)
+
+            # Verification, against the post-fault snapshot (§11.7).
+            env.wait_stabilization_window()
+            postaction = env.capture_snapshot()
+            effective = self.effectiveness.verify(steady_state)
+            harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)
+        except BaseException as exc:
+            self._stop_load_after_failure(exc)
             raise
-        raw_output, trajectory = self.agent.investigate(context)
-        proposal = self.parser.parse(raw_output)
-
-        features = shadow_scores = decision = execution = executed_action = None
-        action = self._gate_eligible_action(proposal)
-        if action is not None:
-            features = self.extractor.extract(proposal, trajectory, context)
-            shadow_scores = self.shadow_gates.score(features)
-            decision = self.gate.decide(features)
-            if self._should_execute(decision):
-                execution = self.executor.apply(action)
-                executed_action = self._executed_action(action, execution)
-
-        # Verification, against the post-fault snapshot (§11.7).
-        env.wait_stabilization_window()
-        postaction = env.capture_snapshot()
-        effective = self.effectiveness.verify(steady_state)
-        harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)
 
         # Measurements are complete. Everything from here on is cleanup, and no cleanup
         # failure may erase the run (§11.1; Milestone 3 third review). Order:
@@ -173,13 +175,13 @@ class ExperimentRunner:
         )
         self._recover_if_dirty(post_clean)  # strictly after the record
 
-    def _stop_load_after_discard(self, exc: Exception) -> None:
+    def _stop_load_after_failure(self, exc: BaseException) -> None:
         """Best-effort stop of the load this run started. A stop failure is attached to the
         original exception, never raised in its place."""
         try:
             self.workload.stop_workload()
         except Exception as stop_exc:
-            exc.add_note(f"stop_workload after the discard also failed: {stop_exc}")
+            exc.add_note(f"stop_workload after the failure also failed: {stop_exc}")
 
     # Runner hooks: points where the runner interprets a stage's result.
 

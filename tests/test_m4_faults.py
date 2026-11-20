@@ -36,6 +36,7 @@ from safeops.experiment.unit import (
 )
 from safeops.faults.alerts import AlertGenerator
 from safeops.faults.injector import (
+    VERIFY_MAX_WINDOWS,
     VERIFY_TIMEOUT_S,
     FaultInjectionError,
     FaultInjector,
@@ -446,15 +447,18 @@ SETTINGS = WorkloadSettings("/checkout", 10.0, 1.0, 15.0, 300, 297, 60.0, 1.0)
 class FakeDetectionWorkload:
     """Detection windows with scripted 5xx counts. Each window advances the clock 30 s."""
 
-    def __init__(self, server_errors: list[int | None], clock: list[float]) -> None:
+    def __init__(
+        self, server_errors: list[int | None], clock: list[float], window_takes_s: float = 30.0
+    ) -> None:
         self.settings = SETTINGS
         self.script = list(server_errors)
         self.clock = clock
+        self.window_takes_s = window_takes_s
         self.sizes: list[int] = []
 
     def measure_window(self, attempts: int) -> WindowMeasurement:
         self.sizes.append(attempts)
-        self.clock[0] += 30.0
+        self.clock[0] += self.window_takes_s
         errors = self.script.pop(0)
         if errors is None:
             return WindowMeasurement("wX", "failed", attempts, 12, None, "generator lost")
@@ -500,9 +504,9 @@ def test_exactly_the_threshold_does_not_hold() -> None:
 def test_silent_non_injection_is_reported_after_a_bounded_number_of_windows() -> None:
     v, wl = _verify([0, 1, 3, 0, 0])
     assert not v.present
-    assert len(wl.sizes) == 3  # 95 s holds three 30 s windows, not a fourth
+    assert len(wl.sizes) == VERIFY_MAX_WINDOWS == 3  # a fixed count, never a fourth
     assert "never held" in v.reason
-    assert VERIFY_TIMEOUT_S == 95.0
+    assert VERIFY_TIMEOUT_S == 150.0
 
 
 def test_a_lost_detection_window_is_an_infrastructure_failure_not_absence() -> None:
@@ -979,3 +983,80 @@ def test_review_topology_is_read_only() -> None:
     enum = topo.resources["orders-config"].approved_keys["log_level"]["enum"]
     assert isinstance(enum, tuple)
     assert topo.incident_scope("orders") == {"orders", "inventory", "payment", "postgres"}
+
+
+# --- Milestone 4 adversarial review, second pass ------------------------------------------
+
+
+def test_review2_a_stub_after_the_agent_starts_still_stops_the_load(offline_runner_factory) -> None:
+    """Finding 1: every Milestone 4 run ends at the agent stub; the load must not outlive it."""
+    from safeops.stubs import NotImplementedStage
+
+    r = offline_runner_factory()
+    r.workload = _LoadRecorder()
+    with pytest.raises(NotImplementedStage):
+        r.run(RunUnit("bad-deployment-config", 0, 0))  # stops at Agent.investigate
+    assert r.workload.events == ["start", "stop"]
+
+
+def test_review2_ctrl_c_mid_run_stops_the_load(offline_runner_factory) -> None:
+    """Finding 5: KeyboardInterrupt is a BaseException, not an Exception."""
+    r = offline_runner_factory()
+    r.workload = _LoadRecorder()
+
+    class Interrupted:
+        def inject(self, fault_id, fault_seed):
+            raise KeyboardInterrupt
+
+    r.injector = Interrupted()
+    with pytest.raises(KeyboardInterrupt):
+        r.run(RunUnit("bad-deployment-config", 0, 0))
+    assert r.workload.events == ["start", "stop"]
+
+
+@pytest.mark.parametrize("window_takes_s", [29.0, 32.4, 33.0, 40.0])
+def test_review2_window_count_does_not_depend_on_timing(window_takes_s: float) -> None:
+    """Finding 2: at 95 s, 32.4 s windows left 0.2 s for the third one; now it's a count."""
+    clock = [0.0]
+    wl = FakeDetectionWorkload([0, 0, 0, 0], clock, window_takes_s)
+    v = _injector(None, wl, clock=lambda: clock[0]).verify_fault_present(_fault())
+    assert not v.present and len(v.observations) == VERIFY_MAX_WINDOWS
+
+
+def test_review2_the_wall_clock_cap_still_bounds_a_slow_generator() -> None:
+    clock = [0.0]
+    wl = FakeDetectionWorkload([0, 0, 0], clock, window_takes_s=80.0)
+    v = _injector(None, wl, clock=lambda: clock[0]).verify_fault_present(_fault())
+    assert not v.present and len(v.observations) == 2 and "cut at 150s" in v.reason
+
+
+@pytest.mark.parametrize(("window_s", "ok"), [(30, True), (57, True), (58, False), (300, False)])
+def test_review2_a_window_the_collector_cannot_see_close_is_refused_before_injection(
+    window_s: int, ok: bool
+) -> None:
+    """Finding 3: the collector gives up after window_poll_timeout_s (60 s)."""
+    spec = dataclasses.replace(
+        SPEC,
+        symptoms=(Symptom("HighErrorRate", "orders", f"http_5xx_rate > 0.2 over {window_s}s"),),
+    )
+    k = FakeKubectl(_orders_deployment())
+    inj = _injector(k, FakeDetectionWorkload([], [0.0]))
+    if ok:
+        inj.inject_spec(spec, 0)
+        assert len(k.replaced) == 1
+    else:
+        with pytest.raises(FaultSpecError, match="poll timeout"):
+            inj.inject_spec(spec, 0)
+        assert k.replaced == []
+
+
+def test_review2_unsettled_keeps_the_last_change_even_if_the_final_polls_match() -> None:
+    """Finding 4: a timeout right after two matching polls used to report no change."""
+    # Polls at t=0, 5, 10: 2 -> 3 -> 3. The timeout (12 s) lands right after the matching
+    # pair, so the only change ever seen is the one between the first two polls.
+    env = ScriptedEnv([_snap(2), _snap(3), _snap(3)])
+    env.settle_timeout_s = 12.0
+    s = env.capture_settled_snapshot()
+    assert not s.settled and s.polls == 3
+    assert s.snapshot == _snap(3)
+    assert s.last_changes, "the change that kept it unsettled must be reported"

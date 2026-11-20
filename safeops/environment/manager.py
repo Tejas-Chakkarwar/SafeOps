@@ -68,7 +68,7 @@ class SettledSnapshot:
     settled: bool
     polls: int
     elapsed_s: float
-    last_changes: tuple[str, ...] = ()  # diff between the last two polls if not settled
+    last_changes: tuple[str, ...] = ()  # the most recent change seen, if not settled
 
 
 # Inventory of every other namespaced kind the testbed could hold (Milestone 3 review, H1).
@@ -419,10 +419,12 @@ class EnvironmentManager:
             self._sleep(SETTLE_POLL_S)
             previous, current = current, self.capture_snapshot()
             polls += 1
-            changes = tuple(snap.diff(previous, current))
-            if not changes and previous.digest() != current.digest():
-                changes = ("canonical digest changed",)  # belt and braces over diff()
-            identical = identical + 1 if not changes else 1
+            step = tuple(snap.diff(previous, current))
+            if not step and previous.digest() != current.digest():
+                step = ("canonical digest changed",)  # belt and braces over diff()
+            if step:
+                changes = step  # the most recent change, kept even if later polls match
+            identical = identical + 1 if not step else 1
         return SettledSnapshot(current, True, polls, self._clock() - started)
 
     def wait_stabilization_window(self) -> bool:
