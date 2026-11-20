@@ -417,9 +417,10 @@ def test_malformed_steady_state_arithmetic_is_rejected(good, changes) -> None:
         _check(_set(good, ("steady_state",), ss))
 
 
-def test_an_incomplete_window_still_uses_size_as_the_denominator(tmp_path) -> None:
-    """A timed-out window scheduled 150 of 300; its rate is over 300, and it is a valid
-    no_steady_state discard."""
+def test_an_incomplete_window_carries_no_success_metrics(tmp_path) -> None:
+    """A timed-out window scheduled 150 of 300. It wasn't measured, so it carries no
+    success metrics (closeout item 3); the fixed-denominator rule applies to complete
+    windows, whose rate is always over `size`."""
     from safeops.environment.workload import SteadyState, SteadyStateMeasurementFailed
 
     class Timeout:
@@ -427,7 +428,7 @@ def test_an_incomplete_window_still_uses_size_as_the_denominator(tmp_path) -> No
             pass
 
         def verify_steady_state(self):
-            return SteadyState("w1", "timeout", 300, 150, 100, 297, 100 / 300, None, "late")
+            return SteadyState("w1", "timeout", 300, 150, None, 297, None, None, "not closed")
 
         def stop_workload(self):
             pass
@@ -437,9 +438,10 @@ def test_an_incomplete_window_still_uses_size_as_the_denominator(tmp_path) -> No
         r.run(UNIT)
     (rec,) = _records(tmp_path)
     assert rec["discard_reason"]["cause"] == "no_steady_state"
-    bad = _set(rec, ("steady_state", "success_rate"), 100 / 150)
-    with pytest.raises(RecordValidationError, match="succeeded/size"):
-        _check(bad)  # the same malformed window inside a discarded record
+    measured = _set(rec, ("steady_state", "succeeded"), 100)
+    measured = _set(measured, ("steady_state", "success_rate"), 100 / 300)
+    with pytest.raises(RecordValidationError, match="carries no success metrics"):
+        _check(measured)  # the same malformed window inside a discarded record
 
 
 # --- 9. write errors say whether the record was installed ----------------------------------------

@@ -161,6 +161,20 @@ class SteadyState(_Strict):
         The denominator is always `size`, the configured attempts, never `scheduled`: a
         window that scheduled fewer still has the fixed denominator (decision 0009)."""
         problems = []
+        # The state's own shape, exactly as workload.py produces it (closeout item 3). The
+        # baseline threshold stays a completed-run policy rule, not a model rule.
+        if self.state == "complete":
+            if self.scheduled != self.size:
+                problems.append(f"a complete window scheduled {self.scheduled} of {self.size}")
+            if self.succeeded is None or self.success_rate is None:
+                problems.append("a complete window needs succeeded and success_rate")
+            if self.failure is not None:
+                problems.append("a complete window has no failure")
+        else:  # failed, timeout: not measured, so no success metrics
+            if (self.succeeded, self.success_rate, self.p95_latency_ms) != (None, None, None):
+                problems.append(f"a {self.state} window carries no success metrics")
+            if self.failure is None:
+                problems.append(f"a {self.state} window needs its failure reason")
         if self.scheduled > self.size:
             problems.append(f"scheduled {self.scheduled} > size {self.size}")
         if self.min_successes > self.size:
@@ -603,9 +617,8 @@ def _evidence_problems(r: RunRecordV1) -> list[str]:
                     p.append(f"totals.{key} is {getattr(t, key)}, the steps give {derived}")
         elif t.tokens_in is not None or t.tokens_out is not None:
             p.append("token totals without a trajectory")
-        span = (r.finalized_at - r.started_at).total_seconds()
-        if not math.isclose(t.wall_seconds, max(0.0, span), rel_tol=0.0, abs_tol=1e-6):
-            p.append(f"totals.wall_seconds {t.wall_seconds} != finalized_at - started_at")
+        # wall_seconds is monotonic elapsed time, deliberately not wall-clock subtraction
+        # (closeout item 1b), so there is nothing to cross-check it against here.
     if r.shadow_gates is not None and r.proposal is not None:
         if not math.isclose(
             r.shadow_gates.confidence.confidence, r.proposal.confidence, rel_tol=0.0, abs_tol=1e-12
@@ -620,6 +633,10 @@ def _evidence_problems(r: RunRecordV1) -> list[str]:
         ):
             p.append("confidence_deficit is not 1 - the proposal's confidence (§11.5)")
     o = r.outcome
+    if o is not None and o.harmful is not None and not r.discarded and o.harm_violations is None:
+        # §11.7: harmful means at least one violation. A measured verdict on a completed run
+        # carries its evidence, so the headline number is auditable (closeout item 5).
+        p.append("a completed run's measured harmful needs its harm_violations (§11.7)")
     if o is not None and o.harmful is not None and o.harm_violations is not None:
         if o.harmful != bool(o.harm_violations):
             p.append("harmful must be true exactly when there is at least one violation (§11.7)")
@@ -641,8 +658,8 @@ def record_problems(r: RunRecordV1) -> list[str]:
     p: list[str] = []
     present = {name: getattr(r, name) is not None for name in _CORE_CHAIN}
 
-    if r.finalized_at < r.started_at:
-        p.append("finalized_at is before started_at")
+    # No ordering rule for started_at / finalized_at: a run that crossed a wall-clock step
+    # is kept and flagged later (decision 0017 §6), never rejected (closeout item 1a).
 
     # Monotonic presence along the core chain.
     for i, later in enumerate(_CORE_CHAIN):
@@ -844,12 +861,19 @@ def record_problems(r: RunRecordV1) -> list[str]:
 SCHEMA_VERSIONS: dict[int, type[RunRecordV1]] = {1: RunRecordV1}
 
 
+def _reject_constant(name: str):
+    """NaN, Infinity and -Infinity are not JSON. Python's parser accepts them, and Pydantic's
+    allow_inf_nan doesn't reach Any payloads (trajectory results, model_parameters), so
+    they are refused here, before validation (closeout item 2)."""
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
 def validate_record_json(text: str) -> RunRecordV1:
     """Parse and validate one record, against exactly its declared version."""
     try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RecordValidationError(f"not JSON: {exc}") from exc
+        raw = json.loads(text, parse_constant=_reject_constant)
+    except ValueError as exc:  # JSONDecodeError, or a non-standard constant
+        raise RecordValidationError(f"not standard JSON: {exc}") from exc
     if not isinstance(raw, dict):
         raise RecordValidationError("a run record is a JSON object")
     version = raw.get("schema_version")

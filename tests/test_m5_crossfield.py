@@ -348,7 +348,6 @@ SWEEP = {
         ["Service/orders-svc: changed"],
     ),
     "token total disagrees with steps": (("totals", "tokens_in"), 9999),
-    "wall seconds disagree with the timestamps": (("totals", "wall_seconds"), 12345.0),
     "confidence shadow scalar is not the proposal's": (
         ("shadow_gates", "confidence", "confidence"),
         0.5,

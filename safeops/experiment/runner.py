@@ -11,6 +11,7 @@ tests/test_run_sequence.py enforces that.
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import UTC, datetime
 
@@ -91,6 +92,7 @@ class ExperimentRunner:
         self._topology = None
         self._wall_clock = lambda: datetime.now(UTC)
         self._new_run_id = uuid.uuid4
+        self._monotonic = time.monotonic  # elapsed time; never serialized
 
     def run(self, unit: RunUnit) -> None:
         """One attempted run. Exactly one record per attempted unit (decision 0017 §1, R1),
@@ -112,6 +114,8 @@ class ExperimentRunner:
             "run_id": run_id,
             "unit": unit,
             "started_at": self._wall_clock(),
+            # Harness-internal: only the elapsed duration derived from it is recorded.
+            "_monotonic_start": self._monotonic(),
             "provenance": self.records.capture_provenance(unit),
             "action_attempted": False,
         }
@@ -294,6 +298,9 @@ class ExperimentRunner:
 
     def _finalize(self, data: dict, discard: Discard | None = None):
         fields = {k: v for k, v in data.items() if k in RECORD_FIELDS}
+        # Elapsed real time from the monotonic clock: immune to wall-clock steps, and the
+        # raw samples stay here (closeout item 1b).
+        fields["wall_seconds"] = self._monotonic() - data["_monotonic_start"]
         return self.records.finalize(**fields, discard=discard)
 
     @staticmethod

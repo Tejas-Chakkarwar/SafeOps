@@ -293,3 +293,22 @@ The tests are in the "final review" section of `tests/test_m5_crossfield.py`. A 
 - A hard ordering rule would reject a run that crossed such a step, which moves it to `rejected/` and out of the dataset.
 - Those are exactly the runs decision 0017 §6 wants kept and flagged, through the two-reading host and cluster clock comparison at Milestones 6 and 12.
 - So ordering is a Milestone 12 flag, never a v1 validation rule.
+
+## Amendment, 2026-11-20: Milestone 5 closeout
+
+These are the last schema and writer fixes before Milestone 5 closes. Runner control flow and Kubernetes behavior are unchanged. The tests are in `tests/test_m5_closeout.py`. A mutation check removed each rule (11 mutations), and every one failed a test. One survived at first, because an older rule caught the same case, and its test was made self-consistent until only the new rule could reject it.
+
+1. **Timestamps.**
+   - **Wall-clock ordering is not a validation rule.** The `finalized_at < started_at` rejection is gone. A run that crosses a backwards wall-clock step stays in the dataset, so decision 0017 §6's clock analysis can flag it. `started_at` and `finalized_at` remain ordinary wall-clock timestamps, and a backwards step is derivable from them, so there's no extra field for it. This is beside the earlier "timestamp ordering deliberately unconstrained" entry.
+   - **`wall_seconds` is elapsed real time from a monotonic clock.** The runner samples `time.monotonic()` once at run start, next to `started_at` and `run_id`, and again when the record is finalized. It passes only the difference to the writer.
+     - The raw samples are harness-internal state: not in schema v1, not in `RECORD_FIELDS`, never serialized.
+     - `wall_seconds` keeps its name, because it already meant elapsed real time, as opposed to CPU or model time.
+     - It is not cross-checked against `finalized_at − started_at`, and it is never clamped. A negative monotonic duration means the clock source is broken, so it fails loudly instead of being recorded as `0.0`.
+2. **Strict JSON.** `validate_record_json` parses with `parse_constant` set to refuse `NaN`, `Infinity` and `-Infinity` before model validation. Python's parser accepts them, and Pydantic's `allow_inf_nan` doesn't reach `Any` payloads (`trajectory[].result`, `provenance.model_parameters`). They are refused as malformed, never converted.
+3. **`SteadyState.state` has a fixed field shape** on the model, so it applies to every record that carries a window, matching `workload.py` and decision 0009:
+   - **`complete`:** `scheduled == size`, `succeeded` and `success_rate` non-null, `failure` null.
+   - **`failed` and `timeout`:** `succeeded`, `success_rate` and `p95_latency_ms` null, and `failure` non-null. An unmeasured window carries no success metrics.
+
+   The fixed-denominator rule (`success_rate == succeeded / size`) is unchanged. The baseline threshold remains a completed-run policy rule, not a model rule.
+4. **`started_at` is required, and the writer never fabricates it.** A missing `started_at` raises "run record requires started_at captured at run start". `finalized_at` is never substituted. `wall_seconds` is required the same way. The wall timestamps and the elapsed duration are independent pieces of run state.
+5. **A measured `harmful` on a completed run carries its evidence.** `harm_violations` must be non-null whenever `harmful` is measured on a completed run, and `harmful` must be true exactly when that list is non-empty (§11.7: "at least one violation"). So the safety headline number can be audited from the immutable record. Discarded runs, which have no outcome, aren't affected. Nothing equivalent applies to `effective`, which isn't defined by an evidence list.

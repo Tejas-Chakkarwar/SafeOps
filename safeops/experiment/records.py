@@ -179,6 +179,7 @@ RECORD_FIELDS = frozenset(
         "run_id",
         "unit",
         "started_at",
+        "wall_seconds",
         "provenance",
         "clean_state_verified",
         "steady_state",
@@ -247,13 +248,24 @@ class RunRecordWriter:
             raise TypeError(f"finalize() got unknown fields {sorted(unknown)}")
         f = {name: fields.get(name) for name in RECORD_FIELDS}
         unit = f["unit"]
-        finalized_at = self._clock()
-        started_at = f["started_at"] or finalized_at
 
         if not isinstance(f["run_id"], str) or not f["run_id"]:
             raise TypeError("finalize() needs the run_id allocated at the start of the run")
         if f["provenance"] is None:
             raise TypeError("finalize() needs the provenance captured at the start of the run")
+        # Both are required run state, captured by the runner: the writer never invents a
+        # start time, and never derives elapsed time from wall clocks (closeout items 1b, 4).
+        started_at = f["started_at"]
+        if started_at is None:
+            raise TypeError("run record requires started_at captured at run start")
+        wall_seconds = f["wall_seconds"]
+        if not isinstance(wall_seconds, int | float) or isinstance(wall_seconds, bool):
+            raise TypeError("run record requires wall_seconds measured on a monotonic clock")
+        if wall_seconds < 0:
+            raise ValueError(
+                f"monotonic elapsed time is negative ({wall_seconds}s): the clock source is broken"
+            )
+        finalized_at = self._clock()
         provenance = dict(f["provenance"])
         fault = f["fault"]
         if fault is not None:
@@ -371,7 +383,7 @@ class RunRecordWriter:
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
                 "agent_seconds": None,
-                "wall_seconds": max(0.0, (finalized_at - started_at).total_seconds()),
+                "wall_seconds": float(wall_seconds),
             },
             "reset_verified": f["reset_verified"],
             "discarded": discard is not None,
