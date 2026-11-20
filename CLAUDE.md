@@ -23,7 +23,7 @@ Completed:
 - Milestone 2 (`cdc9178`, review fixes `c3db4ef`, closeout `d5609eb`). Decisions 0006–0011.
 - Milestone 3 (`4e7b76d`, review fixes `f6a7173`, `e7c50ca`, third-review fixes `de48670`). Decisions 0012–0013.
 - Milestone 4 (`84dbf5c`, review fixes `e4f353e`, second-review fixes `137fad4`, closeout `e4893e5`). Decisions 0014–0017; amendments to 0009 and 0015.
-- Milestone 5 (`f287643`, review fixes `8731c17`, second-review fixes `a78eeaa`, fix list `74c9b37`, cross-field fixes `6a557f6`, final-review fixes `45fd43d`, closeout `14b0b87`). Decision 0018 and its amendments; 0017 §1, §6, §7 resolved or recorded.
+- Milestone 5 (`f287643`, review fixes `8731c17`, second-review fixes `a78eeaa`, fix list `74c9b37`, cross-field fixes `6a557f6`, final-review fixes `45fd43d`, closeout `14b0b87`, final cleanup `b5da642`). Decision 0018 and its amendments; 0017 §1, §6, §7 resolved or recorded.
 
 Update this line as milestones complete. Work on the current milestone only. The design document lists 17; do not run ahead. Milestone N's acceptance criterion must pass before N+1 starts.
 
