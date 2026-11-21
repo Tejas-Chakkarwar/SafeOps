@@ -1,5 +1,7 @@
 # SafeOps
 
+[![ci](https://github.com/Tejas-Chakkarwar/SafeOps/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Tejas-Chakkarwar/SafeOps/actions/workflows/ci.yml)
+
 **Risk-aware remediation for AI incident-response agents in Kubernetes.**
 
 SafeOps is an incident-response system in which an AI agent investigates an alert with read-only tools, diagnoses the problem, and proposes a fix. Before that fix touches the cluster, a **safety gate** scores its operational risk and decides to execute it or escalate it to a human. Afterwards, two independent checks run: did the service recover (*effective*), and did the action cause new damage (*harmful*)?
