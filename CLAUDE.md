@@ -85,6 +85,7 @@ make bootstrap-scope # re-render pinned charts into config/bootstrap_scope.yaml;
 make test            # offline pytest; never touches a cluster
 make cluster-test    # live RBAC and harness-path tests; needs make cluster-up
 make lint
+python scripts/check_repo_policy.py --base <rev> --head <rev>  # frozen design, artifact hygiene, decision numbering (decision 0019; CI runs it)
 safeops steady-state # start load, measure one 300-attempt window, stop (decision 0009)
 safeops workload-stop # stop a generator a dead run left running; never while a run is active
 safeops reset [--times N] # reset the testbed to desired state, then verify (decision 0013)
@@ -103,7 +104,8 @@ safeops snapshot     # capture/inspect a canonical snapshot
 
 | Path | Notes |
 |---|---|
-| `safeops/` | The project. All new code goes here. |
+| `safeops/` | The project. All experiment and runtime code goes here. |
+| `scripts/` | Repository-development and policy tooling (`check_repo_policy.py`, decision 0019). Not part of the SafeOps experiment or runtime, and excluded from run-record provenance. |
 | `config/` | Version-controlled: topology, desired state, weights, ranges, pricing. Changing any of these changes the experimental condition. |
 | `faults/`, `invariants/` | YAML declarations, not code. |
 | `docs/decisions/` | One file per decision. Every threshold, timeout, weight, and bound gets a reason. |

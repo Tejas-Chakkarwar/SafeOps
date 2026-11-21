@@ -1,0 +1,83 @@
+# SafeOps CI (decision 0019): offline checks and repository policy only. Live cluster
+# tests stay a deliberate milestone-boundary action and never run here.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Nothing here writes to the repository. CI follows the same least privilege as the
+# runtime system: no job gets ambient write access.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: clean-checkout test and lint
+    runs-on: ubuntu-24.04
+    env:
+      # Use uv's own CPython for the .python-version pin (3.12), never the runner's
+      # incidental interpreter. The pinned uv version fixes which 3.12 build that is.
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      # External actions are pinned to full commit SHAs; updating one is a deliberate change.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.9"
+          # No cache: this job proves a fresh clone reproduces the checks from Git alone.
+          enable-cache: false
+
+      # Local `make sync` may re-resolve dependencies while you deliberately change them.
+      # This job claims clean-checkout reproducibility, so it first proves the committed
+      # uv.lock already matches pyproject.toml; otherwise a forgotten lock would pass after
+      # uv silently resolved a new dependency graph.
+      - name: Check uv.lock matches pyproject.toml
+        run: uv lock --check
+
+      - name: Install (the documented bootstrap)
+        run: make sync
+
+      - name: Show and assert the interpreter
+        run: |
+          uv run python -c "import sys; print(sys.version); print(sys.executable)"
+          uv run python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version"
+
+      - name: Offline tests
+        run: make test
+
+      - name: Lint (ruff check and ruff format --check)
+        run: make lint
+
+  repository-policy:
+    name: repository policy
+    runs-on: ubuntu-24.04
+    steps:
+      # Full history: the frozen-design check must reach the supplied base commit. A
+      # shallow clone that lacked it would fail closed, a checkout error posing as a
+      # policy failure.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Event values reach the shell only through env, never interpolated into the script.
+      - name: Check repository policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          else
+            base="$PUSH_BEFORE"; head="$PUSH_AFTER"
+          fi
+          # The checker validates the range itself and fails closed on an empty, all-zero
+          # or unknown revision; nothing here may turn that into a pass.
+          python3 scripts/check_repo_policy.py --base "$base" --head "$head"
