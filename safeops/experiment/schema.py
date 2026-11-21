@@ -23,17 +23,27 @@ import json
 import math
 from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import AwareDatetime, Field, ValidationError, model_validator
 
+# The agent-side types are the neutral runtime domain types (decision 0020): the same
+# classes the agent, parser, extractor and gates use, reused here, never duplicated.
+from safeops.domain import (  # noqa: F401  (re-exported: the record's agent-side fields)
+    ActionTarget,
+    FeatureVector,
+    NonNegInt,
+    Proposal,
+    RecommendedAction,
+    Sha256,
+    ShadowGates,
+    TrajectoryStep,
+    UnitInterval,
+)
+from safeops.domain import StrictModel as _Strict
 from safeops.enums import ActionType, ExecutionStatus, ProposalStatus, RunStage
 from safeops.experiment.records import MAX_DISCARD_ERROR, MAX_LAST_CHANGES
 from safeops.experiment.unit import FAULT_ID_PATTERN, MAX_FAULT_SEED, MAX_TRIAL_INDEX
 
 SCHEMA_VERSION = 1
-
-Sha256 = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
-UnitInterval = Annotated[float, Field(ge=0.0, le=1.0)]
-NonNegInt = Annotated[int, Field(ge=0)]
 
 # Where a discarded run stopped. Run stages are the closed RunStage enum (M5 review,
 # item 2); these two tuples must partition it exactly, which a test checks against the
@@ -98,11 +108,6 @@ Category = Literal[
 
 class RecordValidationError(ValueError):
     """A run record that doesn't match its declared schema version."""
-
-
-class _Strict(BaseModel):
-    # allow_inf_nan=False: NaN and infinities are refused everywhere (review finding 6).
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True, allow_inf_nan=False)
 
 
 class Unit(_Strict):
@@ -246,48 +251,6 @@ class Alert(_Strict):
     fired_at: AwareDatetime
 
 
-class TrajectoryStep(_Strict):
-    step: Annotated[int, Field(ge=1)]
-    tool: str
-    args: dict[str, Any]
-    result: Any
-    result_digest: Sha256
-    tokens_in: NonNegInt | None
-    tokens_out: NonNegInt | None
-    latency_ms: Annotated[float, Field(ge=0.0)] | None
-
-
-class ActionTarget(_Strict):
-    kind: str
-    ns: str
-    name: str
-
-
-class RecommendedAction(_Strict):
-    type: ActionType
-    target: ActionTarget
-    params: dict[str, Any]
-
-
-class Proposal(_Strict):
-    diagnosis: str
-    recommended_action: RecommendedAction | None
-    confidence: UnitInterval
-    evidence: list[NonNegInt]
-    prerequisites_claimed: list[str]
-
-
-class FeatureVector(_Strict):
-    irreversibility: UnitInterval
-    blast_radius: UnitInterval
-    persistence_risk: UnitInterval
-    scope_outside_target: UnitInterval
-    confidence_deficit: UnitInterval
-    evidence_insufficiency: UnitInterval
-    prerequisites_unverified: UnitInterval
-    telemetry_conflict: UnitInterval
-
-
 class Gate(_Strict):
     """The online gate. Phase A is always-act by construction (§10.2): it decides execute,
     carries no score, and is the only policy that can control execution. Every other
@@ -296,24 +259,6 @@ class Gate(_Strict):
     strategy: Literal["always-act"]
     decision: Literal["execute"]
     score: None
-
-
-class _RiskScore(_Strict):
-    risk_score: UnitInterval
-
-
-class _Confidence(_Strict):
-    confidence: UnitInterval
-
-
-class _Draw(_Strict):
-    draw: UnitInterval
-
-
-class ShadowGates(_Strict):
-    safeops: _RiskScore
-    confidence: _Confidence
-    random: _Draw
 
 
 class ExecutionStep(_Strict):

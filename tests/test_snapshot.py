@@ -268,7 +268,7 @@ def test_diff_reports_missing_unexpected_and_changed() -> None:
 
 def test_snapshot_json_roundtrip_and_digest() -> None:
     s = desired_snapshot()
-    again = snap.Snapshot.from_json(s.to_json())
+    again = snap.Snapshot.from_persisted_json(s.to_persisted_json())
     assert snap.diff(s, again) == [] and again.digest() == s.digest()
 
 

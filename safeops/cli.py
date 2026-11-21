@@ -213,14 +213,14 @@ def _cluster_errors():
 
 @app.command()
 def snapshot() -> None:
-    """Print the canonical snapshot of the testbed (JSON) and its digest."""
+    """Print the testbed's snapshot (versioned JSON) and its canonical digest."""
     from safeops.environment.manager import EnvironmentManager
 
     try:
         snap = EnvironmentManager().capture_snapshot()
     except _cluster_errors() as exc:
         _fail("snapshot", str(exc), EXIT_CLUSTER)
-    typer.echo(snap.to_json())
+    typer.echo(snap.to_persisted_json())  # carries its projection version (decision 0020)
     typer.echo(f"digest: {snap.digest()}", err=True)
 
 

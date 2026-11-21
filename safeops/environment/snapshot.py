@@ -28,7 +28,10 @@ import math
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-PROJECTED_KINDS = ("Deployment", "Service", "ConfigMap", "StatefulSet", "PersistentVolumeClaim")
+# One definition, owned by safeops.topology: the ownership map, the snapshot and clean-state
+# verification must all mean the same set of kinds (decision 0020). Re-exported here.
+from safeops.topology import PROJECTED_KINDS  # noqa: F401
+
 # Created by Kubernetes in every namespace; not part of the testbed (same rule as ownership).
 IGNORED = frozenset({("ConfigMap", "kube-root-ca.crt")})
 SNAPSHOT_PROJECTION_VERSION = 2  # 2: full Probe projection + startupProbe (0013)
@@ -329,25 +332,53 @@ def endpoints_for(
 
 @dataclass(frozen=True)
 class Snapshot:
-    """{(kind, name): canonical state}. Compare with diff(); identity via digest()."""
+    """{(kind, name): canonical state}. Compare with diff(); identity via digest().
+
+    Two serializations, deliberately separate (decision 0020):
+    - to_json() is the canonical resource form that digest() hashes. It is unchanged, so
+      every recorded snapshot hash and desired_state_hash keeps its meaning.
+    - to_persisted_json() / from_persisted_json() are for storage. They carry the
+      projection version, and loading refuses any other version, or none: old snapshot
+      data is never silently stamped with the current version.
+    """
 
     resources: dict = field(default_factory=dict)
     projection_version: int = SNAPSHOT_PROJECTION_VERSION
 
+    def _canonical(self) -> dict:
+        return {f"{k}/{n}": v for (k, n), v in sorted(self.resources.items())}
+
     def to_json(self) -> str:
-        return json.dumps(
-            {f"{k}/{n}": v for (k, n), v in sorted(self.resources.items())},
-            sort_keys=True,
-            indent=2,
-        )
+        return json.dumps(self._canonical(), sort_keys=True, indent=2)
 
     def digest(self) -> str:
         return "sha256:" + hashlib.sha256(self.to_json().encode()).hexdigest()
 
+    def to_persisted_json(self) -> str:
+        return json.dumps(
+            {"projection_version": self.projection_version, "resources": self._canonical()},
+            sort_keys=True,
+            indent=2,
+        )
+
     @classmethod
-    def from_json(cls, text: str) -> Snapshot:
+    def from_persisted_json(cls, text: str) -> Snapshot:
         raw = json.loads(text)
-        return cls({tuple(key.split("/", 1)): value for key, value in raw.items()})
+        if not isinstance(raw, dict) or set(raw) != {"projection_version", "resources"}:
+            raise ValueError(
+                "not a persisted snapshot: expected {projection_version, resources}"
+                " (an unversioned snapshot is refused, never assigned the current version)"
+            )
+        version = raw["projection_version"]
+        if version != SNAPSHOT_PROJECTION_VERSION or isinstance(version, bool):
+            raise ValueError(
+                f"snapshot projection version {version!r} is not the current"
+                f" {SNAPSHOT_PROJECTION_VERSION}; re-capture it instead of reinterpreting it"
+            )
+        return cls(
+            {tuple(key.split("/", 1)): value for key, value in raw["resources"].items()},
+            projection_version=version,
+        )
 
 
 def build(
@@ -381,7 +412,13 @@ def build(
 
 
 def diff(expected: Snapshot, actual: Snapshot) -> list[str]:
-    """Human-readable differences; empty means semantically identical."""
+    """Human-readable differences. Empty exactly when the digests are equal (decision 0020):
+    the comparator and the canonical hash mean the same identity."""
+    if expected.projection_version != actual.projection_version:
+        raise ValueError(
+            f"can't compare projection versions {expected.projection_version} and"
+            f" {actual.projection_version}"
+        )
     problems = []
     for key in sorted(set(expected.resources) | set(actual.resources)):
         label = f"{key[0]}/{key[1]}"
@@ -398,11 +435,23 @@ def _diff_values(path: str, a, b) -> list[str]:
     if isinstance(a, dict) and isinstance(b, dict):
         out = []
         for k in sorted(set(a) | set(b), key=str):
-            out.extend(_diff_values(f"{path}.{k}", a.get(k), b.get(k)))
+            # Key membership is explicit: a key present with None is not a missing key.
+            if k not in b:
+                out.append(f"{path}.{k}: missing (expected {a[k]!r})")
+            elif k not in a:
+                out.append(f"{path}.{k}: unexpected (got {b[k]!r})")
+            else:
+                out.extend(_diff_values(f"{path}.{k}", a[k], b[k]))
         return out
     if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
         out = []
         for i, (x, y) in enumerate(zip(a, b, strict=True)):
             out.extend(_diff_values(f"{path}[{i}]", x, y))
         return out
-    return [] if a == b else [f"{path}: expected {a!r}, got {b!r}"]
+    # Leaves compare the way the digest sees them: as canonical JSON. Python's == would
+    # call 1, 1.0 and True equal although their JSON, and so the digest, differs.
+    return [] if _canon(a) == _canon(b) else [f"{path}: expected {a!r}, got {b!r}"]
+
+
+def _canon(value) -> str:
+    return json.dumps(value, sort_keys=True)

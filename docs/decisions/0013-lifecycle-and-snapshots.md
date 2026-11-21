@@ -196,3 +196,11 @@ The regression tests are in the "third review" section of `tests/test_m3_review.
   - Before capturing the post-fault snapshot, poll the canonical projection until it is identical across two consecutive polling intervals, within a bounded timeout.
   - If it doesn't settle, record and flag the unsettled condition. Never silently treat an arbitrary mid-rollout snapshot as a clean harm baseline.
 - **No per-fault declarations.** The property is observed from cluster state, never maintained as another list in the fault catalog.
+
+## Amendment, 2026-11-20: cross-milestone seam review (decision 0020)
+
+- **`diff()` and `digest()` now define the same identity:** `diff(a, b) == []` exactly when `a.digest() == b.digest()`.
+  - Before, a key present with `None` and a missing key compared as equal, and so did `1`, `1.0` and `True`, although their digests differed.
+  - The comparator now tests key membership explicitly and compares leaves as canonical JSON.
+- **`PROJECTED_KINDS` has one definition,** in `safeops/topology.py`; the snapshot module re-exports it.
+- **Persisted snapshots carry their projection version.** `to_persisted_json()` and `from_persisted_json()` refuse any other version, or none. `to_json()`, and the `digest()` over it, is unchanged, so every existing snapshot hash keeps its meaning. `safeops snapshot` prints the versioned form.

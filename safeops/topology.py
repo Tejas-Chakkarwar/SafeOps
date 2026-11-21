@@ -19,8 +19,9 @@ from types import MappingProxyType
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOPOLOGY_PATH = REPO_ROOT / "config" / "topology.yaml"
 
-# Kinds the canonical snapshot projects (design §11.1). The ownership map must resolve
-# every testbed object of these kinds, and nothing else.
+# Kinds the canonical snapshot projects (design §11.1). The single definition (decision
+# 0020): safeops.environment.snapshot, clean-state verification and bootstrap all import
+# this one. The ownership map must resolve every testbed object of these kinds.
 PROJECTED_KINDS = ("Deployment", "Service", "ConfigMap", "StatefulSet", "PersistentVolumeClaim")
 RANGED_FIELDS = ("replicas", "memory_mib", "cpu_millis")
 

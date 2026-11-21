@@ -1,8 +1,15 @@
-"""Information wall (design §6, Rule 1): agent, features and gate never import safeops.faults.
+"""Information wall (design §6, Rule 1; decision 0020): the agent, the feature extractor
+and the gates never reach evaluator or harness state.
 
-The check is transitive. If the agent imports a module that imports safeops.faults, that
-leaks ground truth just as a direct import would. Dynamic imports (importlib) are not
-caught, so don't use them in those packages.
+The boundary is by namespace. Everything under a FORBIDDEN root is evaluator or harness
+code: fault ground truth (safeops.faults), the experimental unit, runner and run records
+(safeops.experiment), verdicts (safeops.verify), the harness credential and measurement
+path (safeops.environment), the admin credential (safeops.bootstrap), and analysis over
+records (safeops.analysis). Protected code consumes only neutral modules instead:
+safeops.context, safeops.domain, safeops.enums and safeops.topology.
+
+The check is transitive, follows relative imports, and sees imports inside function bodies.
+Dynamic imports (importlib) are not caught, so don't use them in those packages.
 """
 
 from __future__ import annotations
@@ -11,9 +18,24 @@ import ast
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# safeops.context is the neutral module those packages consume (Alert, IncidentRuntimeContext).
-PROTECTED = ("safeops.agent", "safeops.features", "safeops.gate", "safeops.context")
-FORBIDDEN = "safeops.faults"
+# The protected packages, plus the neutral modules they consume: those must stay neutral too.
+PROTECTED = (
+    "safeops.agent",
+    "safeops.features",
+    "safeops.gate",
+    "safeops.context",
+    "safeops.domain",
+    "safeops.enums",
+    "safeops.topology",
+)
+FORBIDDEN = (
+    "safeops.faults",
+    "safeops.experiment",
+    "safeops.verify",
+    "safeops.environment",
+    "safeops.bootstrap",
+    "safeops.analysis",
+)
 
 
 def _module_index(root: Path, top: str) -> dict[str, Path]:
@@ -63,14 +85,46 @@ def reachable_modules(root: Path, top: str, roots: tuple[str, ...]) -> set[str]:
     return seen
 
 
-def _leaks(reachable: set[str], forbidden: str) -> set[str]:
-    return {m for m in reachable if m == forbidden or m.startswith(forbidden + ".")}
+def _leaks(reachable: set[str], forbidden: tuple[str, ...] | str) -> set[str]:
+    roots = (forbidden,) if isinstance(forbidden, str) else forbidden
+    return {m for m in reachable for f in roots if m == f or m.startswith(f + ".")}
 
 
 def test_protected_packages_exist() -> None:
     index = _module_index(REPO_ROOT, "safeops")
     for pkg in PROTECTED:
         assert pkg in index, f"{pkg} missing, so the wall test would pass vacuously"
+
+
+def test_forbidden_roots_exist() -> None:
+    """The mirror of the test above: a renamed or deleted forbidden root would make the wall
+    pass vacuously."""
+    index = _module_index(REPO_ROOT, "safeops")
+    for root in FORBIDDEN:
+        assert root in index, f"{root} missing, so the wall test would pass vacuously"
+
+
+def test_ground_truth_modules_are_behind_the_wall() -> None:
+    """The modules that hold evaluator ground truth today, named so a move is noticed."""
+    for module in (
+        "safeops.faults.spec",
+        "safeops.faults.injector",
+        "safeops.experiment.unit",  # RunUnit: fault_id, fault_seed, trial_index
+        "safeops.experiment.schema",
+        "safeops.experiment.records",
+        "safeops.environment.workload",  # the evaluator's measurement path
+    ):
+        assert _leaks({module}, FORBIDDEN), f"{module} is outside every forbidden root"
+
+
+def test_neutral_types_are_reachable_without_a_leak() -> None:
+    """Protected code may use the shared domain types; that must not open the wall."""
+    reachable = reachable_modules(REPO_ROOT, "safeops", ("safeops.domain",))
+    assert "safeops.domain" in reachable and not _leaks(reachable, FORBIDDEN)
+    from safeops.domain import FeatureVector
+    from safeops.experiment.schema import FeatureVector as RecordFeatureVector
+
+    assert FeatureVector is RecordFeatureVector  # one model, reused, never duplicated
 
 
 def test_agent_features_gate_never_reach_faults() -> None:
@@ -96,3 +150,56 @@ def test_wall_checker_catches_transitive_and_relative_imports(tmp_path: Path) ->
 
     assert _leaks(reachable_modules(tmp_path, "safeops", ("safeops.agent",)), FORBIDDEN)
     assert not _leaks(reachable_modules(tmp_path, "safeops", ("safeops.gate",)), FORBIDDEN)
+
+
+def _fake_tree(tmp_path: Path, files: dict[str, str]) -> Path:
+    pkg = tmp_path / "safeops"
+    for sub in ("agent", "features", "gate", "tools", "faults", "experiment", "environment"):
+        (pkg / sub).mkdir(parents=True, exist_ok=True)
+        (pkg / sub / "__init__.py").write_text("")
+    (pkg / "__init__.py").write_text("")
+    for rel, text in files.items():
+        (pkg / rel).write_text(text)
+    return tmp_path
+
+
+def test_every_forbidden_root_is_caught_directly(tmp_path: Path) -> None:
+    root = _fake_tree(
+        tmp_path,
+        {
+            "experiment/unit.py": "class RunUnit: ...\n",
+            "environment/workload.py": "X = 1\n",
+            "agent/loop.py": "from safeops.experiment.unit import RunUnit\n",
+            "gate/always_act.py": "import safeops.environment.workload\n",
+        },
+    )
+    leaked = _leaks(reachable_modules(root, "safeops", ("safeops.agent",)), FORBIDDEN)
+    assert {"safeops.experiment", "safeops.experiment.unit"} <= leaked
+    assert _leaks(reachable_modules(root, "safeops", ("safeops.gate",)), FORBIDDEN)
+
+
+def test_a_lazy_import_inside_a_function_is_caught(tmp_path: Path) -> None:
+    root = _fake_tree(
+        tmp_path,
+        {
+            "experiment/unit.py": "class RunUnit: ...\n",
+            "features/extractor.py": (
+                "def extract():\n"
+                "    from safeops.experiment.unit import RunUnit\n"
+                "    return RunUnit\n"
+            ),
+        },
+    )
+    assert _leaks(reachable_modules(root, "safeops", ("safeops.features",)), FORBIDDEN)
+
+
+def test_a_relative_import_of_the_experiment_is_caught(tmp_path: Path) -> None:
+    root = _fake_tree(
+        tmp_path,
+        {
+            "experiment/unit.py": "class RunUnit: ...\n",
+            "tools/helper.py": "from ..experiment import unit\n",
+            "agent/loop.py": "from safeops.tools import helper\n",
+        },
+    )
+    assert _leaks(reachable_modules(root, "safeops", ("safeops.agent",)), FORBIDDEN)

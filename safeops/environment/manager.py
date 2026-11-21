@@ -421,7 +421,9 @@ class EnvironmentManager:
             polls += 1
             step = tuple(snap.diff(previous, current))
             if not step and previous.digest() != current.digest():
-                step = ("canonical digest changed",)  # belt and braces over diff()
+                # Belt and braces: diff() and the digest define the same identity (decision
+                # 0020), so this never fires; it would catch a future comparator regression.
+                step = ("canonical digest changed",)
             if step:
                 changes = step  # the most recent change, kept even if later polls match
             identical = identical + 1 if not step else 1
