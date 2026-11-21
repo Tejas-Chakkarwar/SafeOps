@@ -1,0 +1,14 @@
+SafeOps
+Copyright 2026 Tejas Chakkarwar
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Developed as an MS Computer Science project at San Jose State University
+(CS297/CS298, advisor Prof. Robert Chun).
+
+Third-party software that SafeOps installs or runs (Python packages locked in
+uv.lock, the testbed's pinned container images, and the Chaos Mesh and
+Prometheus Helm charts) is used under its own license and is not
+redistributed in this repository. The repositories listed in Appendix A of
+docs/safeops-design.md are read as research references only; they are not
+part of this repository (reference/ is never tracked).
