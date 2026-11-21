@@ -355,6 +355,71 @@ def test_injected_endpoint_slice_is_flagged_quickly_and_removed_by_reset(env) ->
     assert after.clean, after.problems
 
 
+# --- whole-project hardening (decision 0021) ---
+
+
+def test_clean_node_qdisc_inspection_sees_namespaces_and_no_failure(env) -> None:
+    """The fail-closed guard is silent on a clean node, and the clean answer is real: the
+    script actually inspected namespaces and reported no failure marker."""
+    from safeops.environment import node as node_mod
+
+    out = node_sh(node_mod._QDISC_SCRIPT)
+    assert node_mod.QDISC_ERROR_MARKER not in out
+    namespaces = {ln.split()[0] for ln in out.splitlines() if " qdisc " in ln}
+    assert len(namespaces) >= 6, f"inspected only {len(namespaces)} network namespaces"
+    assert env._nodes().qdisc_residue() == []
+
+
+def test_planted_tbf_with_no_chaos_object_fails_verify(env) -> None:
+    pid = pod_pid("inventory")
+    node_sh(
+        f"nsenter -t {pid} -n tc qdisc add dev eth0 root tbf rate 1mbit burst 32kbit latency 400ms"
+    )
+    try:
+        assert not json.loads(admin("get", "networkchaos", "-n", NS, "-o", "json"))["items"]
+        result = env.verify_clean_state()
+        assert not result.clean
+        assert any("tbf qdisc" in p for p in result.problems), result.problems
+    finally:
+        node_sh(f"nsenter -t {pid} -n tc qdisc del dev eth0 root")
+    assert env.verify_clean_state().clean
+
+
+def test_rogue_legacy_endpoints_is_flagged_removed_and_not_mirrored(env) -> None:
+    """A hand-made core/v1 Endpoints is dirty; reset deletes it (the harness can, by RBAC);
+    it produces no EndpointSlice, so the canonical projection doesn't see it (0021 §2)."""
+    before = env.capture_snapshot().digest()
+    admin(
+        "apply",
+        "-f",
+        "-",
+        stdin=(
+            "apiVersion: v1\nkind: Endpoints\n"
+            f"metadata: {{name: h21-rogue-ep, namespace: {NS}}}\n"
+            "subsets: [{addresses: [{ip: 10.0.0.98}], ports: [{name: http, port: 8080}]}]\n"
+        ),
+    )
+    try:
+        time.sleep(5)  # give the EndpointSliceMirroring controller time to act, if it would
+        slices = json.loads(admin("get", "endpointslices", "-n", NS, "-o", "json"))["items"]
+        mirrored = [
+            s["metadata"]["name"]
+            for s in slices
+            if (s["metadata"].get("labels") or {}).get("kubernetes.io/service-name")
+            == "h21-rogue-ep"
+        ]
+        assert mirrored == [], f"the rogue Endpoints was mirrored into {mirrored}"
+        assert env.capture_snapshot().digest() == before  # the projection is unaffected
+        result = env.verify_clean_state()
+        assert "Endpoints/h21-rogue-ep: unexpected object in the testbed" in result.problems
+        env.reset_environment()
+        assert not admin("get", "endpoints", "h21-rogue-ep", "-n", NS, "--ignore-not-found")
+        after = env.verify_clean_state()
+        assert after.clean, after.problems
+    finally:
+        admin("delete", "endpoints", "h21-rogue-ep", "-n", NS, "--ignore-not-found")
+
+
 # --- reset -> verify passes 10 times in a row ---
 
 

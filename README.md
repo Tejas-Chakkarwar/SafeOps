@@ -63,7 +63,7 @@ Every `kubectl` and `helm` call passes an explicit context, and a guard refuses 
 **Offline**, with no cluster needed:
 
 ```bash
-make sync    # install from the committed uv.lock
+make sync    # sync the local environment; dependency changes may refresh uv.lock
 make test    # offline test suite
 make lint    # ruff check + ruff format --check
 ```

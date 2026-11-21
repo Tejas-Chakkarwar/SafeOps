@@ -132,6 +132,12 @@ class ProvenanceSource:
             return None
 
     def _images(self) -> tuple[dict | None, dict | None, str | None]:
+        """Bootstrap-time image provenance (decision 0021), read back from what cluster-up
+        captured in .safeops/images.json. `image_digests` are the content-addressed images
+        built and loaded at bootstrap; `running_images` are the image identities observed
+        on the pods right after bootstrap. Both are frozen at bootstrap and only referenced
+        by each record; neither is re-sampled per run. That they still match the live
+        cluster is a separate pre-admission check (0021, carried to Milestone 10)."""
         try:
             record = json.loads((self._root / ".safeops" / "images.json").read_text())
             built = record["built"]

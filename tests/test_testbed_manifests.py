@@ -181,6 +181,8 @@ def test_experiment_controller_rbac_is_exactly_proxy_get_update_by_name() -> Non
     assert not [
         x for x in granted if "secrets" in x[1] or "/" in x[1]
     ]  # no Secrets, no subresources
+    assert ("", "endpoints", "create") not in granted  # inventory + stray removal only (0021)
+    assert ("", "endpoints", "list") in granted and ("", "endpoints", "delete") in granted
     assert ("", "pods", "delete") not in granted and (
         "chaos-mesh.org",
         "*",

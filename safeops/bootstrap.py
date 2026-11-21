@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from safeops import manifests
@@ -459,6 +460,10 @@ def rbac_checks(cfg: ClusterConfig) -> list[str]:
         ("list", "roles.rbac.authorization.k8s.io", None, cfg.namespace, True),
         ("delete", "roles.rbac.authorization.k8s.io", None, cfg.namespace, False),
         ("create", "roles.rbac.authorization.k8s.io", None, cfg.namespace, False),
+        # Hardening pass (decision 0021): legacy Endpoints are inventoried and removable
+        ("list", "endpoints", None, cfg.namespace, True),
+        ("delete", "endpoints", None, cfg.namespace, True),
+        ("create", "endpoints", None, cfg.namespace, False),
         ("get", "secrets", None, cfg.system_namespace, False),
     ]
     failures = []
@@ -713,14 +718,27 @@ def up() -> None:
     print(f"  node memory: {memory_report(cfg)}")
 
 
-def down() -> None:
+def down(tool: Callable[..., str] | None = None, docker: Callable | None = None) -> None:
+    """Delete the SafeOps kind cluster, only once its control-plane container proves by its
+    kind labels that it is that cluster (decision 0021). Deleting by name alone could take
+    out an unrelated same-name cluster, unattended, during a quarantine rebuild. The proof
+    is Docker labels, never API-server reachability: a broken cluster must still go."""
+    from safeops.kind_identity import KindIdentityError, verify_control_plane
+
+    tool = tool or _tool
     cfg = load_cluster_config()
-    if cfg.cluster_name in _tool(["kind", "get", "clusters"]).split():
+    if cfg.cluster_name in tool(["kind", "get", "clusters"]).split():
+        try:
+            verify_control_plane(cfg.cluster_name, docker or subprocess.run)
+        except KindIdentityError as exc:
+            raise CommandError(
+                f"refusing to delete kind cluster {cfg.cluster_name!r}: {exc}"
+            ) from exc
         kubeconfig = cfg.kubeconfig_path if cfg.kubeconfig_path.is_file() else None
         args = ["kind", "delete", "cluster", "--name", cfg.cluster_name]
         if kubeconfig is not None:
             args += ["--kubeconfig", str(kubeconfig)]
-        _tool(args)
+        tool(args)
         print(f"deleted kind cluster {cfg.cluster_name}")
     else:
         print(f"kind cluster {cfg.cluster_name} does not exist")

@@ -41,7 +41,7 @@ Update this line as milestones complete. Work on the current milestone only. The
 ## Environment and cluster safety
 
 - macOS, Docker Desktop, local `kind` cluster.
-- Python 3.12 is pinned per decision 0005 (the design says 3.11+). Current direct runtime dependencies are Typer and PyYAML; pytest and Ruff are development dependencies. Add new direct dependencies only when a milestone first requires them. Kubernetes access currently goes through the guarded CLI wrappers (`kind`, `kubectl`, `helm`); do not assume the Python `kubernetes` client or the Prometheus API client is installed. Managed with `uv`; open a fresh shell so `~/.local/bin/uv` and Homebrew `kubectl` come first on PATH.
+- Python 3.12 is pinned per decision 0005 (the design says 3.11+). Current direct runtime dependencies are PyYAML, Typer and Pydantic (`pyproject.toml` is the source of truth); pytest and Ruff are development dependencies. Add new direct dependencies only when a milestone first requires them. Kubernetes access currently goes through the guarded CLI wrappers (`kind`, `kubectl`, `helm`); do not assume the Python `kubernetes` client or the Prometheus API client is installed. Managed with `uv`; open a fresh shell so `~/.local/bin/uv` and Homebrew `kubectl` come first on PATH.
 - The core project uses local kind only. No cloud and no cloud credentials unless I explicitly activate the EKS portability stretch goal, which happens only after the core project is complete.
 
 **Context guard — check before every mutating Kubernetes command** (decisions 0002 and 0006).

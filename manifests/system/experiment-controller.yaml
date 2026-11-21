@@ -57,6 +57,11 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch", "delete"]  # delete: hand-made slices only (second review, R5)
+  # Legacy core/v1 Endpoints, still served on the pinned Kubernetes (decision 0021): inventory
+  # only. Reset deletes a stray one; the endpoint controller's own are expected.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "delete"]
   - apiGroups: ["chaos-mesh.org"]
     resources: ["*"]
     verbs: ["get", "list", "watch", "delete"]  # reset removes chaos; injecting it is Milestone 4

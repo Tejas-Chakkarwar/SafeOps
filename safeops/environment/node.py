@@ -16,20 +16,47 @@ from collections.abc import Callable
 RESIDUE_QDISCS = ("netem", "tbf")
 RESIDUE_PROCESSES = ("stress-ng", "memStress")
 
-# Every network namespace on the node: one representative pid per distinct /proc netns,
-# plus every namespace pinned under /var/run/netns, even one with no process left in it
-# (review L3). Then every qdisc in each, deduplicated. Fixed text: nothing from the caller
-# is interpolated into it.
+# Every network namespace on the node: every distinct /proc netns, plus every namespace
+# pinned under /var/run/netns, even one with no process left in it (review L3). Then every
+# qdisc in each, deduplicated. Fixed text: nothing from the caller is interpolated into it.
+#
+# Fail closed (decision 0021). A namespace that still exists but can't be inspected prints
+# QDISC_ERROR_MARKER, never nothing: tc missing, nsenter refused, or empty tc output (every
+# namespace has at least a loopback qdisc). Discovery races stay quiet: a /proc entry that
+# vanishes while being listed is skipped, and each namespace's processes are tried oldest
+# first, so one transient process can't trip the check. A namespace whose processes are
+# all gone has been destroyed (it can't hold residue) and prints QDISC_GONE_MARKER.
+QDISC_ERROR_MARKER = "SAFEOPS_QDISC_INSPECTION_ERROR:"
+QDISC_GONE_MARKER = "SAFEOPS_QDISC_NAMESPACE_GONE:"
 _QDISC_SCRIPT = r"""
+ERR='SAFEOPS_QDISC_INSPECTION_ERROR:'
+GONE='SAFEOPS_QDISC_NAMESPACE_GONE:'
 {
 for q in /proc/[0-9]*; do n=$(readlink "$q/ns/net" 2>/dev/null) && echo "$n ${q#/proc/}"; done \
-  | sort -u -k1,1 | while read -r ns pid; do
-      nsenter -t "$pid" -n tc qdisc show 2>/dev/null | sed "s|^|$ns |"
+  | sort -k1,1 -k2,2n | awk '{p[$1] = p[$1] " " $2} END {for (n in p) print n p[n]}' \
+  | while read -r ns pids; do
+      inspected=""; alive=""; last=""
+      for pid in $pids; do
+        if out=$(nsenter -t "$pid" -n tc qdisc show 2>&1); then
+          if [ -n "$out" ]; then printf '%s\n' "$out" | sed "s|^|$ns |"
+          else echo "$ERR $ns pid $pid: tc printed no qdiscs"; fi
+          inspected=1; break
+        fi
+        last=$(printf '%s' "$out" | head -1)
+        [ -e "/proc/$pid" ] && alive=1
+      done
+      if [ -z "$inspected" ]; then
+        if [ -n "$alive" ]; then echo "$ERR $ns: every process failed: $last"
+        else echo "$GONE $ns"; fi
+      fi
     done
 for f in /var/run/netns/*; do
   [ -e "$f" ] || continue
-  ino=$(stat -L -c %i "$f" 2>/dev/null) || continue
-  nsenter --net="$f" tc qdisc show 2>/dev/null | sed "s|^|net:[$ino] |"
+  if ino=$(stat -L -c %i "$f" 2>&1) && out=$(nsenter --net="$f" tc qdisc show 2>&1); then
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed "s|^|net:[$ino] |"
+    else echo "$ERR $f: tc printed no qdiscs"; fi
+  elif [ -e "$f" ]; then echo "$ERR $f: $(printf '%s' "$out$ino" | head -1)"
+  else echo "$GONE $f"; fi
 done
 } | sort -u
 """
@@ -38,6 +65,28 @@ _PROCESS_SCRIPT = "ps -eo pid=,comm=,args="
 
 class NodeCheckError(Exception):
     """The node couldn't be identified or inspected. Fail closed: treat the node as not clean."""
+
+
+def parse_qdisc_output(out: str) -> list[str]:
+    """Residue from the qdisc script's output. Raises NodeCheckError when the inspection
+    itself failed: an error marker anywhere, or no inspected qdisc at all (decision 0021)."""
+    errors = [ln for ln in out.splitlines() if ln.startswith(QDISC_ERROR_MARKER)]
+    if errors:
+        raise NodeCheckError(
+            f"qdisc inspection failed for {len(errors)} network namespace(s): {errors[0]}"
+        )
+    lines = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith(QDISC_GONE_MARKER)]
+    if not lines:
+        raise NodeCheckError(
+            "qdisc inspection returned no qdiscs at all; refusing to call it clean"
+        )
+    found = []
+    for line in lines:
+        parts = line.split()
+        # "<netns> qdisc <kind> <handle> ..." from the script's prefixing
+        if len(parts) >= 3 and parts[1] == "qdisc" and parts[2] in RESIDUE_QDISCS:
+            found.append(f"{parts[2]} qdisc in network namespace {parts[0]}: {' '.join(parts[1:])}")
+    return found
 
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -68,21 +117,20 @@ class NodeInspector:
         return proc.stdout
 
     def verify_identity(self) -> None:
-        """Node name, kind labels, and the published API port must all match (0012)."""
+        """Node name, kind labels, and the published API port must all match (0012).
+
+        The label check is the shared primitive teardown uses too (decision 0021). On top of
+        it, inspection also requires the harness API server, which teardown deliberately
+        does not: a node is inspected only if it's the cluster the harness talks to.
+        """
         if self._verified:
             return
-        fmt = (
-            '{{index .Config.Labels "io.x-k8s.kind.cluster"}}|'
-            '{{index .Config.Labels "io.x-k8s.kind.role"}}'
-        )
-        cluster, _, role = (
-            self._docker("inspect", self.node, "--format", fmt).strip().partition("|")
-        )
-        if cluster != self.cfg.cluster_name or role != "control-plane":
-            raise NodeCheckError(
-                f"container {self.node!r} is not the SafeOps kind control-plane"
-                f" (cluster={cluster!r}, role={role!r})"
-            )
+        from safeops.kind_identity import KindIdentityError, verify_control_plane
+
+        try:
+            verify_control_plane(self.cfg.cluster_name, self._run)
+        except KindIdentityError as exc:
+            raise NodeCheckError(str(exc)) from exc
         if self._expected_api_server is None:
             raise NodeCheckError("no expected API server to match the node against")
         published = {
@@ -100,15 +148,7 @@ class NodeInspector:
     def qdisc_residue(self) -> list[str]:
         self.verify_identity()
         out = self._docker("exec", self.node, "sh", "-c", _QDISC_SCRIPT, timeout=120)
-        found = []
-        for line in out.splitlines():
-            parts = line.split()
-            # "<netns> qdisc <kind> <handle> ..." from the script's prefixing
-            if len(parts) >= 3 and parts[1] == "qdisc" and parts[2] in RESIDUE_QDISCS:
-                found.append(
-                    f"{parts[2]} qdisc in network namespace {parts[0]}: {' '.join(parts[1:])}"
-                )
-        return found
+        return parse_qdisc_output(out)
 
     def process_residue(self) -> list[str]:
         self.verify_identity()

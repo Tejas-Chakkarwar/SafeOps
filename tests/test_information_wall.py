@@ -5,8 +5,13 @@ The boundary is by namespace. Everything under a FORBIDDEN root is evaluator or 
 code: fault ground truth (safeops.faults), the experimental unit, runner and run records
 (safeops.experiment), verdicts (safeops.verify), the harness credential and measurement
 path (safeops.environment), the admin credential (safeops.bootstrap), and analysis over
-records (safeops.analysis). Protected code consumes only neutral modules instead:
-safeops.context, safeops.domain, safeops.enums and safeops.topology.
+records (safeops.analysis).
+
+The invariant is the boundary, not an allowlist: protected code may depend on any neutral
+runtime module, but never reaches a forbidden root, transitively. The neutral modules named
+below are checked as protected so they stay neutral; they are examples, not the complete
+set protected code may use (decision 0021). safeops.tools is protected before the first
+real tool lands: tools are the agent's senses.
 
 The check is transitive, follows relative imports, and sees imports inside function bodies.
 Dynamic imports (importlib) are not caught, so don't use them in those packages.
@@ -17,10 +22,13 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # The protected packages, plus the neutral modules they consume: those must stay neutral too.
 PROTECTED = (
     "safeops.agent",
+    "safeops.tools",
     "safeops.features",
     "safeops.gate",
     "safeops.context",
@@ -154,7 +162,16 @@ def test_wall_checker_catches_transitive_and_relative_imports(tmp_path: Path) ->
 
 def _fake_tree(tmp_path: Path, files: dict[str, str]) -> Path:
     pkg = tmp_path / "safeops"
-    for sub in ("agent", "features", "gate", "tools", "faults", "experiment", "environment"):
+    for sub in (
+        "agent",
+        "features",
+        "gate",
+        "tools",
+        "faults",
+        "experiment",
+        "environment",
+        "verify",
+    ):
         (pkg / sub).mkdir(parents=True, exist_ok=True)
         (pkg / sub / "__init__.py").write_text("")
     (pkg / "__init__.py").write_text("")
@@ -191,6 +208,33 @@ def test_a_lazy_import_inside_a_function_is_caught(tmp_path: Path) -> None:
         },
     )
     assert _leaks(reachable_modules(root, "safeops", ("safeops.features",)), FORBIDDEN)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "safeops.environment.workload",
+        "safeops.experiment.unit",
+        "safeops.faults.spec",
+        "safeops.verify.harm",
+    ],
+)
+def test_a_tool_cannot_reach_evaluator_state(tmp_path: Path, target: str) -> None:
+    """A tool is protected on its own, not only through the agent that imports it."""
+    pkg, mod = target.rsplit(".", 1)
+    root = _fake_tree(
+        tmp_path,
+        {
+            f"{pkg.split('.', 1)[1]}/{mod}.py": "X = 1\n",
+            "tools/get_metrics.py": f"from {pkg} import {mod}\n",
+        },
+    )
+    leaked = _leaks(reachable_modules(root, "safeops", ("safeops.tools",)), FORBIDDEN)
+    assert pkg in leaked
+
+
+def test_tools_are_in_the_protected_set() -> None:
+    assert "safeops.tools" in PROTECTED
 
 
 def test_a_relative_import_of_the_experiment_is_caught(tmp_path: Path) -> None:

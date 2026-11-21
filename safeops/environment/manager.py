@@ -97,6 +97,9 @@ INVENTORY = {
     "leases.coordination.k8s.io": ("Lease", True),
     # second review, R5: a hand-made slice can inject endpoints into a Service
     "endpointslices.discovery.k8s.io": ("EndpointSlice", True),
+    # Hardening pass (decision 0021): legacy core/v1 Endpoints are still served on the
+    # pinned Kubernetes; default-deny inventory must see them. Inventory only, not projected.
+    "endpoints": ("Endpoints", True),
     "roles.rbac.authorization.k8s.io": ("Role", False),
     "rolebindings.rbac.authorization.k8s.io": ("RoleBinding", False),
 }
@@ -122,7 +125,8 @@ def unexpected_objects(
     Expected: pods owned (via their ReplicaSet) by a desired Deployment or by a desired
     StatefulSet; ReplicaSets and ControllerRevisions owned by desired workloads; the
     `default` ServiceAccount; the RBAC objects SafeOps itself creates in the testbed; and
-    EndpointSlices that the endpointslice controller manages for a desired Service.
+    EndpointSlices that the endpointslice controller manages for a desired Service; and
+    the legacy Endpoints the endpoint controller keeps for a desired Service.
     Nothing else of these kinds belongs in the testbed.
     """
     rs_owner = {rs["metadata"]["name"]: _controller(rs) for rs in items.get("replicasets.apps", [])}
@@ -144,6 +148,8 @@ def unexpected_objects(
                 ok = name == "default"
             elif kind == "EndpointSlice":
                 ok = is_controller_slice(obj) and ctrl in {("Service", sv) for sv in services}
+            elif kind == "Endpoints":
+                ok = is_controller_endpoints(obj) and name in services
             elif kind in ("Role", "RoleBinding"):
                 ok = (kind, name) in rbac
             else:
@@ -154,6 +160,18 @@ def unexpected_objects(
 
 
 SLICE_CONTROLLER = "endpointslice-controller.k8s.io"
+# The legacy controller's form, observed on the pinned Kubernetes v1.37.0 (decision 0021):
+# one Endpoints per Service with a selector, named like it, labelled managed-by
+# endpoint-controller, with no ownerReferences.
+ENDPOINTS_CONTROLLER = "endpoint-controller"
+
+
+def is_controller_endpoints(endpoints: dict) -> bool:
+    meta = endpoints["metadata"]
+    labels = meta.get("labels") or {}
+    return labels.get(
+        "endpoints.kubernetes.io/managed-by"
+    ) == ENDPOINTS_CONTROLLER and not meta.get("ownerReferences")
 
 
 def is_controller_slice(slice_: dict) -> bool:

@@ -334,3 +334,11 @@ That will matter when real metric tools land. Prometheus returns special sample 
 - one that preserves the fact that the source value was non-finite.
 
 It must never turn such a value into `0` or any other finite number, drop it, or otherwise make missing, undefined or non-finite evidence look like a real measurement. The exact representation is chosen when `get_metrics` is implemented, deliberately, not by whoever writes the first tool.
+
+## Amendment, 2026-11-20: what `image_digests` and `running_images` mean (decision 0021)
+
+Both are **bootstrap-time** provenance, captured by `cluster-up` in `.safeops/images.json` and referenced by every record. Neither is sampled per run:
+- `image_digests` are the content-addressed images built and loaded at bootstrap;
+- `running_images` are the image identities observed on the pods right after bootstrap.
+
+That the live cluster still runs those images is a separate check before runs are admitted. Decision 0021 carries it to Milestone 10.
