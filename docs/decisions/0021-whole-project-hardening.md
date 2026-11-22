@@ -57,6 +57,7 @@ Decision 0020 closed the seams between milestones. This pass closes twelve remai
   - labels match → deleted, even with the API server unreachable;
   - wrong cluster label, wrong role, missing labels, garbled output, or a container that can't be inspected → refused with `CommandError`, nothing deleted.
 - **Tests:** offline only, with injected kind and Docker fakes and the config's local paths redirected to a temporary directory. No identity test is destructive against a real cluster. The real teardown of the SafeOps cluster, which has the correct labels, ran during this pass's rebuild and in the quarantine live test.
+- **Strengthened by decision 0022 §2:** teardown now also requires the full container ID recorded by `cluster-up`; the labels alone prove only the name.
 - **Mutation checks:** skipping the identity check in teardown fails 5 tests; ignoring the role fails 2; ignoring an inspect failure fails 1.
 
 ## 4. What `image_digests` and `running_images` mean
@@ -64,6 +65,7 @@ Decision 0020 closed the seams between milestones. This pass closes twelve remai
 - Both are **bootstrap-time, frozen provenance**: the digests built and loaded at `cluster-up`, and the images the testbed ran then. They don't prove what a run executed against.
 - Documented in `ProvenanceSource` (`safeops/experiment/records.py`) and as an amendment to decision 0018.
 - **A live drift check before admitted runs** (running images re-read and compared with the recorded digests) belongs to campaign admission, not here. It is **required before the first pilot run (Milestone 10)** and recorded there as a carried requirement. Not implemented now.
+- **Superseded by decision 0022 §3:** the reference is a separate, version-controlled campaign image lock under `config/`, written at the Milestone 14 freeze. It is checked at bootstrap/rebuild and at each run's admission. `.safeops/images.json` stays a per-bootstrap observation, which a rebuild rewrites.
 
 ## 5–6. The information wall protects `safeops.tools`
 

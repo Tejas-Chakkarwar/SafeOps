@@ -80,7 +80,8 @@ Write the harm checker, the canonicalizer, and the metric computation by hand. A
 
 ```bash
 make cluster-up      # create kind cluster + deploy testbed (bootstrap phase; decision 0006)
-make cluster-down
+make cluster-down     # refuses a cluster it can't prove it created (decision 0022)
+uv run python -m safeops.bootstrap down --force-unverified-ownership  # operator-only, argv-only; skips the container-ID check
 make bootstrap-scope # re-render pinned charts into config/bootstrap_scope.yaml; review the diff
 make test            # offline pytest; never touches a cluster
 make cluster-test    # live RBAC and harness-path tests; needs make cluster-up

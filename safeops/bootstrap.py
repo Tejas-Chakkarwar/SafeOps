@@ -593,6 +593,15 @@ def up() -> None:
             "180s",
         ]
     )
+    # Pin the exact instance first, before any other step, so a later bootstrap failure
+    # still leaves the proof teardown needs (decision 0022). _preflight refused a
+    # same-name cluster, so this is the one kind just created: never an adopted one.
+    from safeops.kind_identity import KindIdentityError, record_identity
+
+    try:
+        record_identity(cfg.state_dir, cfg.cluster_name)
+    except (KindIdentityError, OSError) as exc:
+        raise CommandError(f"could not record the new cluster's exact identity: {exc}") from exc
     os.chmod(cfg.kubeconfig_path, 0o600)
     k = Kubectl(cfg, Phase.BOOTSTRAP)
 
@@ -718,18 +727,35 @@ def up() -> None:
     print(f"  node memory: {memory_report(cfg)}")
 
 
-def down(tool: Callable[..., str] | None = None, docker: Callable | None = None) -> None:
-    """Delete the SafeOps kind cluster, only once its control-plane container proves by its
-    kind labels that it is that cluster (decision 0021). Deleting by name alone could take
-    out an unrelated same-name cluster, unattended, during a quarantine rebuild. The proof
-    is Docker labels, never API-server reachability: a broken cluster must still go."""
-    from safeops.kind_identity import KindIdentityError, verify_control_plane
+def down(
+    tool: Callable[..., str] | None = None,
+    docker: Callable | None = None,
+    *,
+    force_unverified_ownership: bool = False,
+) -> None:
+    """Delete the SafeOps kind cluster, only once it proves to be the exact instance this
+    state directory created (decision 0022): the kind labels on its control-plane container
+    match, and so does its full container ID, recorded by cluster-up. The proof is Docker,
+    never Kubernetes: a broken cluster must still go (decision 0021).
+
+    Ordering: verify, delete, confirm it's gone, and only then remove the ownership record.
+    A failed delete keeps the record, so the next attempt can still prove ownership.
+
+    `force_unverified_ownership` skips only the container-ID match. main() sets it from the
+    explicit operator flag; nothing else does (no environment variable, no config)."""
+    from safeops.kind_identity import KindIdentityError, identity_path, verify_owned
 
     tool = tool or _tool
     cfg = load_cluster_config()
+    record = identity_path(cfg.state_dir)
     if cfg.cluster_name in tool(["kind", "get", "clusters"]).split():
         try:
-            verify_control_plane(cfg.cluster_name, docker or subprocess.run)
+            verify_owned(
+                cfg.state_dir,
+                cfg.cluster_name,
+                docker or subprocess.run,
+                force_unverified_ownership=force_unverified_ownership,
+            )
         except KindIdentityError as exc:
             raise CommandError(
                 f"refusing to delete kind cluster {cfg.cluster_name!r}: {exc}"
@@ -738,10 +764,16 @@ def down(tool: Callable[..., str] | None = None, docker: Callable | None = None)
         args = ["kind", "delete", "cluster", "--name", cfg.cluster_name]
         if kubeconfig is not None:
             args += ["--kubeconfig", str(kubeconfig)]
-        tool(args)
+        tool(args)  # raises on failure: the ownership record is kept
+        if cfg.cluster_name in tool(["kind", "get", "clusters"]).split():
+            raise CommandError(
+                f"kind delete reported success, but {cfg.cluster_name!r} is still listed;"
+                f" ownership record kept at {record}"
+            )
         print(f"deleted kind cluster {cfg.cluster_name}")
     else:
         print(f"kind cluster {cfg.cluster_name} does not exist")
+    record.unlink(missing_ok=True)  # only once the cluster is established absent
     for path in (
         cfg.kubeconfig_path,
         cfg.harness_kubeconfig_path,
@@ -754,12 +786,31 @@ def down(tool: Callable[..., str] | None = None, docker: Callable | None = None)
 
 
 def main(argv: list[str]) -> int:
+    """The bootstrap entry point. The ownership override is argv only (decision 0022):
+    `down --force-unverified-ownership`, exactly, for one invocation. Nothing else, and no
+    environment variable or configuration, can enable it, so a quarantine rebuild child
+    (`python -m safeops.bootstrap down`, which inherits the operator's environment) never
+    can."""
+    from safeops.kind_identity import FORCE_FLAG
+
     commands = {"up": up, "down": down, "render-scope": render_scope}
-    if len(argv) != 1 or argv[0] not in commands:
-        print("usage: python -m safeops.bootstrap up|down|render-scope", file=sys.stderr)
+    force = argv == ["down", FORCE_FLAG]
+    if not force and (len(argv) != 1 or argv[0] not in commands):
+        print(
+            f"usage: python -m safeops.bootstrap up|down|render-scope | down {FORCE_FLAG}",
+            file=sys.stderr,
+        )
         return 2
     try:
-        commands[argv[0]]()
+        if force:
+            print(
+                "[cluster-down] WARNING: --force-unverified-ownership: deleting without the"
+                " exact container-ID ownership check (the kind labels are still checked)",
+                file=sys.stderr,
+            )
+            down(force_unverified_ownership=True)
+        else:
+            commands[argv[0]]()
     except (CommandError, CredentialError, GuardError, ValueError) as exc:
         print(f"[cluster-{argv[0]}] FAILED: {exc}", file=sys.stderr)
         return 1

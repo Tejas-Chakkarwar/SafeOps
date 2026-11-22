@@ -19,7 +19,13 @@ from safeops.agent.loop import Agent
 from safeops.agent.parser import ProposalParser
 from safeops.cluster import CommandError
 from safeops.enums import RunStage
-from safeops.environment.manager import CleanStateResult, EnvironmentManager, QuarantineFailed
+from safeops.environment.manager import (
+    MAX_RESET_ERROR,
+    CleanStateResult,
+    EnvironmentManager,
+    QuarantineFailed,
+    ResetMutationError,
+)
 from safeops.environment.workload import (
     SteadyStateError,
     WorkloadGenerator,
@@ -120,14 +126,17 @@ class ExperimentRunner:
             "action_attempted": False,
         }
 
-        # Pre-run. A reset that fails outright counts as a dirty environment (review M2).
-        # One that can't produce a result at all (a configuration, guard or credential
-        # error, a quarantined worker) propagates: nothing was attempted, so no record (R1).
-        try:
-            env.reset_environment()
-            pre_clean = env.verify_clean_state()
-        except CommandError as exc:
-            pre_clean = CleanStateResult(False, (f"pre-run reset failed: {exc}",))
+        # Pre-run, on either side of reset's mutation boundary (decision 0022):
+        # - Before it, a failure that can't say anything about the environment (a
+        #   quarantined worker, stale configuration, a credential or guard error on a read)
+        #   propagates: nothing was changed, so no record (R1). A kubectl read that fails
+        #   outright still counts as dirty, as before (review M2).
+        # - After it, the environment may be half reset. A reset failure (ResetMutationError)
+        #   or any failure of the verification after a reset means it couldn't be shown
+        #   clean: pre_run_dirty, through the one canonical path below (_require_pre_run_clean
+        #   -> PreRunDiscard -> _finalize_then_recover: record first, then quarantine).
+        # Interrupts are never converted here.
+        pre_clean = self._pre_run_clean_state()
         data["clean_state_verified"] = pre_clean.clean
         try:
             self._require_pre_run_clean(pre_clean)
@@ -231,6 +240,29 @@ class ExperimentRunner:
         self._finalize_then_recover(data, None, post_clean, interrupt)
         if interrupt is not None:
             raise interrupt
+
+    def _pre_run_clean_state(self) -> CleanStateResult:
+        """Reset, then verify; a failure after the mutation boundary is a not-clean result
+        (decision 0022). Never writes a record and never recovers: run() routes every
+        not-clean result through _require_pre_run_clean, the one pre-run discard path."""
+        env = self.environment
+        try:
+            env.reset_environment()
+        except CommandError as exc:  # a read failed outright, before any mutation (M2)
+            return CleanStateResult(False, (f"pre-run reset failed: {exc}",))
+        except ResetMutationError as exc:  # its message is already bounded
+            return CleanStateResult(False, (f"pre-run reset failed: {exc}",))
+        try:
+            return env.verify_clean_state()
+        except Exception as exc:  # reset has mutated: "not shown clean", never "no attempt"
+            detail = str(exc)[:MAX_RESET_ERROR]
+            return CleanStateResult(
+                False,
+                (
+                    "pre-run clean-state verification failed after reset:"
+                    f" {type(exc).__name__}: {detail}",
+                ),
+            )
 
     def _finalize_then_recover(self, data, discard, post_clean, interrupt, recover=None):
         """Write the record, then recover a dirty environment (strictly in that order).

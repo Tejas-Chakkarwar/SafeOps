@@ -136,8 +136,9 @@ class ProvenanceSource:
         captured in .safeops/images.json. `image_digests` are the content-addressed images
         built and loaded at bootstrap; `running_images` are the image identities observed
         on the pods right after bootstrap. Both are frozen at bootstrap and only referenced
-        by each record; neither is re-sampled per run. That they still match the live
-        cluster is a separate pre-admission check (0021, carried to Milestone 10)."""
+        by each record; neither is re-sampled per run. This file is a per-bootstrap
+        observation that rebuilds rewrite. The frozen reference is a separate campaign image
+        lock under config/, checked at bootstrap/rebuild and at run admission (0022 §3)."""
         try:
             record = json.loads((self._root / ".safeops" / "images.json").read_text())
             built = record["built"]

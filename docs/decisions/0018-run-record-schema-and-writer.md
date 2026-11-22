@@ -341,4 +341,4 @@ Both are **bootstrap-time** provenance, captured by `cluster-up` in `.safeops/im
 - `image_digests` are the content-addressed images built and loaded at bootstrap;
 - `running_images` are the image identities observed on the pods right after bootstrap.
 
-That the live cluster still runs those images is a separate check before runs are admitted. Decision 0021 carries it to Milestone 10.
+That the live cluster still runs those images is a separate check before runs are admitted. Decision 0022 §3 specifies it: a version-controlled campaign image lock under `config/`, written at the Milestone 14 freeze. It is checked at bootstrap/rebuild and at each run's admission, and is never this per-bootstrap file.

@@ -452,7 +452,29 @@ def test_planted_stress_process_fails_verify_and_quarantine_rebuilds(env) -> Non
     env.reset_environment()  # reset never touches the node: residue survives it
     assert any("stress-ng" in p for p in env.verify_clean_state().problems)
 
+    # Exact ownership across the rebuild (decision 0022): the pinned cluster is torn down by
+    # the normal, exact-identity teardown, and the new one is pinned at creation.
+    from safeops.kind_identity import identity_path
+
+    record = identity_path(CFG.state_dir)
+    before = json.loads(record.read_text())["container_id"]
+    assert before == _container_id(), "precondition: the live cluster is the pinned one"
+
     env.quarantine_and_rebuild(reason="m3 acceptance: planted stress-ng residue")
     assert not env._marker.exists(), "quarantine marker should be cleared after a clean rebuild"
     final = env.verify_clean_state()
     assert final.clean, final.problems
+
+    after = json.loads(record.read_text())
+    assert after["container_id"] == _container_id() != before  # a new instance, re-pinned
+    assert oct(record.stat().st_mode & 0o777) == "0o600"
+
+
+def _container_id() -> str:
+    return subprocess.run(
+        ["docker", "inspect", NODE, "--format", "{{.Id}}"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    ).stdout.strip()

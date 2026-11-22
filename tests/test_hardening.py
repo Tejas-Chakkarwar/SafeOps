@@ -8,6 +8,7 @@ config points at a temporary directory, so the real .safeops/ is never touched.
 from __future__ import annotations
 
 import dataclasses
+import json
 import subprocess
 
 import pytest
@@ -16,6 +17,8 @@ from safeops.cluster import CommandError, load_cluster_config
 from safeops.environment import node as node_mod
 from safeops.environment.manager import INVENTORY, EnvironmentManager, unexpected_objects
 from safeops.environment.node import NodeCheckError, NodeInspector, parse_qdisc_output
+
+CONTAINER_ID = "c0ffee" * 10 + "abcd"  # a full 64-hex Docker container ID
 
 # --- 1. qdisc inspection fails closed ----------------------------------------------------------
 
@@ -79,7 +82,7 @@ class _Docker:
     """A fake `docker` for NodeInspector: labels, the published port, then exec output."""
 
     def __init__(self, exec_out: str, cluster="safeops", role="control-plane"):
-        self.exec_out, self.labels = exec_out, f"{cluster}|{role}"
+        self.exec_out, self.labels = exec_out, f"{CONTAINER_ID}|{cluster}|{role}"
 
     def __call__(self, args, **kw):
         if args[1] == "inspect":
@@ -181,6 +184,16 @@ def scratch_cfg(tmp_path, monkeypatch):
         harness_token_meta_path=state / "experiment-controller.token.json",
     )
     monkeypatch.setattr(bootstrap, "load_cluster_config", lambda: cfg)
+    (state / "cluster-identity.json").write_text(  # exact ownership (decision 0022)
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cluster_name": "safeops",
+                "control_plane_container": "safeops-control-plane",
+                "container_id": CONTAINER_ID,
+            }
+        )
+    )
     return cfg
 
 
@@ -193,7 +206,7 @@ class _Kind:
         if args[0] == "kubectl":
             raise CommandError("the API server is unreachable")  # teardown must not need it
         if args[:3] == ["kind", "get", "clusters"]:
-            return self.clusters
+            return "" if self.deleted else self.clusters
         return ""
 
     @property
@@ -205,7 +218,10 @@ def _labels(out: str, rc: int = 0):
     def docker(args, **kw):
         assert args[:2] == ["docker", "inspect"] and args[2] == "safeops-control-plane"
         return subprocess.CompletedProcess(
-            args, rc, out, "" if rc == 0 else "Error: No such object"
+            args,
+            rc,
+            f"{CONTAINER_ID}|{out}" if rc == 0 else "",
+            "" if rc else "Error: No such object",
         )
 
     return docker
@@ -258,8 +274,8 @@ def test_node_inspection_and_teardown_share_one_identity_check() -> None:
 
     from safeops import bootstrap
 
-    for fn in (NodeInspector.verify_identity, bootstrap.down):
-        assert "verify_control_plane" in inspect.getsource(fn)
+    assert "verify_control_plane" in inspect.getsource(NodeInspector.verify_identity)
+    assert "verify_owned" in inspect.getsource(bootstrap.down)  # labels + exact ID (0022)
     assert "io.x-k8s.kind" not in inspect.getsource(bootstrap)  # no second label check
 
 

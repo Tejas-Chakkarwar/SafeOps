@@ -48,6 +48,45 @@ class QuarantineFailed(EnvironmentStateError):
     """The rebuild didn't produce a clean environment. The worker stays halted."""
 
 
+MAX_RESET_ERROR = 500  # bound the underlying error kept in a ResetMutationError message
+MAX_REBUILD_STDERR = 1500  # the tail of a failed bootstrap child's stderr kept
+
+
+class _ResetProgress:
+    """Where reset is, and whether it has crossed the mutation boundary (decision 0022)."""
+
+    def __init__(self) -> None:
+        self.step, self.mutated = "preflight", False
+
+    def read(self, step: str) -> None:
+        self.step = step
+
+    def mutate(self, step: str, fn, *args) -> None:
+        self.step, self.mutated = step, True  # before the call: it may apply and still fail
+        fn(*args)
+
+
+class ResetMutationError(EnvironmentStateError):
+    """Reset entered its mutating phase and failed before a verified-clean environment was
+    established (decision 0022). Cluster state may already have changed: some deletes or
+    creates may have applied, and a timeout never proves one didn't. `step` names the
+    operation that failed; the original exception is __cause__.
+
+    The mutation boundary is the first mutating call reset issues. A failure before it
+    (quarantine refusal, configuration, a read) propagates as itself: nothing was changed.
+    """
+
+    def __init__(self, step: str, cause: Exception) -> None:
+        self.step = step
+        detail = str(cause)
+        if len(detail) > MAX_RESET_ERROR:
+            detail = detail[:MAX_RESET_ERROR] + f"... [{len(detail)} chars, truncated]"
+        super().__init__(
+            f"reset failed after it began mutating the testbed, at {step}:"
+            f" {type(cause).__name__}: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class CleanStateResult:
     clean: bool
@@ -491,6 +530,10 @@ class EnvironmentManager:
 
         verify_clean_state() then checks the result independently. Reset never inspects
         or changes node state; leftover node residue is quarantine's job.
+
+        The mutation boundary (decision 0022): everything up to the first mutating call is
+        preflight, and its failures propagate unchanged (nothing was changed). From that
+        call on, any ordinary failure raises ResetMutationError. Interrupts aren't wrapped.
         """
         from safeops.environment import snapshot
 
@@ -498,12 +541,26 @@ class EnvironmentManager:
         _, desired, rbac = self._configuration()  # before anything is deleted
         k, ns = self._k(), self.cfg.namespace
 
-        for resource, kind, name in self._chaos_objects():
-            k.delete(resource, kind, name, ns)
+        progress = _ResetProgress()
+        try:
+            self._reset_steps(k, ns, desired, rbac, progress, snapshot)
+        except Exception as exc:
+            if not progress.mutated:
+                raise  # preflight: nothing was changed
+            raise ResetMutationError(progress.step, exc) from exc
 
+    def _reset_steps(self, k, ns, desired, rbac, progress, snapshot) -> None:
+        """reset_environment's steps 1-5. Every mutating call goes through
+        progress.mutate, which marks the boundary; reads only name the step."""
+        mutate = progress.mutate
+        progress.read("list Chaos Mesh objects")
+        for resource, kind, name in self._chaos_objects():
+            mutate(f"delete {kind}/{name}", k.delete, resource, kind, name, ns)
+
+        progress.read("list unexpected objects")
         for resource, kind, name, deletable in self._unexpected(desired, rbac):
             if deletable:
-                k.delete(resource, kind, name, ns)
+                mutate(f"delete {kind}/{name}", k.delete, resource, kind, name, ns)
         desired_keys = {(o["kind"], o["metadata"]["name"]) for o in desired}
         expected_pvcs = {
             f"{t['metadata']['name']}-{o['metadata']['name']}-{i}"
@@ -512,6 +569,7 @@ class EnvironmentManager:
             for t in o["spec"].get("volumeClaimTemplates") or []
             for i in range(o["spec"].get("replicas", 1))
         }
+        progress.read("list projected objects")
         live = self._items(",".join(x.lower() for x in snapshot.PROJECTED_KINDS))
         for obj in live:
             key = (obj["kind"], obj["metadata"]["name"])
@@ -519,7 +577,7 @@ class EnvironmentManager:
                 continue
             if key[0] == "PersistentVolumeClaim" and key[1] in expected_pvcs:
                 continue
-            k.delete(key[0].lower(), key[0], key[1], ns)
+            mutate(f"delete {key[0]}/{key[1]}", k.delete, key[0].lower(), key[0], key[1], ns)
 
         app_tier = [o for o in desired if o["kind"] in ("Deployment", "Service", "ConfigMap")]
         live_keys = {(o["kind"], o["metadata"]["name"]) for o in live}
@@ -527,11 +585,11 @@ class EnvironmentManager:
             for obj in app_tier:
                 key = (obj["kind"], obj["metadata"]["name"])
                 if obj["kind"] == kind and key in live_keys:
-                    k.delete(kind.lower(), kind, key[1], ns)
+                    mutate(f"delete {kind}/{key[1]}", k.delete, kind.lower(), kind, key[1], ns)
         for kind in ("ConfigMap", "Service", "Deployment"):
             batch = [o for o in app_tier if o["kind"] == kind]
             if batch:
-                k.create(batch)
+                mutate(f"create {kind} objects", k.create, batch)
 
         for obj in (o for o in desired if o["kind"] == "StatefulSet"):
             name = obj["metadata"]["name"]
@@ -540,10 +598,11 @@ class EnvironmentManager:
                 None,
             )
             if current is None:
-                k.create([obj])
-            else:
-                k.replace([obj])  # unconditional: unprojected drift goes too (review L5)
+                mutate(f"create StatefulSet/{name}", k.create, [obj])
+            else:  # unconditional: unprojected drift goes too (review L5)
+                mutate(f"replace StatefulSet/{name}", k.replace, [obj])
 
+        progress.read("wait for the stabilization window")
         self.wait_stabilization_window()
 
     # --- verification --------------------------------------------------------------------
@@ -597,18 +656,34 @@ class EnvironmentManager:
 
     def _default_rebuild(self) -> None:
         """Recreate the cluster through the real entry points (decision 0006): never
-        hand-patched, and never a wider guard."""
+        hand-patched, and never a wider guard.
+
+        The argv is exactly `down`, then `up`: never the ownership override (decision 0022),
+        which is argv-only, so the inherited environment can't arm it either. A teardown
+        that can't prove exact ownership fails closed here, as QuarantineFailed carrying the
+        child's own explanation (stderr is echoed through, and its tail kept)."""
         for command in ("down", "up"):
             try:
                 proc = subprocess.run(
-                    [sys.executable, "-m", "safeops.bootstrap", command], check=False, timeout=1800
+                    [sys.executable, "-m", "safeops.bootstrap", command],
+                    check=False,
+                    timeout=1800,
+                    stderr=subprocess.PIPE,
+                    text=True,
                 )
             except (subprocess.TimeoutExpired, OSError) as exc:
                 raise QuarantineFailed(
                     f"cluster-{command} did not finish during quarantine rebuild: {exc}"
                 ) from exc
+            err = proc.stderr or ""
+            if err:
+                sys.stderr.write(err)
             if proc.returncode != 0:
-                raise QuarantineFailed(f"cluster-{command} failed during quarantine rebuild")
+                tail = err.strip()[-MAX_REBUILD_STDERR:]
+                raise QuarantineFailed(
+                    f"cluster-{command} failed during quarantine rebuild"
+                    + (f": {tail}" if tail else "")
+                )
 
     def quarantine_and_rebuild(self, reason: str = "") -> None:
         """Stop using this worker, recreate the cluster, then verify desired state (§11.1).

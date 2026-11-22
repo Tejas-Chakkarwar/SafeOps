@@ -392,7 +392,7 @@ class Docker:
         self.calls.append(args)
         if self.fail and args[1] == self.fail:
             return subprocess.CompletedProcess(args, 1, "", "Error: No such container")
-        out = {"inspect": self.labels, "port": self.port}.get(args[1])
+        out = {"inspect": "f" * 64 + "|" + self.labels, "port": self.port}.get(args[1])
         if out is None:
             out = self.qdisc if "tc qdisc" in args[-1] else self.ps
         return subprocess.CompletedProcess(args, 0, out, "")
