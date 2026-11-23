@@ -22,6 +22,45 @@ from safeops.faults.spec import Symptom, load_fault_spec
 FIXED_TIME = datetime(2026, 11, 19, 18, 0, 0, tzinfo=UTC)
 
 REPO_RUNS_DIR = Path(__file__).resolve().parent.parent / "data" / "runs"
+REPO_STATE_DIR = Path(__file__).resolve().parent.parent / ".safeops"
+
+
+def scratch_cluster_config(state: Path):
+    """The real cluster config with every local path (all of cluster._PATH_KEYS) moved into
+    `state`, so code under test that writes or removes local state never touches the real
+    .safeops/ (found at Milestone 6: a fixture that missed the new reader paths let offline
+    teardown tests delete the real reader credential)."""
+    import dataclasses
+
+    from safeops.cluster import _PATH_KEYS, load_cluster_config
+
+    real = load_cluster_config()
+    return dataclasses.replace(real, **{k: state / getattr(real, k).name for k in _PATH_KEYS})
+
+
+def _state_listing() -> dict:
+    if not REPO_STATE_DIR.exists():
+        return {}
+    return {
+        str(p.relative_to(REPO_STATE_DIR)): (p.stat().st_size, p.stat().st_mtime_ns)
+        for p in REPO_STATE_DIR.rglob("*")
+        if p.is_file()
+    }
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_local_state():
+    """No offline test may create, change or remove anything in the real .safeops/ (the
+    cluster's credentials and ownership record). Live tests (tests/cluster) are exempt:
+    the quarantine test rebuilds the cluster for real."""
+    import os
+
+    if os.environ.get("SAFEOPS_CLUSTER_TESTS") == "1":
+        yield
+        return
+    before = _state_listing()
+    yield
+    assert _state_listing() == before, "an offline test changed the real .safeops/"
 
 
 def _repo_records() -> set[str]:
@@ -40,12 +79,30 @@ def _never_write_the_real_dataset(tmp_path, monkeypatch):
     assert _repo_records() == before, "a test wrote into the repository's data/runs/"
 
 
+def clock_reading(offset_s: int = 0, at: datetime = FIXED_TIME):
+    """A fabricated host/cluster clock reading (decision 0023): a 40 ms create round trip
+    starting at `at`, with the server clock `offset_s` whole seconds ahead."""
+    from datetime import timedelta
+
+    from safeops.environment.clock import ClockReading
+
+    return ClockReading(
+        at + timedelta(milliseconds=500),
+        at + timedelta(milliseconds=540),
+        at + timedelta(seconds=offset_s),
+    )
+
+
 class FakeEnvironment:
-    """Stands in for EnvironmentManager: clean, stable, empty snapshots."""
+    """Stands in for EnvironmentManager: clean, stable, empty snapshots, steady clocks."""
 
     def __init__(self, clean: bool = True) -> None:
         self.calls: list[str] = []
         self.clean = clean
+
+    def read_clock(self):
+        self.calls.append("read_clock")
+        return clock_reading()
 
     def reset_environment(self) -> None:
         self.calls.append("reset_environment")

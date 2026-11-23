@@ -366,9 +366,25 @@ def _private_state_dir(cfg: ClusterConfig) -> None:
 
 def issue_harness_credential(cfg: ClusterConfig, k: Kubectl) -> dict:
     """Time-limited TokenRequest token for experiment-controller (decision 0009)."""
+    return _issue_credential(
+        cfg, k, "experiment-controller", cfg.harness_kubeconfig_path, cfg.harness_token_meta_path
+    )
+
+
+def issue_reader_credential(cfg: ClusterConfig, k: Kubectl) -> dict:
+    """Time-limited TokenRequest token for safeops-reader, the tools' read-only identity
+    (design §4; Milestone 6, decision 0023). Same lifetime as the harness token."""
+    return _issue_credential(
+        cfg, k, "safeops-reader", cfg.reader_kubeconfig_path, cfg.reader_token_meta_path
+    )
+
+
+def _issue_credential(
+    cfg: ClusterConfig, k: Kubectl, service_account: str, kubeconfig_path: Path, meta_path: Path
+) -> dict:
     import yaml
 
-    token = k.create_token("experiment-controller", cfg.system_namespace, cfg.harness_session_s)
+    token = k.create_token(service_account, cfg.system_namespace, cfg.harness_session_s)
     iat, exp = decode_token_times(token)
     actual = exp - iat
     if actual < cfg.harness_session_s:
@@ -382,32 +398,39 @@ def issue_harness_credential(cfg: ClusterConfig, k: Kubectl) -> dict:
         "apiVersion": "v1",
         "kind": "Config",
         "clusters": [{"name": cfg.kube_context, "cluster": cluster["cluster"]}],
-        "users": [{"name": "experiment-controller", "user": {"token": token}}],
+        "users": [{"name": service_account, "user": {"token": token}}],
         "contexts": [
             {
                 "name": cfg.kube_context,
-                "context": {"cluster": cfg.kube_context, "user": "experiment-controller"},
+                "context": {"cluster": cfg.kube_context, "user": service_account},
             }
         ],
     }
-    _write_private(cfg.harness_kubeconfig_path, yaml.safe_dump(kubeconfig))
+    _write_private(kubeconfig_path, yaml.safe_dump(kubeconfig))
     meta = {
-        "service_account": f"{cfg.system_namespace}/experiment-controller",
+        "service_account": f"{cfg.system_namespace}/{service_account}",
         "kind": "time-limited TokenRequest ServiceAccount token (no boundObjectRef)",
         "requested_s": cfg.harness_session_s,
         "issued_at": iat,
         "expires_at": exp,
         "actual_s": actual,
     }
-    cfg.harness_token_meta_path.write_text(json.dumps(meta, indent=2))
+    meta_path.write_text(json.dumps(meta, indent=2))
     return meta
 
 
 # --- health checks -------------------------------------------------------------------
 
 
-def _can_i(cfg: ClusterConfig, verb: str, resource: str, sub: str | None, namespace: str) -> bool:
-    sa = f"system:serviceaccount:{cfg.system_namespace}:experiment-controller"
+def _can_i(
+    cfg: ClusterConfig,
+    verb: str,
+    resource: str,
+    sub: str | None,
+    namespace: str,
+    service_account: str = "experiment-controller",
+) -> bool:
+    sa = f"system:serviceaccount:{cfg.system_namespace}:{service_account}"
     proc = subprocess.run(
         [
             "kubectl",
@@ -472,7 +495,82 @@ def rbac_checks(cfg: ClusterConfig) -> list[str]:
         if got != want:
             what = f"{resource}" + (f" --subresource={sub}" if sub else "")
             failures.append(f"can-i {verb} {what} -n {ns}: expected {want}, got {got}")
+    for verb, resource, sub, ns, want in reader_rbac_expectations(cfg):
+        got = _can_i(cfg, verb, resource, sub, ns, service_account="safeops-reader")
+        if got != want:
+            what = f"{resource}" + (f" --subresource={sub}" if sub else "")
+            failures.append(f"reader can-i {verb} {what} -n {ns}: expected {want}, got {got}")
     return failures
+
+
+# The §4 reader surface (Milestone 6, decision 0023): every read it needs, and the denied
+# surface around it. Shared by the bootstrap health check and tests/cluster.
+READER_READS = (
+    "pods",
+    "events",
+    "services",
+    "configmaps",
+    "endpointslices.discovery.k8s.io",
+    "deployments.apps",
+    "replicasets.apps",
+    "statefulsets.apps",
+)
+
+
+def reader_rbac_expectations(cfg: ClusterConfig) -> list[tuple]:
+    ns, mon = cfg.namespace, cfg.monitoring_namespace
+    prom = f"{cfg.prometheus_service}:{cfg.prometheus_service_port}"  # the proxy is by port
+    expect: list[tuple] = []
+    for resource in READER_READS:
+        expect += [(verb, resource, None, ns, True) for verb in ("get", "list", "watch")]
+        expect += [
+            (verb, resource, None, ns, False)
+            for verb in ("create", "update", "patch", "delete", "deletecollection")
+        ]
+    expect += [
+        # pods/log is get only (§4); nothing else on any pod subresource.
+        ("get", "pods", "log", ns, True),
+        ("create", "pods", "log", ns, False),
+        ("create", "pods", "exec", ns, False),
+        ("get", "pods", "exec", ns, False),
+        ("create", "pods", "attach", ns, False),
+        ("create", "pods", "portforward", ns, False),
+        ("create", "pods", "eviction", ns, False),
+        ("update", "deployments.apps", "scale", ns, False),
+        ("patch", "deployments.apps", "scale", ns, False),
+        ("get", "services", "proxy", ns, False),
+        ("get", "pods", "proxy", ns, False),
+        ("get", "secrets", None, ns, False),
+        ("list", "secrets", None, ns, False),
+        ("list", "persistentvolumeclaims", None, ns, False),
+        ("list", "networkchaos.chaos-mesh.org", None, ns, False),
+        ("list", "podchaos.chaos-mesh.org", None, ns, False),
+        ("list", "roles.rbac.authorization.k8s.io", None, ns, False),
+        ("create", "serviceaccounts", "token", ns, False),
+        # Prometheus: GET through its Service proxy only.
+        ("get", f"services/{prom}", "proxy", mon, True),
+        ("create", f"services/{prom}", "proxy", mon, False),
+        ("update", f"services/{prom}", "proxy", mon, False),
+        ("delete", f"services/{prom}", "proxy", mon, False),
+        ("get", "services/some-other-service", "proxy", mon, False),
+        ("get", f"services/{cfg.prometheus_service}", "proxy", mon, False),  # only by port
+        ("get", f"services/{prom}", None, mon, False),
+        ("list", "pods", None, mon, False),
+        # The workload namespace and its proxy: never (decision 0009).
+        ("get", f"services/{cfg.workload_service}", "proxy", cfg.workload_namespace, False),
+        ("update", f"services/{cfg.workload_service}", "proxy", cfg.workload_namespace, False),
+        ("list", "pods", None, cfg.workload_namespace, False),
+        ("get", "pods", "log", cfg.workload_namespace, False),
+        ("list", "events", None, cfg.workload_namespace, False),
+        # Every other namespace, and cluster scope.
+        ("get", "secrets", None, cfg.system_namespace, False),
+        ("list", "pods", None, cfg.chaos_namespace, False),
+        ("list", "pods", None, "kube-system", False),
+        ("list", "events", None, "default", False),
+        ("list", "nodes", None, ns, False),
+        ("list", "namespaces", None, ns, False),
+    ]
+    return expect
 
 
 def wait_rollouts(k: Kubectl, namespaces: tuple[str, ...]) -> None:
@@ -672,8 +770,9 @@ def up() -> None:
         k, (cfg.namespace, cfg.workload_namespace, cfg.monitoring_namespace, cfg.chaos_namespace)
     )
 
-    _say("issuing the harness credential")
+    _say("issuing the harness and reader credentials")
     meta = issue_harness_credential(cfg, k)
+    issue_reader_credential(cfg, k)
 
     _say("health checks")
     ownership_check(cfg, k)
@@ -719,6 +818,7 @@ def up() -> None:
         f" (expires {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(meta['expires_at']))})"
     )
     print(f"  rbac:        proxy to {cfg.workload_service} allowed; everything else denied")
+    print("  reader:      safeops-reader reads testbed (§4) and queries Prometheus; never writes")
     running = state.get("running")
     print(f"  workload:    generator reachable via the harness path (running={running})")
     print(
@@ -778,6 +878,8 @@ def down(
         cfg.kubeconfig_path,
         cfg.harness_kubeconfig_path,
         cfg.harness_token_meta_path,
+        cfg.reader_kubeconfig_path,
+        cfg.reader_token_meta_path,
         cfg.kubeconfig_path.parent / "images.json",
     ):
         path.unlink(missing_ok=True)

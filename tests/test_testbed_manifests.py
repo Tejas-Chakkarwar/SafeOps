@@ -152,12 +152,19 @@ def test_workload_generator_is_outside_the_testbed_and_uses_its_own_image() -> N
 
 def test_experiment_controller_rbac_is_exactly_proxy_get_update_by_name() -> None:
     system = GROUPS["system"]
-    sa = next(o for o in system if o["kind"] == "ServiceAccount")
-    assert (sa["metadata"]["name"], sa["metadata"]["namespace"]) == (
-        "experiment-controller",
-        CFG.system_namespace,
+    sa = next(
+        o
+        for o in system
+        if o["kind"] == "ServiceAccount" and o["metadata"]["name"] == "experiment-controller"
     )
-    roles = {o["metadata"]["name"]: o for o in system if o["kind"] in ("Role", "ClusterRole")}
+    assert sa["metadata"]["namespace"] == CFG.system_namespace
+    # safeops-reader's roles (Milestone 6) are checked in tests/test_m6_tools.py.
+    roles = {
+        o["metadata"]["name"]: o
+        for o in system
+        if o["kind"] in ("Role", "ClusterRole")
+        and o["metadata"]["name"].startswith("experiment-controller")
+    }
     assert {r["kind"] for r in roles.values()} == {"Role"}  # namespaced only, never cluster-wide
     proxy = roles["experiment-controller-workload-proxy"]
     assert proxy["metadata"]["namespace"] == CFG.workload_namespace
@@ -189,7 +196,7 @@ def test_experiment_controller_rbac_is_exactly_proxy_get_update_by_name() -> Non
         "create",
     ) not in granted
     assert len(roles) == 2
-    assert not [o for o in system if o["kind"] == "ClusterRoleBinding"]
+    assert not [o for o in system if o["kind"] in ("ClusterRole", "ClusterRoleBinding")]
 
 
 def test_image_tags_are_content_derived_and_separate() -> None:

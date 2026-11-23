@@ -19,6 +19,7 @@ import pytest
 from typer.testing import CliRunner
 
 from safeops.cluster import CommandError
+from safeops.enums import RunStage
 from safeops.environment.manager import CleanStateResult, ConfigurationError
 from safeops.experiment.records import (
     RECORD_FIELDS,
@@ -39,6 +40,7 @@ from safeops.experiment.schema import (
 from safeops.experiment.unit import MAX_FAULT_SEED, RunUnit
 from safeops.faults.injector import FaultInjectionError, FaultVerificationFailed
 from safeops.stubs import NotImplementedStage
+from safeops.tools.canonical import result_digest
 from tests.conftest import FakeInjector, FixedProvenance
 
 UNIT = RunUnit("bad-deployment-config", 0, 0)
@@ -75,13 +77,24 @@ class Rec:
         return copy.deepcopy(self.record)
 
 
+# A real version-2 step (decision 0023): a get_pods envelope and its canonical digest.
+_POD_RESULT = {
+    "status": "ok",
+    "data": {
+        "namespace": "testbed",
+        "pods": [],
+        "pod_count": 0,
+        "total_pods": 0,
+        "truncated": False,
+    },
+}
 STEP = Rec(
     {
         "step": 1,
         "tool": "get_pods",
         "args": {"namespace": "testbed"},
-        "result": {"pods": []},
-        "result_digest": SHA,
+        "result": _POD_RESULT,
+        "result_digest": result_digest(_POD_RESULT),
         "tokens_in": 1200,
         "tokens_out": 80,
         "latency_ms": 940,
@@ -531,7 +544,7 @@ def _check(rec: dict) -> None:
 def test_valid_records_validate(good, dirty) -> None:
     _check(good)
     _check(dirty)  # almost entirely null, and valid
-    assert dirty["schema_version"] == SCHEMA_VERSION == 1
+    assert dirty["schema_version"] == good["schema_version"] == SCHEMA_VERSION == 2
 
 
 def test_every_key_is_required_even_when_null(good) -> None:
@@ -553,7 +566,8 @@ def _set(rec, path, value):
 MALFORMED = {
     "unknown top-level field": (("clock_offset_s",), 0.1),
     "unknown nested field": (("unit", "variant"), 1),
-    "version 2 is not defined": (("schema_version",), 2),
+    "version 3 is not defined": (("schema_version",), 3),
+    "a version-2 record claiming version 1": (("schema_version",), 1),
     "version as a string": (("schema_version",), "1"),
     "version as a bool": (("schema_version",), True),
     "seed as a string": (("unit", "fault_seed"), "0"),
@@ -960,6 +974,7 @@ def _crash_at(r, stage: str) -> None:
     env_methods = {
         "stabilization": "wait_stabilization_window",
         "postaction_snapshot": "capture_snapshot",
+        "clock_after_measurements": "read_clock",
     }
     if stage in owner:
         setattr(r, owner[stage], Fixed(raises=boom) if stage != "agent" else Agent(raises=boom))
@@ -971,8 +986,9 @@ def _crash_at(r, stage: str) -> None:
 
         def method(*a, **k):
             calls["n"] += 1
-            # capture_snapshot is also the pre-fault snapshot: crash only the second call.
-            if stage == "postaction_snapshot" and calls["n"] == 1:
+            # capture_snapshot is also the pre-fault snapshot, and read_clock the first clock
+            # reading: crash only the second call.
+            if stage in ("postaction_snapshot", "clock_after_measurements") and calls["n"] == 1:
                 return real(*a, **k)
             raise boom
 
@@ -1019,6 +1035,7 @@ def test_review_a_crash_at_every_pre_agent_stage_writes_a_valid_record(tmp_path,
         raise boom
 
     target = {
+        "clock_before_load": (r.environment, "read_clock"),
         "start_workload": (r.workload, "start_workload"),
         "steady_state": (r.workload, "verify_steady_state"),
         "steady_state_baseline": (r, "_require_steady_state"),
@@ -1057,9 +1074,16 @@ def test_review_a_nan_inside_an_untyped_tool_result_never_reaches_the_dataset(tm
 
 
 def _as_discard(rec: dict, stage: str, cause: str = "infrastructure_failure") -> dict:
-    """A completed record turned into a discard at `stage`, keeping all its data."""
-    from safeops.experiment.schema import POST_AGENT_STAGES
+    """A completed record turned into a discard at `stage`, keeping all its data, except the
+    clock readings its stage could not yet have taken (version 2, decision 0023): a reading
+    is produced by its own stage, so a discard at or before that stage never carries it."""
+    from safeops.experiment.schema import _CLOCK_PRODUCES, POST_AGENT_STAGES, STAGE_PRODUCES
 
+    order = list(STAGE_PRODUCES)
+    for clock_stage, fields in _CLOCK_PRODUCES.items():
+        if order.index(RunStage(stage)) <= order.index(clock_stage):
+            for name in fields:
+                rec = _set(rec, (name,), None)
     rec = _set(rec, ("discarded",), True)
     rec = _set(rec, ("in_cohort_g",), False)
     rec = _set(rec, ("outcome",), None)

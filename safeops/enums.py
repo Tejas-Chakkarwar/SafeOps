@@ -42,9 +42,14 @@ class RunStage(StrEnum):
     A closed set: a discard record's stage is one of these, and schema.PRE_AGENT_STAGES /
     POST_AGENT_STAGES partition it exactly (M5 review, item 2). Add a stage here, and in
     the runner, and classify it; a test fails if any member is left unclassified.
+
+    The two clock-probe stages arrived with run record version 2 (Milestone 6, decision
+    0023; 0017 §6): each probe is its own stage, so a record's stage says exactly which
+    reading it got to. A version-1 record never names them.
     """
 
     PRE_RUN_CLEAN_STATE = "pre_run_clean_state"
+    CLOCK_BEFORE_LOAD = "clock_before_load"  # first clock reading: before the load begins
     START_WORKLOAD = "start_workload"
     STEADY_STATE = "steady_state"
     STEADY_STATE_BASELINE = "steady_state_baseline"
@@ -68,3 +73,5 @@ class RunStage(StrEnum):
     POSTACTION_SNAPSHOT = "postaction_snapshot"
     EFFECTIVENESS = "effectiveness"
     HARM = "harm"
+    # second clock reading: measurements complete, before any destructive recovery
+    CLOCK_AFTER_MEASUREMENTS = "clock_after_measurements"

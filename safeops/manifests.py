@@ -74,6 +74,8 @@ def template_values(cfg: ClusterConfig, images: dict[str, str]) -> dict[str, str
         "WORKLOAD_SERVICE": cfg.workload_service,
         "WORKLOAD_SERVICE_PORT": str(cfg.workload_service_port),
         "MONITORING_NAMESPACE": cfg.monitoring_namespace,
+        "PROMETHEUS_SERVICE": cfg.prometheus_service,
+        "PROMETHEUS_SERVICE_PORT": str(cfg.prometheus_service_port),
         "CHAOS_NAMESPACE": cfg.chaos_namespace,
         "POSTGRES_IMAGE": cfg.postgres_image,
         "TESTBED_IMAGE": images["testbed"],

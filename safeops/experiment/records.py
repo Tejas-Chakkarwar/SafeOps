@@ -189,6 +189,7 @@ RECORD_FIELDS = frozenset(
         "wall_seconds",
         "provenance",
         "clean_state_verified",
+        "clock_before_load",
         "steady_state",
         "prefault",
         "fault",
@@ -206,6 +207,7 @@ RECORD_FIELDS = frozenset(
         "postaction",
         "effective",
         "harm",
+        "clock_after_measurements",
         "reset_verified",
         "discard",
     }
@@ -317,11 +319,21 @@ class RunRecordWriter:
 
         tokens_in, tokens_out = _known_total(steps, "tokens_in"), _known_total(steps, "tokens_out")
         stabilized = f["stabilized"]
+        # Clock readings (version 2; decision 0023): the change between them is derived
+        # here only when both exist, never fabricated from one.
+        clock_before, clock_after = f["clock_before_load"], f["clock_after_measurements"]
+        clock_change = None
+        if clock_before is not None and clock_after is not None:
+            from safeops.environment.clock import clock_change as derive_change
+
+            clock_change = derive_change(clock_before, clock_after)
 
         return {
             # Allocated by the runner at run start and never regenerated here (item 1).
             "run_id": f["run_id"],
-            "schema_version": 1,
+            # Every new record is the current version (2, decision 0023). Version-1 records
+            # stay readable; nothing writes one any more.
+            "schema_version": 2,
             "phase": self.phase,
             "unit": {
                 "fault_id": unit.fault_id,
@@ -332,6 +344,7 @@ class RunRecordWriter:
             "finalized_at": _iso(finalized_at),
             "provenance": provenance,
             "clean_state_verified": f["clean_state_verified"],
+            "clock_before_load": None if clock_before is None else clock_before.to_record(),
             "steady_state": (
                 None if f["steady_state"] is None else dataclasses.asdict(f["steady_state"])
             ),
@@ -386,6 +399,8 @@ class RunRecordWriter:
             if f["postaction"] is None
             else f["postaction"].digest(),
             "outcome": outcome,
+            "clock_after_measurements": None if clock_after is None else clock_after.to_record(),
+            "clock_change": clock_change,
             "totals": {
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,

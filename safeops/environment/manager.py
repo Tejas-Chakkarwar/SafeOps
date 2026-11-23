@@ -486,6 +486,13 @@ class EnvironmentManager:
             identical = identical + 1 if not step else 1
         return SettledSnapshot(current, True, polls, self._clock() - started)
 
+    def read_clock(self):
+        """One host/cluster clock reading through a fresh, removed probe (decision 0017 §6;
+        safeops.environment.clock). Raises ClockProbeError; never a synthesized reading."""
+        from safeops.environment.clock import take_reading
+
+        return take_reading(self._k(), self.cfg.namespace)
+
     def wait_stabilization_window(self) -> bool:
         """Wait until every deployment's observed generation matches the desired one with
         all replicas ready, and endpoints have caught up, or until 120 s pass (§5).

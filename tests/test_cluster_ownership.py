@@ -35,15 +35,11 @@ IDENTITY = {
 @pytest.fixture
 def cfg(tmp_path, monkeypatch):
     """The real config, with every local path moved into a temporary state directory."""
-    real = load_cluster_config()
+    from tests.conftest import scratch_cluster_config
+
     state = tmp_path / ".safeops"
     state.mkdir()
-    c = dataclasses.replace(
-        real,
-        kubeconfig_path=state / "kubeconfig",
-        harness_kubeconfig_path=state / "experiment-controller.kubeconfig",
-        harness_token_meta_path=state / "experiment-controller.token.json",
-    )
+    c = scratch_cluster_config(state)
     monkeypatch.setattr(bootstrap, "load_cluster_config", lambda: c)
     return c
 

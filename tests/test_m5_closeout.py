@@ -289,5 +289,34 @@ def test_overflowing_numbers_in_any_payloads_are_refused(good, number, where) ->
 
 
 def test_finite_numbers_in_any_payloads_still_validate(good) -> None:
-    rec = _set(good, ("trajectory", 0, "result"), {"x": 1e308, "y": -2.5, "z": 0.0, "n": [1, 2.0]})
+    # Version 2 validates stored tool results (decision 0023), so the finite numbers ride
+    # in a real get_metrics result, with its canonical digest.
+    from safeops.tools.canonical import result_digest
+
+    values = [1e308, -2.5, 0.0, 2.0]
+    result = {
+        "status": "ok",
+        "data": {
+            "service": "orders",
+            "metric": "request_rate",
+            "window": 1,
+            "unit": "requests_per_second",
+            "start": "2026-11-19T18:00:00Z",
+            "end": "2026-11-19T18:00:15Z",
+            "step_s": 5,
+            "range_s": 20,
+            "points": [
+                {"t": f"2026-11-19T18:00:{5 * i:02d}Z", "v": v} for i, v in enumerate(values)
+            ],
+            "point_count": 4,
+            "truncated": False,
+        },
+    }
+    rec = _set(good, ("trajectory", 0, "tool"), "get_metrics")
+    rec = _set(
+        rec, ("trajectory", 0, "args"), {"service": "orders", "metric": "request_rate", "window": 1}
+    )
+    rec = _set(rec, ("trajectory", 0, "result"), result)
+    rec = _set(rec, ("trajectory", 0, "result_digest"), result_digest(result))
+    rec = _set(rec, ("provenance", "model_parameters"), {"x": 1e308, "z": 0.0, "n": [1, 2.0]})
     validate_record_json(json.dumps(rec))

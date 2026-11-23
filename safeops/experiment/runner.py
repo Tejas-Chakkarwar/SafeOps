@@ -162,8 +162,15 @@ class ExperimentRunner:
         # response was lost: the generator may be running anyway (fix list, item 4). The one
         # exception is WorkloadGeneratorBusy, which means the load is someone else's (0009,
         # W5). Then _handle_failure writes the record R1/R2 call for (decision 0017 §1).
-        stage = RunStage.START_WORKLOAD
+        #
+        # The two clock readings (0017 §6; decision 0023) are stages of their own, named
+        # before each probe runs, so a failed probe is attributed to the probe, never to the
+        # step before it: the first before the load and the incident begin, the second once
+        # the measurements are complete and before any destructive recovery (the cleanup).
+        stage = RunStage.CLOCK_BEFORE_LOAD
         try:
+            data["clock_before_load"] = env.read_clock()
+            stage = RunStage.START_WORKLOAD
             self.workload.start_workload()
             stage = RunStage.STEADY_STATE
             steady_state = data["steady_state"] = self.workload.verify_steady_state()
@@ -222,6 +229,8 @@ class ExperimentRunner:
             stage = RunStage.HARM
             harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)
             data["effective"], data["harm"] = effective, harm
+            stage = RunStage.CLOCK_AFTER_MEASUREMENTS
+            data["clock_after_measurements"] = env.read_clock()
         except BaseException as exc:
             if not isinstance(exc, WorkloadGeneratorBusy):
                 self._stop_load_after_failure(exc)

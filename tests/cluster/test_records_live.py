@@ -176,9 +176,50 @@ def test_a_real_run_with_fabricated_agent_stages_writes_one_complete_record(env,
         harm=Fixed(Rec({"harmful": False, "harm_violations": []})),
         records=RunRecordWriter(runs_dir=tmp_path / "runs", provenance=RealPlusAgentProvenance()),
     )
-    runner.run(RunUnit("bad-deployment-config", 0, 0))
+    # Milestone 6 (decision 0023): where the two real clock probes fall in the real run.
+    events: list[str] = []
+    real_env, real_workload = runner.environment, runner.workload
+    traced = {
+        (real_env, "read_clock"): lambda: (
+            f"read_clock(load running={real_workload._proxy().stats()['running']})"
+        ),
+        (real_env, "reset_environment"): lambda: "reset_environment",
+        (real_workload, "start_workload"): lambda: "start_workload",
+    }
+    for (owner, name), label in traced.items():
+        original = getattr(owner, name)
+
+        def wrapper(*a, _original=original, _label=label, **k):
+            events.append(_label())
+            return _original(*a, **k)
+
+        setattr(owner, name, wrapper)
+
+    class Harm:
+        def check(self, *a, **k):
+            events.append("harm")
+            return Rec({"harmful": False, "harm_violations": []})
+
+    runner.harm = Harm()
+    try:
+        runner.run(RunUnit("bad-deployment-config", 0, 0))
+    finally:
+        for owner, name in traced:
+            owner.__dict__.pop(name, None)
+    assert events == [
+        "reset_environment",  # pre-run reset (then verify)
+        "read_clock(load running=False)",  # before the load and the incident begin
+        "start_workload",
+        "harm",  # the last measurement
+        "read_clock(load running=True)",  # measurements complete; nothing destroyed yet
+        "reset_environment",  # the post-run cleanup, after the second reading
+    ], events
     assert env.verify_clean_state().clean  # the real post-run reset removed the fault
     raw, record = _one_record(tmp_path / "runs")
+    assert raw["schema_version"] == 2
+    for name in ("clock_before_load", "clock_after_measurements"):
+        assert -5 < raw[name]["offset_s"] < 5, raw[name]
+    assert raw["clock_change"]["interpretation"] in ("change_detected", "no_change_detected")
     assert not record.discarded and record.in_cohort_g and record.reset_verified is True
     assert raw["fault_verified"] is True and raw["fault"]["variant_index"] == 3
     assert raw["postfault_settledness"]["settled"] is True
@@ -188,7 +229,9 @@ def test_a_real_run_with_fabricated_agent_stages_writes_one_complete_record(env,
     _check_real_provenance(raw["provenance"])
     print(
         f"\n  complete record: wall {raw['totals']['wall_seconds']:.0f}s,"
-        f" settled in {raw['postfault_settledness']['polls']} polls"
+        f" settled in {raw['postfault_settledness']['polls']} polls,"
+        f" clock offsets {raw['clock_before_load']['offset_s']}s /"
+        f" {raw['clock_after_measurements']['offset_s']}s, change {raw['clock_change']}"
     )
 
 

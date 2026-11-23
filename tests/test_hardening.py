@@ -173,16 +173,11 @@ def test_endpoint_slices_are_classified_as_before() -> None:
 def scratch_cfg(tmp_path, monkeypatch):
     """The real config, with every local path moved into a temporary directory."""
     from safeops import bootstrap
+    from tests.conftest import scratch_cluster_config
 
-    real = load_cluster_config()
     state = tmp_path / ".safeops"
     state.mkdir()
-    cfg = dataclasses.replace(
-        real,
-        kubeconfig_path=state / "kubeconfig",
-        harness_kubeconfig_path=state / "experiment-controller.kubeconfig",
-        harness_token_meta_path=state / "experiment-controller.token.json",
-    )
+    cfg = scratch_cluster_config(state)
     monkeypatch.setattr(bootstrap, "load_cluster_config", lambda: cfg)
     (state / "cluster-identity.json").write_text(  # exact ownership (decision 0022)
         json.dumps(
@@ -303,3 +298,16 @@ def test_rebuild_drops_cached_clients_but_keeps_injected_ones(tmp_path) -> None:
     env = env_with(kubectl=k, node=n)
     env.quarantine_and_rebuild("test")
     assert env._kubectl is k and env._node is n  # a caller's doubles are never dropped
+
+
+def test_the_scratch_config_moves_every_local_path(tmp_path) -> None:
+    """Milestone 6 (decision 0023): a fixture that missed the new reader paths let offline
+    teardown tests delete the real reader credential. Every path key is redirected."""
+    from safeops.cluster import _PATH_KEYS
+    from tests.conftest import REPO_STATE_DIR, scratch_cluster_config
+
+    cfg = scratch_cluster_config(tmp_path)
+    assert {"reader_kubeconfig_path", "reader_token_meta_path"} <= set(_PATH_KEYS)
+    for key in _PATH_KEYS:
+        path = getattr(cfg, key)
+        assert path.parent == tmp_path and REPO_STATE_DIR not in path.parents, key

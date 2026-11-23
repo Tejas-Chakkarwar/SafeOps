@@ -1,0 +1,75 @@
+{
+  "action_attempted": false,
+  "alert": null,
+  "clean_state_verified": false,
+  "discard_reason": {
+    "cause": "pre_run_dirty",
+    "error": "environment not clean before the run; discarded and rebuilt: Deployment/orders: drift",
+    "phase": "pre_agent",
+    "stage": "pre_run_clean_state"
+  },
+  "discarded": true,
+  "execution": null,
+  "fault": null,
+  "fault_verification": null,
+  "fault_verified": null,
+  "feature_vector": null,
+  "finalized_at": "2026-11-23T03:20:46.012323Z",
+  "gate": null,
+  "in_cohort_g": false,
+  "outcome": null,
+  "phase": "A",
+  "postaction_snapshot_hash": null,
+  "postfault_settledness": null,
+  "postfault_snapshot_hash": null,
+  "prefault_snapshot_hash": null,
+  "proposal": null,
+  "proposal_status": null,
+  "provenance": {
+    "action_semantics_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "conflict_rules_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "desired_state_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "evidence_requirements_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "fault_backend": null,
+    "fault_definition_hash": "sha256:61da5ebae395eae308d7167cf22fc2b09cad7dbfc3bd410d17e0770726672377",
+    "gate_feature_version": 1,
+    "image_digests": {
+      "testbed": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "is_pilot_run": true,
+    "kind_version": "v0.33.0",
+    "kubernetes_version": "v1.37.0",
+    "model_id": "fabricated-model",
+    "model_parameters": {
+      "temperature": 0.0
+    },
+    "prompt_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "provider": "anthropic",
+    "running_images": {},
+    "safeops_commit": "0000000000000000000000000000000000000000",
+    "safeops_tree_dirty": false,
+    "snapshot_projection_version": 2,
+    "testbed_version": "safeops-testbed:000000000000",
+    "tool_schema_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "topology_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "reset_verified": null,
+  "run_id": "e4b9ac5a-cf38-4f30-8b04-cefd80c9f42e",
+  "schema_version": 1,
+  "shadow_gates": null,
+  "stabilization_timed_out": null,
+  "started_at": "2026-11-23T03:20:46.012213Z",
+  "steady_state": null,
+  "totals": {
+    "agent_seconds": null,
+    "tokens_in": null,
+    "tokens_out": null,
+    "wall_seconds": 0.00010100007057189941
+  },
+  "trajectory": null,
+  "unit": {
+    "fault_id": "bad-deployment-config",
+    "fault_seed": 0,
+    "trial_index": 0
+  }
+}

@@ -16,6 +16,10 @@ kind_node_image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a2
 kubeconfig_path: .safeops/kubeconfig
 harness_kubeconfig_path: .safeops/experiment-controller.kubeconfig
 harness_token_meta_path: .safeops/experiment-controller.token.json
+# reader:  safeops-reader's time-limited TokenRequest token (design §4, Milestone 6). Used
+#          only by the agent's read-only tools; same lifetime as the harness token.
+reader_kubeconfig_path: .safeops/safeops-reader.kubeconfig
+reader_token_meta_path: .safeops/safeops-reader.token.json
 # Requested lifetime of the harness token: one development cluster session of 7 days.
 # Bootstrap reads the issued expiry back and fails if the API server caps it lower.
 # Never falls back to the admin kubeconfig. Revisit before Milestone 14 with the measured

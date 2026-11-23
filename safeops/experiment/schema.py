@@ -1,4 +1,11 @@
-"""Run record schema, version 1 (design §11.8; decisions 0017 §1, §7 and 0018).
+"""Run record schema, versions 1 and 2 (design §11.8; decisions 0017 §1, §6, §7, 0018, 0023).
+
+Version 2 (Milestone 6, decision 0023) is version 1 plus the two host/cluster clock
+readings of 0017 §6, their derived change, and the two RunStage members that take them.
+It inherits every version-1 rule (RunRecordV2 subclasses RunRecordV1, and record_problems
+runs for both); its own additions are the clock evidence and the stored tool results.
+Version 1 is unchanged and strict: it refuses the clock fields and the clock stages. Every
+new record is version 2.
 
 Hand-checked rules on top of Pydantic's field validation, because a bug here produces a
 wrong dataset without crashing:
@@ -43,14 +50,18 @@ from safeops.enums import ActionType, ExecutionStatus, ProposalStatus, RunStage
 from safeops.experiment.records import MAX_DISCARD_ERROR, MAX_LAST_CHANGES
 from safeops.experiment.unit import FAULT_ID_PATTERN, MAX_FAULT_SEED, MAX_TRIAL_INDEX
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Where a discarded run stopped. Run stages are the closed RunStage enum (M5 review,
 # item 2); these two tuples must partition it exactly, which a test checks against the
-# enum itself, so a stage added later can't be left unclassified.
+# enum itself, so a stage added later can't be left unclassified. The clock stages
+# (decision 0023) are classified like any other: the first is before the agent, the
+# second after it.
 _S = RunStage
+CLOCK_STAGES: tuple[RunStage, ...] = (_S.CLOCK_BEFORE_LOAD, _S.CLOCK_AFTER_MEASUREMENTS)
 PRE_AGENT_STAGES: tuple[RunStage, ...] = (
     _S.PRE_RUN_CLEAN_STATE,
+    _S.CLOCK_BEFORE_LOAD,
     _S.START_WORKLOAD,
     _S.STEADY_STATE,
     _S.STEADY_STATE_BASELINE,
@@ -76,6 +87,7 @@ POST_AGENT_STAGES: tuple[RunStage, ...] = (
     _S.POSTACTION_SNAPSHOT,
     _S.EFFECTIVENESS,
     _S.HARM,
+    _S.CLOCK_AFTER_MEASUREMENTS,
 )
 
 
@@ -288,18 +300,52 @@ class Totals(_Strict):
     wall_seconds: Annotated[float, Field(ge=0.0)]
 
 
-class DiscardReason(_Strict):
+class _DiscardReasonFields(_Strict):
     stage: RunStage
     phase: Literal["pre_agent", "post_agent"]
     cause: DiscardCause
     error: Annotated[str, Field(max_length=MAX_DISCARD_ERROR)]
 
 
+class DiscardReason(_DiscardReasonFields):
+    """Version 1: the clock stages did not exist, so a version-1 record never names one."""
+
+    @model_validator(mode="after")
+    def _version_1_stages(self) -> DiscardReason:
+        if self.stage in CLOCK_STAGES:
+            raise ValueError(f"run stage {self.stage} does not exist in schema version 1")
+        return self
+
+
+class DiscardReasonV2(_DiscardReasonFields):
+    pass
+
+
+class ClockReading(_Strict):
+    """One host/cluster clock reading (0017 §6; safeops.environment.clock). offset_s is
+    derived, and must equal the readings' own offset exactly."""
+
+    host_before: AwareDatetime
+    host_after: AwareDatetime
+    server_created: AwareDatetime
+    offset_s: float
+
+
+class ClockChange(_Strict):
+    """Derived from the two readings, so present exactly when both are."""
+
+    change_s: float
+    interpretation: Literal["change_detected", "no_change_detected"]
+
+
 # What each stage writes into the record, in run order (stage names as in the runner).
 # A discard at stage S means S raised: nothing from S or after it can be present, and the
 # core data from before it must be (M5 second review, finding 1). The pre-run check's
 # result (clean_state_verified) comes before every stage.
-STAGE_PRODUCES: dict[RunStage, tuple[str, ...]] = {
+#
+# Version 1's table, unchanged. Version 2's (STAGE_PRODUCES) adds the clock stages and
+# nothing else; the strictly-before rule that reads both is the same function.
+STAGE_PRODUCES_V1: dict[RunStage, tuple[str, ...]] = {
     _S.PRE_RUN_CLEAN_STATE: (),
     _S.START_WORKLOAD: (),
     _S.STEADY_STATE: ("steady_state",),
@@ -327,13 +373,22 @@ STAGE_PRODUCES: dict[RunStage, tuple[str, ...]] = {
     _S.EFFECTIVENESS: (),
     _S.HARM: (),
 }
+# Version 2 (decision 0023): each clock reading is produced by its own stage, so a record
+# that got past that stage must carry it, and one that stopped at or before it must not.
+_CLOCK_PRODUCES = {
+    _S.CLOCK_BEFORE_LOAD: ("clock_before_load",),
+    _S.CLOCK_AFTER_MEASUREMENTS: ("clock_after_measurements", "clock_change"),
+}
+STAGE_PRODUCES: dict[RunStage, tuple[str, ...]] = {
+    stage: _CLOCK_PRODUCES[stage] if stage in _CLOCK_PRODUCES else STAGE_PRODUCES_V1[stage]
+    for stage in RunStage
+}
 # Written by a stage but never required by later ones (status-dependent).
 _ALSO_WRITES: dict[RunStage, tuple[str, ...]] = {_S.PARSE: ("proposal",)}
 # A stage that raised may already have written part of its output: the agent appends
 # each completed step to the runner's trajectory sink, so a crash at step 7 keeps steps
 # 1-6 (M5 review, item 7). Present or absent, both are valid at that stage.
 _PARTIAL_AT_OWN_STAGE: dict[RunStage, tuple[str, ...]] = {_S.AGENT: ("trajectory",)}
-_STAGE_ORDER = tuple(STAGE_PRODUCES)
 # Only traversed when the proposal is gate-eligible (and, from execute on, executed).
 _BRANCH_STAGES = (
     _S.EXTRACT,
@@ -345,26 +400,32 @@ _BRANCH_STAGES = (
 )
 
 
+def _stage_table(r: RunRecordV1) -> dict[RunStage, tuple[str, ...]]:
+    return STAGE_PRODUCES if r.schema_version >= 2 else STAGE_PRODUCES_V1
+
+
 def _stage_problems(r: RunRecordV1, stage: RunStage) -> list[str]:
     p: list[str] = []
-    i = _STAGE_ORDER.index(stage)
+    produces = _stage_table(r)
+    order = tuple(produces)
+    i = order.index(stage)
     partial = _PARTIAL_AT_OWN_STAGE.get(stage, ())
-    for later in _STAGE_ORDER[i:]:
-        for name in STAGE_PRODUCES[later] + _ALSO_WRITES.get(later, ()):
+    for later in order[i:]:
+        for name in produces[later] + _ALSO_WRITES.get(later, ()):
             if later == stage and name in partial:
                 continue
             if getattr(r, name) is not None:
                 p.append(f"discarded at {stage}, yet carries {name} from stage {later}")
-    for earlier in _STAGE_ORDER[:i]:
+    for earlier in order[:i]:
         # A branch stage's data is required only when the discard is inside the branch.
         if earlier in _BRANCH_STAGES and stage not in _BRANCH_STAGES:
             continue
-        for name in STAGE_PRODUCES[earlier]:
+        for name in produces[earlier]:
             if getattr(r, name) is None:
                 p.append(
                     f"discarded at {stage}, yet {name} from earlier stage {earlier} is missing"
                 )
-    execute = _STAGE_ORDER.index(_S.EXECUTE)
+    execute = order.index(_S.EXECUTE)
     if r.action_attempted and i < execute:
         p.append(f"discarded at {stage}, before execute, yet action_attempted is true")
     if stage in (_S.EXECUTE, _S.EXECUTED_ACTION) and not r.action_attempted:
@@ -403,6 +464,16 @@ _CORE_CHAIN = (
     "trajectory",
     "stabilization_timed_out",
     "postaction_snapshot_hash",
+    "outcome",
+)
+# Version 2 (decision 0023): the first reading precedes the load, the second follows the
+# measurements; a completed run has both, and their derived change.
+_CORE_CHAIN_V2 = (
+    "clean_state_verified",
+    "clock_before_load",
+    *_CORE_CHAIN[1:-1],
+    "clock_after_measurements",
+    "clock_change",
     "outcome",
 )
 
@@ -459,6 +530,17 @@ class RunRecordV1(_Strict):
         return self
 
 
+class RunRecordV2(RunRecordV1):
+    """Version 1 plus the clock readings (decision 0023). Every version-1 rule still runs:
+    the validator is inherited, and record_problems applies version 2's tables."""
+
+    schema_version: Literal[2]  # type: ignore[assignment]
+    discard_reason: DiscardReasonV2 | None  # type: ignore[assignment]
+    clock_before_load: ClockReading | None
+    clock_after_measurements: ClockReading | None
+    clock_change: ClockChange | None
+
+
 # The bounded composite (§9.2, §9.4): one SafeOps action, two Kubernetes writes, in order.
 COMPOSITE_STEPS: dict[ActionType, tuple[ActionType, ...]] = {
     ActionType.PATCH_CONFIGMAP: (ActionType.PATCH_CONFIGMAP, ActionType.RESTART_DEPLOYMENT),
@@ -477,6 +559,13 @@ CAUSE_STAGE: dict[str, RunStage] = {
     "detection_unmeasurable": RunStage.VERIFY_FAULT_PRESENT,
     "silent_non_injection": RunStage.FAULT_PRESENT,
     "provider_failure": RunStage.ROUTE_PROPOSAL,
+}
+# The causes a failure while taking a clock reading can have (decision 0023), explicitly:
+# the probe is harness infrastructure, so infrastructure_failure; after the agent, an
+# interrupt under R2 is operator_abort. Nothing else, whatever the generic rules allow.
+CLOCK_STAGE_CAUSES: dict[RunStage, frozenset[str]] = {
+    RunStage.CLOCK_BEFORE_LOAD: frozenset({"infrastructure_failure"}),
+    RunStage.CLOCK_AFTER_MEASUREMENTS: frozenset({"infrastructure_failure", "operator_abort"}),
 }
 
 
@@ -598,18 +687,72 @@ def _threshold(expression: str) -> float | None:
         return None
 
 
-def record_problems(r: RunRecordV1) -> list[str]:
-    """Cross-field rules. Hand-written and tested against fabricated records."""
+def _clock_problems(r: RunRecordV2) -> list[str]:
+    """Version 2: each reading's offset, and the change and its interpretation, must be
+    exactly what the stored timestamps give (safeops.environment.clock)."""
+    from safeops.environment import clock
+
     p: list[str] = []
-    present = {name: getattr(r, name) is not None for name in _CORE_CHAIN}
+    readings = {}
+    for name in ("clock_before_load", "clock_after_measurements"):
+        reading = getattr(r, name)
+        if reading is None:
+            continue
+        stamps = (reading.host_before, reading.host_after, reading.server_created)
+        readings[name] = stamps
+        if reading.server_created.microsecond:
+            p.append(f"{name}.server_created has whole-second resolution")
+        if reading.offset_s != clock.offset_us(*stamps) / 1_000_000:
+            p.append(f"{name}.offset_s is not server_created - midpoint(host_before, host_after)")
+    change = r.clock_change
+    if change is not None and len(readings) != 2:
+        p.append("clock_change needs both clock readings")
+    if change is None and len(readings) == 2:
+        p.append("both clock readings are present but clock_change is not")
+    if change is not None and len(readings) == 2:
+        before, after = readings["clock_before_load"], readings["clock_after_measurements"]
+        if change.change_s != clock.change_us(before, after) / 1_000_000:
+            p.append("clock_change.change_s is not the difference of the two offsets")
+        if change.interpretation != clock.interpretation(before, after):
+            p.append("clock_change.interpretation disagrees with the readings' uncertainty")
+    return p
+
+
+def _version_2_problems(r: RunRecordV2) -> list[str]:
+    p = _clock_problems(r)
+    d = r.discard_reason
+    if (
+        d is not None
+        and d.stage in CLOCK_STAGE_CAUSES
+        and d.cause not in CLOCK_STAGE_CAUSES[d.stage]
+    ):
+        p.append(f"a failure at {d.stage} has cause {d.cause}, not one of its explicit causes")
+    # Stored tool results (decision 0023): each step's digest, envelope, arguments and
+    # result evidence agree.
+    from safeops.tools.contracts import step_problems
+
+    for step in r.trajectory or []:
+        p.extend(
+            f"trajectory step {step.step}: {x}"
+            for x in step_problems(step.tool, step.args, step.result, step.result_digest)
+        )
+    return p
+
+
+def record_problems(r: RunRecordV1) -> list[str]:
+    """Cross-field rules, for every version. Hand-written and tested against fabricated
+    records. Version 2 runs all of version 1's, with its own stage tables, plus its own."""
+    p: list[str] = []
+    chain = _CORE_CHAIN_V2 if r.schema_version >= 2 else _CORE_CHAIN
+    present = {name: getattr(r, name) is not None for name in chain}
 
     # No ordering rule for started_at / finalized_at: a run that crossed a wall-clock step
     # is kept and flagged later (decision 0017 §6), never rejected (closeout item 1a).
 
     # Monotonic presence along the core chain.
-    for i, later in enumerate(_CORE_CHAIN):
+    for i, later in enumerate(chain):
         if present[later]:
-            missing = [e for e in _CORE_CHAIN[:i] if not present[e]]
+            missing = [e for e in chain[:i] if not present[e]]
             if missing:
                 p.append(f"{later} is present but earlier stage(s) {missing} are not")
     # Stages that travel together.
@@ -716,6 +859,8 @@ def record_problems(r: RunRecordV1) -> list[str]:
         p.append("an execution exists but action_semantics_hash is missing")
 
     p.extend(_evidence_problems(r))
+    if r.schema_version >= 2:
+        p.extend(_version_2_problems(r))
 
     # Discards.
     if r.discarded != (r.discard_reason is not None):
@@ -760,7 +905,7 @@ def record_problems(r: RunRecordV1) -> list[str]:
             p.append("no_steady_state needs stage steady_state_baseline and the failing window")
     else:
         # A completed run: the whole core chain, measured outcome, cleanup verdict.
-        missing = [e for e in _CORE_CHAIN if not present[e]]
+        missing = [e for e in chain if not present[e]]
         if missing:
             p.append(f"a completed (not discarded) run is missing {missing}")
         if r.outcome is not None and (r.outcome.effective is None or r.outcome.harmful is None):
@@ -803,7 +948,7 @@ def record_problems(r: RunRecordV1) -> list[str]:
     return p
 
 
-SCHEMA_VERSIONS: dict[int, type[RunRecordV1]] = {1: RunRecordV1}
+SCHEMA_VERSIONS: dict[int, type[RunRecordV1]] = {1: RunRecordV1, 2: RunRecordV2}
 
 
 def _reject_constant(name: str):

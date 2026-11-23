@@ -6,7 +6,9 @@ kubectl (decisions 0002, 0006, 0009).
 - The phase picks the credential. Runtime always uses the experiment-controller token
   and never falls back to the admin kubeconfig. Bootstrap uses the admin kubeconfig
   that kind wrote, and only safeops.bootstrap may ask for it
-  (tests/test_cluster_guard.py enforces that).
+  (tests/test_cluster_guard.py enforces that). Reader is SafeOps' read-only identity,
+  safeops-reader (design §4, Milestone 6): its own token, never the harness or admin
+  credential, no mutation at all, and raw calls only to Prometheus' query API.
 - Kubernetes-object mutations go through `check_object`. Runtime allows the testbed
   namespace only; bootstrap allows its namespaces plus an exactly recorded set of
   cluster-scoped objects (config/bootstrap_scope.yaml).
@@ -33,7 +35,7 @@ CLUSTER_CONFIG_PATH = REPO_ROOT / "config" / "cluster.yaml"
 # Read-only kubectl verbs that `Kubectl.read` accepts. Anything that mutates goes
 # through a dedicated, guarded method instead. Verbs with subcommands are limited to the
 # listed read-only ones (`auth reconcile` writes RBAC, `rollout restart` mutates).
-_READ_VERBS = frozenset({"get", "wait", "api-resources", "version"})
+_READ_VERBS = frozenset({"get", "wait", "api-resources", "version", "logs"})
 _READ_SUBCOMMANDS = {"rollout": frozenset({"status"}), "auth": frozenset({"can-i"})}
 
 # Flags that would override the explicit kubeconfig, context or identity. kubectl uses the
@@ -120,6 +122,7 @@ class CommandError(Exception):
 class Phase(Enum):
     RUNTIME = "runtime"
     BOOTSTRAP = "bootstrap"
+    READER = "reader"  # safeops-reader: the agent's tools (Milestone 6); never mutates
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,8 @@ class ClusterConfig:
     kubeconfig_path: Path
     harness_kubeconfig_path: Path
     harness_token_meta_path: Path
+    reader_kubeconfig_path: Path
+    reader_token_meta_path: Path
     harness_session_s: int
     namespace: str
     system_namespace: str
@@ -163,7 +168,13 @@ class ClusterConfig:
         )
 
 
-_PATH_KEYS = ("kubeconfig_path", "harness_kubeconfig_path", "harness_token_meta_path")
+_PATH_KEYS = (
+    "kubeconfig_path",
+    "harness_kubeconfig_path",
+    "harness_token_meta_path",
+    "reader_kubeconfig_path",
+    "reader_token_meta_path",
+)
 _INT_KEYS = ("harness_session_s", "workload_service_port", "prometheus_service_port")
 
 
@@ -207,6 +218,8 @@ def check_object(
 
     namespace=None means a cluster-scoped object.
     """
+    if phase is Phase.READER:
+        raise GuardError(f"the reader identity never mutates ({kind}/{name})")
     if namespace is None:
         if phase is Phase.RUNTIME:
             raise GuardError(f"runtime may not mutate cluster-scoped {kind}/{name}")
@@ -235,32 +248,43 @@ def decode_token_times(token: str) -> tuple[int, int]:
         raise CredentialError("could not read the issued token's lifetime") from exc
 
 
-def harness_credential(cfg: ClusterConfig, now: Callable[[], float] = time.time) -> Path:
-    """Path of the runtime credential, if present and unexpired. Never the admin kubeconfig."""
-    path, meta = cfg.harness_kubeconfig_path, cfg.harness_token_meta_path
+def _token_credential(path: Path, meta: Path, who: str, now: Callable[[], float]) -> Path:
     if not path.is_file() or not meta.is_file():
         raise CredentialError(
-            f"harness credential missing ({path.name}); run `make cluster-up`."
+            f"{who} credential missing ({path.name}); run `make cluster-up`."
             " Runtime never falls back to the admin kubeconfig."
         )
     try:
         expires_at = int(json.loads(meta.read_text())["expires_at"])
     except Exception as exc:
-        raise CredentialError(
-            "harness token metadata is unreadable; run `make cluster-up`"
-        ) from exc
+        raise CredentialError(f"{who} token metadata is unreadable; run `make cluster-up`") from exc
     if now() >= expires_at:
         raise CredentialError(
-            "harness token has expired; recreate the cluster or re-issue the token"
+            f"{who} token has expired; recreate the cluster or re-issue the token"
             " (refresh is deferred to before Milestone 14, decision 0009)."
             " Runtime never falls back to the admin kubeconfig."
         )
     return path
 
 
+def harness_credential(cfg: ClusterConfig, now: Callable[[], float] = time.time) -> Path:
+    """Path of the runtime credential, if present and unexpired. Never the admin kubeconfig."""
+    return _token_credential(
+        cfg.harness_kubeconfig_path, cfg.harness_token_meta_path, "harness", now
+    )
+
+
+def reader_credential(cfg: ClusterConfig, now: Callable[[], float] = time.time) -> Path:
+    """Path of safeops-reader's credential (Milestone 6), if present and unexpired. Never the
+    harness or admin credential."""
+    return _token_credential(cfg.reader_kubeconfig_path, cfg.reader_token_meta_path, "reader", now)
+
+
 def kubeconfig_for(cfg: ClusterConfig, phase: Phase) -> Path:
     if phase is Phase.RUNTIME:
         return harness_credential(cfg)
+    if phase is Phase.READER:
+        return reader_credential(cfg)
     if not cfg.kubeconfig_path.is_file():
         raise CredentialError(f"admin kubeconfig missing ({cfg.kubeconfig_path.name})")
     return cfg.kubeconfig_path
@@ -285,12 +309,16 @@ class Kubectl:
         self.cfg = cfg
         self.phase = phase
         self._run = runner
-        if kubeconfig is not None and phase is Phase.RUNTIME:
-            # Runtime never uses the admin credential, however it is passed in (review C1).
-            if kubeconfig.resolve() == cfg.kubeconfig_path.resolve():
+        if kubeconfig is not None and phase in (Phase.RUNTIME, Phase.READER):
+            # Runtime never uses the admin credential, however it is passed in (review C1),
+            # and the reader never uses anyone's credential but its own (Milestone 6).
+            refused = {cfg.kubeconfig_path.resolve(): "the admin kubeconfig"}
+            if phase is Phase.READER:
+                refused[cfg.harness_kubeconfig_path.resolve()] = "the harness kubeconfig"
+            if kubeconfig.resolve() in refused:
                 raise CredentialError(
-                    "runtime was handed the admin kubeconfig; runtime never falls back to"
-                    " the admin kubeconfig"
+                    f"{phase.value} was handed {refused[kubeconfig.resolve()]}; it never falls"
+                    " back to another identity's credential"
                 )
         self.kubeconfig = kubeconfig if kubeconfig is not None else kubeconfig_for(cfg, phase)
         self._cluster_scoped: frozenset[str] | None = None
@@ -430,6 +458,18 @@ class Kubectl:
         """Create objects after checking every one against the guard."""
         self._mutate(["create"], objects, cluster_scope)
 
+    def create_returning(self, obj: dict, timeout: float = 60) -> dict:
+        """Create one object after the guard check and return it as the API server stored
+        it (server-populated fields included): the clock probe reads its creationTimestamp
+        (decision 0017 §6)."""
+        import yaml
+
+        self._check_objects([obj], frozenset())
+        out = self._exec(
+            ["create", "-o", "json", "-f", "-"], stdin=yaml.safe_dump(obj), timeout=timeout
+        )
+        return json.loads(out)
+
     def replace(
         self, objects: Iterable[dict], cluster_scope: frozenset[tuple[str, str]] = frozenset()
     ) -> None:
@@ -477,11 +517,13 @@ class Kubectl:
             ["create", "token", service_account, "-n", namespace, f"--duration={duration_s}s"]
         ).strip()
 
-    def raw(self, method: str, path: str, body: dict | None = None) -> str:
-        """Raw API call. Reached only through WorkloadProxy and bootstrap health checks.
+    def raw(self, method: str, path: str, body: dict | None = None, timeout: float = 120) -> str:
+        """Raw API call. Reached only through WorkloadProxy, bootstrap health checks and the
+        reader's Prometheus queries.
 
         Defense in depth: at runtime, raw calls may only target the workload generator's
-        proxy path. Bootstrap may only GET.
+        proxy path. Bootstrap may only GET. The reader may only GET Prometheus' query API
+        through its Service proxy (Milestone 6).
 
         Every path must be an absolute API path. A wrapper validates its own assumptions:
         without this, a bootstrap path shaped like a flag ("--kubeconfig=...") would land
@@ -496,12 +538,25 @@ class Kubectl:
             )
             if not path.startswith(prefix) or ".." in path:
                 raise GuardError("runtime raw calls may only reach the workload generator proxy")
+        elif self.phase is Phase.READER:
+            prefix = (  # by port: the Service's port is named, so a bare name won't resolve
+                f"/api/v1/namespaces/{self.cfg.monitoring_namespace}/services/"
+                f"{self.cfg.prometheus_service}:{self.cfg.prometheus_service_port}/proxy/api/v1/"
+            )
+            rest = path[len(prefix) :] if path.startswith(prefix) else ""
+            endpoint = rest.split("?", 1)[0]
+            if method != "GET" or endpoint not in ("query", "query_range"):
+                raise GuardError("reader raw calls may only GET Prometheus' query API")
+            if ".." in path or "#" in path or "?" not in rest:
+                raise GuardError("reader raw calls need a plain query string")
         elif method != "GET":
             raise GuardError("bootstrap raw calls are GET only")
         if method == "GET":
-            return self._exec(["get", "--raw", path])
+            return self._exec(["get", "--raw", path], timeout=timeout)
         if method == "PUT":
-            return self._exec(["replace", "--raw", path, "-f", "-"], stdin=json.dumps(body or {}))
+            return self._exec(
+                ["replace", "--raw", path, "-f", "-"], stdin=json.dumps(body or {}), timeout=timeout
+            )
         raise GuardError(f"raw {method} is not supported")
 
 

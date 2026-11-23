@@ -35,6 +35,7 @@ PROTECTED = (
     "safeops.domain",
     "safeops.enums",
     "safeops.topology",
+    "safeops.cluster",  # the guarded client the tools read through (Milestone 6)
 )
 FORBIDDEN = (
     "safeops.faults",
@@ -247,3 +248,44 @@ def test_a_relative_import_of_the_experiment_is_caught(tmp_path: Path) -> None:
         },
     )
     assert _leaks(reachable_modules(root, "safeops", ("safeops.agent",)), FORBIDDEN)
+
+
+def test_the_real_tools_reach_the_reader_client_and_nothing_forbidden() -> None:
+    """Milestone 6 (decision 0023): with the eight real tools in place, the wall still holds,
+    and the traversal really walks them (not a vacuous pass)."""
+    reachable = reachable_modules(REPO_ROOT, "safeops", ("safeops.tools",))
+    assert {
+        "safeops.tools.kube",
+        "safeops.tools.metrics",
+        "safeops.tools.contracts",
+        "safeops.tools.canonical",
+        "safeops.tools.reader",
+        "safeops.cluster",
+        "safeops.topology",
+    } <= reachable
+    assert not _leaks(reachable, FORBIDDEN), sorted(_leaks(reachable, FORBIDDEN))
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "safeops.environment.clock",
+        "safeops.experiment.schema",
+        "safeops.faults.injector",
+        "safeops.verify.effectiveness",
+    ],
+)
+def test_a_tool_reaching_evaluator_state_through_a_neutral_helper_is_caught(
+    tmp_path: Path, target: str
+) -> None:
+    """A "neutral" helper that itself imports harness code doesn't launder the import."""
+    pkg, mod = target.rsplit(".", 1)
+    root = _fake_tree(
+        tmp_path,
+        {
+            f"{pkg.split('.', 1)[1]}/{mod}.py": "X = 1\n",
+            "cluster.py": f"def helper():\n    from {pkg} import {mod}\n",
+            "tools/kube.py": "from safeops.cluster import helper\n",
+        },
+    )
+    assert pkg in _leaks(reachable_modules(root, "safeops", ("safeops.tools",)), FORBIDDEN)

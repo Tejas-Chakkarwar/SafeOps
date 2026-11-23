@@ -1,0 +1,77 @@
+# safeops-reader: SafeOps' read-only identity, used only by the agent's tools (design §4,
+# §11.3; Milestone 6, decision 0023). Read-only is enforced here, by the API server, never
+# by a prompt (Rule 18). It lives in the system namespace so a testbed rebuild keeps it.
+#
+# Exactly the §4 list in the testbed namespace: get/list/watch on pods, events, services,
+# endpointslices, configmaps, deployments, replicasets and statefulsets, and `get` only on
+# pods/log (a subresource; list/watch on it would be meaningless). Nothing else:
+# - no verb that writes, on anything;
+# - no Secrets, no pods/exec, pods/attach, pods/portforward or services/proxy in testbed;
+# - nothing in the workload namespace, its proxy included (decision 0009), the chaos,
+#   system or kube-system namespaces, or cluster scope;
+# - one Service proxy grant, `get` only, on the Prometheus server by port, for get_metrics. GET
+#   reaches Prometheus' read API; its lifecycle endpoints need PUT/POST (`update`/`create`
+#   on services/proxy), which are not granted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: safeops-reader
+  namespace: ${SYSTEM_NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: safeops-reader
+  namespace: ${TESTBED_NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: safeops-reader
+  namespace: ${TESTBED_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: safeops-reader
+    namespace: ${SYSTEM_NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: safeops-reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: safeops-reader-prometheus
+  namespace: ${MONITORING_NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["services/proxy"]
+    resourceNames: ["${PROMETHEUS_SERVICE}:${PROMETHEUS_SERVICE_PORT}"]  # proxied by port
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: safeops-reader-prometheus
+  namespace: ${MONITORING_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: safeops-reader
+    namespace: ${SYSTEM_NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: safeops-reader-prometheus
