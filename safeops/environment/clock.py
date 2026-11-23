@@ -8,9 +8,13 @@ so no new RBAC), and takes three timestamps:
     server_created  the new object's metadata.creationTimestamp (API server clock)
     host_after      host wall clock immediately after the create returned it
 
-The probe is deleted and confirmed gone before the reading is returned, so it is never
-present during the load, the agent, a snapshot or harm measurement. Any failure to create,
-read or remove it raises ClockProbeError: never a missing or synthesized reading.
+Each probe ConfigMap is deleted, and confirmed gone, before the reading is returned. The
+first reading is taken, and its probe removed, before the measured workload begins. The
+second is taken after every experimental measurement is complete: load generation may still
+be flowing until the cleanup stops it, but the probe is never present during any measured
+part of the run, the agent's execution, a snapshot, effectiveness measurement or harm
+measurement (decision 0023 §13). Any failure to create, read or remove it raises
+ClockProbeError: never a missing or synthesized reading.
 
 What the numbers mean. creationTimestamp is the API-server clock as seen inside the kind
 environment, truncated to the second (metav1.Time keeps whole seconds), plus request

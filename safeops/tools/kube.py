@@ -24,6 +24,25 @@ from safeops.tools.canonical import normalize
 from safeops.tools.contracts import ToolError
 from safeops.tools.reader import ToolContext, cap, items, parse_time
 
+# The kubelet's answer when a container has no previous instance to serve, observed on the
+# pinned kubelet (decision 0023, closure amendment): `Error from server (BadRequest):
+# previous terminated container "<c>" in pod "<p>" not found`. Only this is "history
+# unavailable"; any other failure of a --previous read is a failed read.
+_NO_PREVIOUS = re.compile(r'previous terminated container "[^"]*" in pod "[^"]*" not found')
+
+
+def split_records(out: str) -> list[str]:
+    """kubectl's log records: framed on literal "\n" only. Every other character Python's
+    str.splitlines() would break on (\r, \v, \f, \x1c-\x1e, \x85, \u2028, \u2029) is
+    application data, and a "\r" before the "\n" is kept as part of the text (decision 0023,
+    closure amendment). Only the empty element after the final "\n" is dropped: it is an
+    artifact of the delimiter, not a record."""
+    parts = out.split("\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
 # Harness objects the agent must never see (Rule 1, §11.1 "explicitly ignored"): Chaos Mesh
 # custom resources are the injection mechanism itself, and their events name it.
 HARNESS_API_GROUPS = frozenset({"chaos-mesh.org"})
@@ -335,18 +354,21 @@ def get_logs(
                         f"--tail={c.LOG_SCAN_LINES + 1}",
                     )
                 except ToolError as exc:
-                    # The kubelet may already have discarded a previous instance: that
-                    # stream is unread, and the result says so. Anything else fails the call.
-                    if instance == "previous" and exc.kind == "command_failed":
+                    # The kubelet has no previous instance to serve: that stream is unread,
+                    # and the result says so. Any other failure, of any read, fails the call.
+                    if (
+                        instance == "previous"
+                        and exc.kind == "command_failed"
+                        and _NO_PREVIOUS.search(exc.message)
+                    ):
                         scan_limited = True
                         continue
                     raise
-                raw = out.splitlines()
+                raw = split_records(out)
                 if len(raw) > c.LOG_SCAN_LINES:
                     scan_limited, raw = True, raw[-c.LOG_SCAN_LINES :]
                 for index, line in enumerate(raw):
-                    if not line:
-                        continue
+                    # A record without a valid timestamp prefix is malformed source output.
                     stamp, _, text = line.partition(" ")
                     ts = _projected(lambda stamp=stamp: parse_time(stamp))
                     if ts < since:

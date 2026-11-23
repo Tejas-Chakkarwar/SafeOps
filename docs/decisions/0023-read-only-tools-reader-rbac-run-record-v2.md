@@ -336,8 +336,10 @@ The import wall is necessary, not sufficient; outputs were audited field by fiel
   - Decide which error kinds end the run as `infrastructure_failure` rather than being shown to the agent: at least `credential` and `guard`.
   - Hash the eight contracts into `tool_schema_hash`.
 - **Milestone 11:**
-  - Check `get_logs` on a really crash-looping container: the previous-instance read, the waiting case, and `scan_limited` (amendment below).
+  - ~~Check `get_logs` on a really crash-looping container~~: done at the Milestone 6 closure (closure amendment).
   - `memory-limit-low`'s durable evidence comes from `get_pods` (termination reason and exit code) and `get_events` (0010).
+  - **Event messages (the external review's F2/F3 concern; not decision 0003's F2/F3).** When the faults whose mechanisms make the kubelet or a controller emit events are implemented or exercised, inspect the actual events those mechanisms generate. Verify that normal kubelet and controller event messages can't reveal evaluator-only process, container or resource identifiers. Add filtering only from concrete implemented identifiers and observed messages, never from generic substring blacklists: `chaos`, `fault`, `safeops`, `injected`, `error` or `timeout` would remove legitimate operational evidence. Today's filter is structural only (§11: the `chaos-mesh.org` group and `chaos` emitters).
+- **Non-blocking, when pilot numbers exist:** `get_rollout_history` reads every ReplicaSet in the namespace, then filters by controller owner before any projection, so a foreign ReplicaSet never reaches `_containers()`. Narrow the read server-side (a label selector serialized from the Deployment's) only if pilot object counts or timings show the namespace-wide read matters. Serializing `matchLabels` and `matchExpressions` correctly isn't worth it before then.
 - **Milestone 12:**
   - The clock offset and change bounds, from measured values (0017 §6).
   - `not_before` is host time, while events, logs and samples carry cluster time; their alignment is that milestone's to judge.
@@ -380,3 +382,50 @@ Four bugs were found and fixed. No record field outside the stored tool results 
   - the events flag unchecked.
 - Live: `tests/cluster/test_tools_live.py` and `test_records_live.py`, 37 passed, including the strengthened `error_rate` check; `safeops verify` CLEAN.
 - **Not proven live:** the `--previous` read. Restarting a container needs exec, which no SafeOps identity has, and the cluster isn't damaged just to test it. The Milestone 11 carry-forward (§16) now covers it: verify `get_logs` on a really crash-looping container, both instances, and the waiting case.
+
+## Closure amendment, 2026-11-23: log framing and CrashLoopBackOff on the pinned kubelet
+
+Milestone 6's final pass. The clock policy, schema, stages, RBAC, evidence floors and metrics are unchanged.
+
+**Log framing (a bug).** `get_logs` split `kubectl logs --timestamps` output with `str.splitlines()`, which also breaks on nine characters kubectl doesn't use as delimiters: `\r`, `\v`, `\f`, `\x1c`, `\x1d`, `\x1e`, `\x85`, `\u2028`, `\u2029`.
+- **Effect:** one valid record containing any of them, a bare `\r` from progress output in practice, became several pieces. Only the first carried the timestamp, so the whole call failed as `malformed_response`.
+- **Fix:** records are framed on literal `\n` only (`kube.split_records`). Exactly one element is dropped: the empty one after the final `\n`, which is a delimiter artifact and not a record. That happens before the `LOG_SCAN_LINES` comparison and the record count.
+- **Strictness is kept.** An empty element in the middle is not dropped; nor is any other record without a valid timestamp prefix. Both still fail as `malformed_response`. A timestamped record with an empty message is a real record.
+- **Contract: a `\r` before kubectl's `\n` is application text and is kept.** `"<ts> message\r\n"` yields the text `"message\r"`, which counts toward the canonical result and its digest. This deliberately differs from the old behavior, which silently changed application data.
+- **Tests:** all nine separators, the CRLF case and the digest, the scan-cap boundary (exactly `LOG_SCAN_LINES` records plus the final newline is not limited; one more is), malformed records, and an empty message.
+
+**CrashLoopBackOff, observed on the pinned kubelet (Kubernetes v1.37.0, 2026-11-23).** The fixture was a temporary Deployment running the loaded testbed image. It printed a unique marker and exited 3, and was observed through the reader's own token. The status was read before and after the log reads, and the observation was accepted only when the same terminated instance held throughout (the first attempt raced a restart and was discarded).
+- **Status:**
+  - `restartCount: 4`;
+  - `state.waiting.reason: CrashLoopBackOff` ("back-off 1m20s …");
+  - `lastState.terminated`: `exitCode 3`, `reason Error`, a `containerID`, and `startedAt`/`finishedAt`;
+  - `ready: false`.
+- **Plain `kubectl logs` while waiting** returns the last terminated instance: its marker carried that instance's start time.
+- **`--previous` while waiting** returns the very same instance, byte for byte.
+- **Earlier instances** (three earlier crashes) are unavailable in every mode: the kubelet keeps only the last dead container.
+- **A container with no previous instance** gets `Error from server (BadRequest): previous terminated container "<c>" in pod "<p>" not found`.
+
+**The SafeOps rule, which needed no change for the waiting case:**
+- **Waiting:** one plain read; it already serves the crashed instance, and reading `--previous` too would duplicate it. Lines say `instance: "latest"`.
+- **Running, with a previous instance that ended inside the window:** a plain read plus `--previous`. That instance is skipped when it ended before the floor.
+- **Terminated:** one plain read.
+- **Never started:** no read; the stream is listed in `unavailable`.
+- **`scan_limited` is true** when an instance older than those read may have logged inside the window: there are more restarts than instances read, and the oldest read instance started after `since`. It is also true when a `--previous` read gets exactly the no-previous answer above. Otherwise it is false.
+- **Live:** the waiting fixture returned its marker as `latest`, with `scan_limited: true` for the three unreadable earlier crashes.
+
+**One production change from the observation (a tightening).** The first amendment treated *any* `command_failed` on a `--previous` read as history unavailable. Only the observed no-previous answer is now (`kube._NO_PREVIOUS`). Every other failure is a typed failure, as on any read: forbidden, "waiting to start", a runtime error, a timeout. A live test pins the form against the real kubelet.
+
+**Also settled, no change:**
+- `get_rollout_history` filters by controller owner before projecting; a regression proves a foreign or unowned ReplicaSet with no spec never reaches `_containers()`.
+- The `clock.py` docstring now matches §13 (the second probe may coexist with load still flowing until cleanup, never with a measured part of the run). The runtime order is untouched.
+- The carry-forwards for event messages and the ReplicaSet read are in §16.
+
+**Verification:**
+- Offline: 1612 passed, with 27 new regression cases; lint, format and repository policy clean; information wall 19 passed; no offline test touched the real `.safeops/`.
+- Mutation checks: 46 attempted, 46 killed: the 42 existing (one re-pointed: R2d, whose guard moved into the narrowed no-previous condition) and 4 new:
+  - `splitlines()` restored: all nine separator tests fail;
+  - the synthetic trailing element kept: the exact-`LOG_SCAN_LINES` test fails;
+  - a trailing `\r` stripped: the CRLF test fails;
+  - any `--previous` command failure treated as unavailable.
+  - No waiting-branch mutant: that code didn't change.
+- Live: `test_crashloop_live.py` (2), `test_tools_live.py` and `test_records_live.py`, 39 passed. `safeops verify` was CLEAN before and after every fixture, and at the end. `manifests/` and `config/` are unchanged, so RBAC is unchanged.

@@ -1336,7 +1336,7 @@ def _instance_handler(p, *, previous=None):
         if "--previous" in args:
             if isinstance(previous, BaseException):
                 return previous
-            return "\n".join(previous or []) + "\n"
+            return "".join(f"{line}\n" for line in previous or [])  # empty log: no output
         return jline(30, "info", "after the restart") + "\n"
 
     return handler
@@ -1361,7 +1361,7 @@ def test_get_logs_admits_instances_it_can_no_longer_read() -> None:
     ctx, _ = ctx_for(_instance_handler(_restarted(restarts=3, last_started=3), previous=[]))
     assert get_logs(ctx, "orders", 5, "info", 10)["scan_limited"] is True
     # The kubelet already discarded the previous instance: unread, admitted, not a failure.
-    gone = CommandError("kubectl logs failed: previous terminated container not found")
+    gone = CommandError(OBSERVED_NO_PREVIOUS)
     ctx, _ = ctx_for(_instance_handler(_restarted(), previous=gone))
     out = get_logs(ctx, "orders", 5, "info", 10)
     assert out["scan_limited"] is True and out["line_count"] == 1
@@ -1412,3 +1412,196 @@ def test_get_logs_an_empty_running_state_is_still_a_running_instance() -> None:
     out = get_logs(ctx, "orders", 5, "info", 10)
     assert sum("--previous" in call for call in reader.calls) == 1
     assert [x["instance"] for x in out["lines"]] == ["previous", "latest"]
+
+
+# --- Milestone 6 closure: log framing, CrashLoopBackOff as observed on the pinned kubelet --------
+
+# Observed live (decision 0023, closure amendment), as the reader client reports it.
+OBSERVED_NO_PREVIOUS = (
+    "kubectl logs failed: Error from server (BadRequest): previous terminated container"
+    ' "crash" in pod "orders-1" not found'
+)
+SEPARATORS = {
+    "CR": "\r",
+    "VT": "\v",
+    "FF": "\f",
+    "FS": "\x1c",
+    "GS": "\x1d",
+    "RS": "\x1e",
+    "NEL": "\x85",
+    "LS": " ",
+    "PS": " ",
+}
+
+
+def _one_stream(out: str):
+    """A single pod with a single running container whose log read returns `out`."""
+
+    def handler(args):
+        if args[:2] == ("get", "pods"):
+            return listing(pod("orders-1"))
+        return out
+
+    return ctx_for(handler)
+
+
+def _stamped(seconds_ago: float = 3) -> str:
+    return f"{ts(0, seconds_ago)[:-1]}.123456789Z"
+
+
+@pytest.mark.parametrize("sep", SEPARATORS.values(), ids=SEPARATORS.keys())
+def test_only_a_literal_newline_ends_a_log_record(sep) -> None:
+    ctx, _ = _one_stream(f"{_stamped()} before{sep}after\n")
+    out = get_logs(ctx, "orders", 5, "debug", 10)
+    assert out["line_count"] == 1 and len(out["lines"]) == 1 and out["matched_count"] == 1
+    assert out["scan_limited"] is False
+    assert out["lines"][0]["text"] == f"before{sep}after"  # one record, separator kept
+    args = {"service": "orders", "last_minutes": 5, "severity": "debug", "max_lines": 10}
+    result = {"status": "ok", "data": out}
+    assert step_problems("get_logs", args, result, result_digest(result)) == []
+
+
+def test_a_carriage_return_before_the_newline_is_kept_as_text() -> None:
+    ctx, _ = _one_stream(f"{_stamped()} before\r\n")
+    out = get_logs(ctx, "orders", 5, "debug", 10)
+    (line,) = out["lines"]
+    assert line["text"] == "before\r"  # the contract: framing is "\n" only
+    assert "before\\r" in canonical_json(out)
+    stripped = copy.deepcopy(out)
+    stripped["lines"][0]["text"] = "before"
+    assert result_digest(out) != result_digest(stripped)  # the \r is part of the evidence
+
+
+def test_the_newline_after_the_last_record_is_not_another_record() -> None:
+    def records(n):
+        return "".join(f"{_stamped(1 + i * 0.01)} r{i}\n" for i in range(n))
+
+    ctx, _ = _one_stream(records(c.LOG_SCAN_LINES))
+    full = get_logs(ctx, "orders", 5, "debug", 200)
+    assert full["scan_limited"] is False and full["matched_count"] == c.LOG_SCAN_LINES
+    ctx, _ = _one_stream(records(c.LOG_SCAN_LINES + 1))
+    over = get_logs(ctx, "orders", 5, "debug", 200)
+    assert over["scan_limited"] is True and over["matched_count"] == c.LOG_SCAN_LINES
+
+
+@pytest.mark.parametrize(
+    "out",
+    [
+        "no timestamp at all\n",
+        f"{_stamped()} ok\n\n{_stamped()} ok\n",  # an empty record in the middle
+        f"{_stamped()} ok\ncontinued without a prefix\n",
+    ],
+    ids=["no prefix", "empty middle record", "unprefixed continuation"],
+)
+def test_a_record_without_a_timestamp_is_still_malformed(out) -> None:
+    ctx, _ = _one_stream(out)
+    with pytest.raises(ToolError) as exc:
+        get_logs(ctx, "orders", 5, "debug", 10)
+    assert exc.value.kind == "malformed_response"
+
+
+def test_an_empty_message_with_a_timestamp_is_a_real_record() -> None:
+    ctx, _ = _one_stream(f"{_stamped()} \n")
+    out = get_logs(ctx, "orders", 5, "debug", 10)
+    assert out["line_count"] == 1 and out["lines"][0]["text"] == ""
+
+
+def _crashloop_pod(state, *, restarts, last=None):
+    p = pod("orders-1", restarts=restarts, state=state)
+    if last is not None:
+        p["status"]["containerStatuses"][0]["lastState"] = {"terminated": last}
+    return p
+
+
+def _term(started, finished, cid="containerd://abc"):
+    return {
+        "containerID": cid,
+        "exitCode": 3,
+        "reason": "Error",
+        "startedAt": ts(started),
+        "finishedAt": ts(finished),
+    }
+
+
+@pytest.mark.parametrize(
+    ("state", "restarts", "last", "modes", "scan_limited"),
+    [
+        # running, never restarted: one plain read
+        ({"running": {"startedAt": ts(8)}}, 0, None, [False], False),
+        # running, previous instance ended inside the window: plain + --previous
+        ({"running": {"startedAt": ts(1)}}, 1, _term(9, 2), [True, False], False),
+        # running, previous ended before the floor: not read, nothing lost
+        ({"running": {"startedAt": ts(1)}}, 1, _term(40, 30), [False], False),
+        # waiting (CrashLoopBackOff), as observed: the plain read serves lastState, once;
+        # earlier crashes inside the window are gone, and admitted
+        ({"waiting": {"reason": "CrashLoopBackOff"}}, 4, _term(1, 1), [False], True),
+        # waiting, the only crash began before the window: nothing older was lost
+        ({"waiting": {"reason": "CrashLoopBackOff"}}, 1, _term(8, 2), [False], False),
+        # terminated current state: one plain read
+        (
+            {"terminated": {"exitCode": 0, "reason": "Completed", "startedAt": ts(8)}},
+            0,
+            None,
+            [False],
+            False,
+        ),
+    ],
+    ids=[
+        "running",
+        "running+restart",
+        "restart before floor",
+        "waiting+crashes",
+        "waiting, one crash",
+        "terminated",
+    ],
+)
+def test_crashloop_read_modes_match_the_pinned_kubelet(
+    state, restarts, last, modes, scan_limited
+) -> None:
+    p = _crashloop_pod(state, restarts=restarts, last=last)
+    ctx, reader = ctx_for(_instance_handler(p, previous=[jline(60, "error", "crash")]))
+    out = get_logs(ctx, "orders", 5, "debug", 10)
+    reads = [call for call in reader.calls if call[1] == "logs"]
+    assert ["--previous" in call for call in reads] == modes
+    assert out["scan_limited"] is scan_limited and out["unavailable"] == []
+
+
+def test_a_never_started_container_is_unavailable_with_no_read() -> None:
+    p = _crashloop_pod({"waiting": {"reason": "ContainerCreating"}}, restarts=0)
+    ctx, reader = ctx_for(_instance_handler(p))
+    out = get_logs(ctx, "orders", 5, "debug", 10)
+    assert out["unavailable"] == ["orders-1/app"] and out["line_count"] == 0
+    assert not [call for call in reader.calls if call[1] == "logs"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        CommandError("kubectl logs failed: Error from server (Forbidden): pods/log denied"),
+        CommandError('kubectl logs failed: container "crash" in pod "x" is waiting to start'),
+        CommandError("kubectl logs failed: unable to retrieve container logs for containerd://x"),
+        subprocess.TimeoutExpired(["kubectl"], 30),
+    ],
+    ids=["forbidden", "waiting to start", "runtime error", "timeout"],
+)
+def test_only_the_observed_no_previous_answer_is_history_unavailable(failure) -> None:
+    ctx, _ = ctx_for(_instance_handler(_restarted(), previous=failure))
+    with pytest.raises(ToolError):
+        get_logs(ctx, "orders", 5, "info", 10)
+    ctx, _ = ctx_for(_instance_handler(_restarted(), previous=CommandError(OBSERVED_NO_PREVIOUS)))
+    assert get_logs(ctx, "orders", 5, "info", 10)["scan_limited"] is True
+
+
+def test_a_foreign_replica_set_never_reaches_projection() -> None:
+    foreign = {
+        "metadata": {
+            "name": "gateway-x",
+            "ownerReferences": [{"kind": "Deployment", "name": "gateway", "controller": True}],
+        }
+    }  # no spec at all
+    unowned = {"metadata": {"name": "stray"}}
+    ctx, _ = ctx_for(
+        by_verb({("get", "replicasets"): listing(foreign, unowned, replicaset("orders-r1", 1))})
+    )
+    out = get_rollout_history(ctx, "testbed", "orders")
+    assert [r["replica_set"] for r in out["revisions"]] == ["orders-r1"]
