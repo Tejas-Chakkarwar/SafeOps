@@ -134,7 +134,7 @@ def is_harness_event(event: dict) -> bool:
     return any(isinstance(e, str) and _HARNESS_COMPONENT.search(e) for e in emitters)
 
 
-def _event(e: dict) -> dict:
+def _event(e: dict, since) -> dict:
     meta = e["metadata"]
     series = e.get("series") or {}
     last = (
@@ -147,9 +147,10 @@ def _event(e: dict) -> dict:
     first = e.get("firstTimestamp") or e.get("eventTime")
     message, truncated = cap(str(e.get("message") or ""), c.MAX_TEXT)
     involved = e.get("involvedObject") or {}
+    first_seen = parse_time(first) if first else None
     return {
         "last_seen": parse_time(last),
-        "first_seen": parse_time(first) if first else None,
+        "first_seen": first_seen,
         "type": str(e.get("type") or "")[:32],
         "reason": str(e.get("reason") or "")[: c.MAX_REASON],
         "object": {
@@ -159,6 +160,7 @@ def _event(e: dict) -> dict:
         "message": message,
         "message_truncated": truncated,
         "count": max(1, int(series.get("count") or e.get("count") or 1)),
+        "began_before_since": first_seen is not None and first_seen < since,
     }
 
 
@@ -171,7 +173,7 @@ def get_events(ctx: ToolContext, namespace: str, last_minutes: int) -> dict:
     listed = items(ctx.read_json("get", "events", "-n", args.namespace))
 
     def project():
-        events = [c.Event(**_event(e)) for e in listed if not is_harness_event(e)]
+        events = [c.Event(**_event(e, since)) for e in listed if not is_harness_event(e)]
         return sorted((e for e in events if e.last_seen >= since), key=c.event_order)
 
     matched = _projected(project)
@@ -223,20 +225,60 @@ def line_level(text: str) -> str | None:
     return _PG_MAP.get(word, "error")  # ERROR, FATAL, PANIC
 
 
-def _streams(pod: dict) -> list[tuple[str, bool]]:
-    """(container, has a log stream) for each container, by name. A container that never
-    started has nothing to read; that is not a failed read."""
+def _stamp(value) -> object:
+    return parse_time(value) if value else None
+
+
+def _streams(pod: dict, since) -> list[dict]:
+    """What to read for each container, by name.
+
+    The kubelet keeps a container's latest instance and the one before it. `kubectl logs`
+    serves the latest (for a container waiting to restart, that is the last one that ran);
+    `--previous` serves the one before a running instance. So:
+
+    - `latest`: there is an instance to read at all. A container that never started has
+      nothing to read, which is not a failed read.
+    - `previous`: the container is running and its previous instance ended inside the
+      window, so its lines are read too (found at the Milestone 6 review: a crash-and-
+      restart inside the incident otherwise lost every line from before the restart).
+    - `older_unread`: an instance older than those read may have logged inside the window
+      (more restarts than instances read, and the oldest read one started after `since`).
+      Those lines are gone from the kubelet, so the result admits it.
+    """
     statuses = {s["name"]: s for s in (pod.get("status") or {}).get("containerStatuses") or []}
     out = []
     for spec in sorted(pod["spec"]["containers"], key=lambda x: x["name"]):
         status = statuses.get(spec["name"]) or {}
         state = status.get("state") or {}
-        started = (
-            "running" in state
-            or "terminated" in state
-            or "terminated" in (status.get("lastState") or {})
+        last = (status.get("lastState") or {}).get("terminated")
+        kind = next((k for k in ("running", "terminated") if k in state), None)
+        current = (state[kind] or {}) if kind is not None else None
+        latest = current is not None or last is not None
+        finished = _stamp(last.get("finishedAt")) if last is not None else None
+        previous = (
+            current is not None and last is not None and (finished is None or finished >= since)
         )
-        out.append((spec["name"], started))
+        # The instance just older than the oldest one read: does it exist, and could it have
+        # logged inside the window (it ended after `boundary`, the oldest read one's start)?
+        restarts = int(status.get("restartCount", 0))
+        if previous:  # read: current and previous; older ones exist from the second restart
+            older, boundary = restarts >= 2, _stamp(last.get("startedAt"))
+        elif current is not None and last is not None:  # last ended before since: not lost
+            older, boundary = False, None
+        elif current is not None:  # no record of the one before: judge by the restart count
+            older, boundary = restarts >= 1, _stamp(current.get("startedAt"))
+        else:  # waiting to restart: the latest read is `last`
+            older = restarts >= 1
+            boundary = _stamp(last.get("startedAt")) if last is not None else None
+        older_unread = latest and older and (boundary is None or boundary > since)
+        out.append(
+            {
+                "name": spec["name"],
+                "latest": latest,
+                "previous": previous,
+                "older_unread": older_unread,
+            }
+        )
     return out
 
 
@@ -245,7 +287,9 @@ def get_logs(
 ) -> dict:
     """The newest `max_lines` lines (at most 200; more is rejected, never clamped) at or
     above `severity` from the service's pods, since the current incident began, oldest
-    first. Each stream is read with a hard tail, so no read is unbounded."""
+    first. Each stream is read with a hard tail, so no read is unbounded. A container that
+    restarted inside the window has its previous instance read too; each line says which
+    instance it came from."""
     args = c.parse_args(
         c.LogsArgs,
         {
@@ -267,45 +311,61 @@ def get_logs(
     scan_limited = False
     for pod in pods[: c.MAX_LOG_PODS]:
         name = pod["metadata"]["name"]
-        streams = _projected(lambda pod=pod: _streams(pod))
+        streams = _projected(lambda pod=pod: _streams(pod, since))
         scan_limited = scan_limited or len(streams) > c.MAX_LOG_CONTAINERS
-        for container, started in streams[: c.MAX_LOG_CONTAINERS]:
-            if not started:
+        for stream in streams[: c.MAX_LOG_CONTAINERS]:
+            container = stream["name"]
+            if not stream["latest"]:
                 unavailable.append(f"{name}/{container}")
                 continue
-            out = ctx.read(
-                "logs",
-                name,
-                "-n",
-                ns,
-                "-c",
-                container,
-                "--timestamps",
-                f"--since-time={since_arg}",
-                f"--tail={c.LOG_SCAN_LINES + 1}",
-            )
-            raw = out.splitlines()
-            if len(raw) > c.LOG_SCAN_LINES:
-                scan_limited, raw = True, raw[-c.LOG_SCAN_LINES :]
-            for index, line in enumerate(raw):
-                stamp, _, text = line.partition(" ")
-                ts = _projected(lambda stamp=stamp: parse_time(stamp))
-                if ts < since:
-                    continue
-                level = line_level(text)
-                if level is not None and c.SEVERITY_RANK[level] < floor:
-                    continue
-                matched.append((ts, name, container, index, level, text))
-    matched.sort(key=lambda m: m[:4])
+            scan_limited = scan_limited or stream["older_unread"]
+            instances = [("previous", 0), ("latest", 1)] if stream["previous"] else [("latest", 1)]
+            for instance, order in instances:
+                try:
+                    out = ctx.read(
+                        "logs",
+                        name,
+                        "-n",
+                        ns,
+                        "-c",
+                        container,
+                        *(["--previous"] if instance == "previous" else []),
+                        "--timestamps",
+                        f"--since-time={since_arg}",
+                        f"--tail={c.LOG_SCAN_LINES + 1}",
+                    )
+                except ToolError as exc:
+                    # The kubelet may already have discarded a previous instance: that
+                    # stream is unread, and the result says so. Anything else fails the call.
+                    if instance == "previous" and exc.kind == "command_failed":
+                        scan_limited = True
+                        continue
+                    raise
+                raw = out.splitlines()
+                if len(raw) > c.LOG_SCAN_LINES:
+                    scan_limited, raw = True, raw[-c.LOG_SCAN_LINES :]
+                for index, line in enumerate(raw):
+                    if not line:
+                        continue
+                    stamp, _, text = line.partition(" ")
+                    ts = _projected(lambda stamp=stamp: parse_time(stamp))
+                    if ts < since:
+                        continue
+                    level = line_level(text)
+                    if level is not None and c.SEVERITY_RANK[level] < floor:
+                        continue
+                    matched.append((ts, name, container, order, index, level, text, instance))
+    matched.sort(key=lambda m: m[:5])
     shown = matched[-args.max_lines :] if matched else []
     lines = []
-    for ts, pod_name, container, _index, level, text in shown:
+    for ts, pod_name, container, _order, _index, level, text, instance in shown:
         text, truncated = cap(text, c.MAX_LOG_TEXT)
         lines.append(
             {
                 "ts": ts,
                 "pod": pod_name,
                 "container": container,
+                "instance": instance,
                 "level": level,
                 "text": text,
                 "text_truncated": truncated,

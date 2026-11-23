@@ -336,9 +336,47 @@ The import wall is necessary, not sufficient; outputs were audited field by fiel
   - Decide which error kinds end the run as `infrastructure_failure` rather than being shown to the agent: at least `credential` and `guard`.
   - Hash the eight contracts into `tool_schema_hash`.
 - **Milestone 11:**
-  - Check `get_logs` on a crash-looping container (does the current stream suffice, or is `--previous` needed?).
+  - Check `get_logs` on a really crash-looping container: the previous-instance read, the waiting case, and `scan_limited` (amendment below).
   - `memory-limit-low`'s durable evidence comes from `get_pods` (termination reason and exit code) and `get_events` (0010).
 - **Milestone 12:**
   - The clock offset and change bounds, from measured values (0017 §6).
   - `not_before` is host time, while events, logs and samples carry cluster time; their alignment is that milestone's to judge.
 - **Milestone 7:** nothing from this milestone.
+
+## Amendment, 2026-11-22: adversarial review after commit `b16d913`
+
+Four bugs were found and fixed. No record field outside the stored tool results changed; the run-record schema version is unchanged (version 2 has no finalized records yet).
+
+1. **`error_rate` returned no points for a healthy service.** Confirmed live: at a steady 10 requests/s, `request_rate` had 6 points and `error_rate` had 0, for gateway and orders.
+   - **Cause:** the 5xx counter series exists only after a first 5xx, so the numerator was an empty vector and the division returned nothing. The agent saw "no data" exactly when the error rate was 0. The live test's per-point loop passed vacuously over an empty list.
+   - **Fix:** the numerator is `(sum(rate(…5xx…)) or vector(0))`.
+     - No errors read 0.
+     - No traffic reads 0/0, the non-finite tag.
+     - A service that never served a request still has no series, so no points.
+   - **Test:** the live test now requires points, and requires the last one to be exactly 0 under steady, fault-free load.
+2. **`get_logs` lost the lines from before a restart inside the window, while claiming a complete read.** `kubectl logs` serves only the latest instance.
+   - **Fix:** a running container whose previous instance ended inside the window has that instance read too, with `--previous` and the same hard tail and `--since-time`.
+   - Each line now carries `instance: "latest" | "previous"`.
+   - **`scan_limited`** is set when an instance that may have logged inside the window can't be read. That is an instance older than those read, which the kubelet no longer keeps, detected from the restart count and the oldest read instance's start time.
+   - **A `--previous` read that fails as `command_failed`** (the kubelet already discarded it) is admitted the same way. Every other failure still fails the call.
+   - **A container waiting to restart** is read once: `kubectl logs` already serves its last instance, so reading `--previous` too would duplicate it.
+3. **A failed first clock reading stopped a load the run never started.** `CLOCK_BEFORE_LOAD` sits inside the stop-on-failure block, which before Milestone 6 began at `start_workload`, where the busy check lives.
+   - **Fix:** the runner sets `load_requested` just before calling `start_workload`, and stops the load on failure only once it is set. It is set before the call, so a lost start response still stops the load (fix list, item 4).
+   - A failure before that point leaves the generator alone; it may be running someone else's load (0009, W5).
+4. **Event counts and `first_seen` could reach before the window.** An event is kept when its last occurrence is inside the window, but Kubernetes aggregates repeats, and the count can't be split.
+   - **Fix:** each event carries `began_before_since`, true exactly when `first_seen < since`. The result validator recomputes it, so a flag that disagrees with its own evidence is rejected.
+   - The count is kept as reported. In practice this happens within a run, for example readiness failures during the pre-run reset, because reset recreates the workloads with new UIDs.
+
+**Verification:**
+- Offline: 1585 passed.
+- Mutation checks: 42, all killed: the original 34, plus 8 for these fixes:
+  - `error_rate` without `or vector(0)`;
+  - the previous instance never read;
+  - an unreadable older instance not admitted;
+  - older instances judged from the wrong restart count;
+  - a discarded previous instance failing the call;
+  - the load stopped before it was requested;
+  - the events flag never set;
+  - the events flag unchecked.
+- Live: `tests/cluster/test_tools_live.py` and `test_records_live.py`, 37 passed, including the strengthened `error_rate` check; `safeops verify` CLEAN.
+- **Not proven live:** the `--previous` read. Restarting a container needs exec, which no SafeOps identity has, and the cluster isn't damaged just to test it. The Milestone 11 carry-forward (§16) now covers it: verify `get_logs` on a really crash-looping container, both instances, and the waiting case.

@@ -167,10 +167,14 @@ class ExperimentRunner:
         # before each probe runs, so a failed probe is attributed to the probe, never to the
         # step before it: the first before the load and the incident begin, the second once
         # the measurements are complete and before any destructive recovery (the cleanup).
+        # A failure before this run asked for its load stops nothing: the generator may be
+        # running someone else's load (Milestone 6 review; the same reason as W5).
         stage = RunStage.CLOCK_BEFORE_LOAD
+        load_requested = False
         try:
             data["clock_before_load"] = env.read_clock()
             stage = RunStage.START_WORKLOAD
+            load_requested = True  # before the call: a lost response may still have started it
             self.workload.start_workload()
             stage = RunStage.STEADY_STATE
             steady_state = data["steady_state"] = self.workload.verify_steady_state()
@@ -232,7 +236,7 @@ class ExperimentRunner:
             stage = RunStage.CLOCK_AFTER_MEASUREMENTS
             data["clock_after_measurements"] = env.read_clock()
         except BaseException as exc:
-            if not isinstance(exc, WorkloadGeneratorBusy):
+            if load_requested and not isinstance(exc, WorkloadGeneratorBusy):
                 self._stop_load_after_failure(exc)
             self._handle_failure(data, stage, exc)
             raise  # _handle_failure always raises; this is never reached

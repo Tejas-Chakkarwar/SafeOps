@@ -213,8 +213,12 @@ def test_metrics_under_real_load_are_current_incident_rates() -> None:
     assert first >= started + timedelta(seconds=rate["range_s"])
     finite = [p["v"] for p in rate["points"] if isinstance(p["v"], float)]
     assert finite and finite[-1] > 1.0  # about 10 requests/s at the end
+    # Healthy traffic reads 0, never "no data" (Milestone 6 review): the 5xx series doesn't
+    # exist until a first 5xx, so the ratio needs points of its own.
+    assert errors["point_count"] >= 3
     for p in errors["points"]:
         assert p["v"] == {"non_finite": "NaN"} or 0.0 <= p["v"] <= 1.0
+    assert errors["points"][-1]["v"] == 0.0  # steady traffic, no faults: exactly zero
 
 
 # --- the clock probe, live ---------------------------------------------------------------------

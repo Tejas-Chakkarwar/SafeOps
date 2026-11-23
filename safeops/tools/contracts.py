@@ -252,6 +252,10 @@ class Event(_Strict):
     message: Text
     message_truncated: bool
     count: Annotated[int, Field(ge=1)]
+    # first_seen is before the result's `since`, so `count` includes occurrences from before
+    # the window (Milestone 6 review): Kubernetes aggregates repeats into one event, and its
+    # count can't be split. Derived from first_seen and since, and checked against them.
+    began_before_since: bool
 
 
 def event_order(e) -> tuple:
@@ -290,6 +294,8 @@ class EventsData(_Strict):
         for i, e in enumerate(self.events):
             if e.last_seen < self.since:
                 p.append(f"event {i} was last seen before since")
+            if e.began_before_since != (e.first_seen is not None and e.first_seen < self.since):
+                p.append(f"event {i}: began_before_since disagrees with first_seen and since")
             _capped_text(p, f"event {i} message", e.message, e.message_truncated, MAX_TEXT)
         _fail("get_events", p)
         return self
@@ -302,6 +308,8 @@ class LogLine(_Strict):
     ts: AwareDatetime
     pod: DnsSubdomain
     container: DnsLabel
+    # Which instance wrote it: the latest, or the one before a restart inside the window.
+    instance: Literal["latest", "previous"]
     level: Severity | None  # None: the line carries no recognizable level
     text: Annotated[str, Field(max_length=MAX_LOG_TEXT)]
     text_truncated: bool
@@ -318,9 +326,10 @@ class LogsData(_Strict):
     line_count: NonNegInt
     matched_count: NonNegInt
     truncated: bool
-    # Not everything was read: a stream had more than LOG_SCAN_LINES lines in the window, or
+    # Not everything was read: a stream had more than LOG_SCAN_LINES lines in the window,
     # some streams were skipped (more than MAX_LOG_PODS pods, more than MAX_LOG_CONTAINERS
-    # containers in a pod, more than MAX_UNAVAILABLE unavailable streams to name).
+    # containers in a pod, more than MAX_UNAVAILABLE unavailable streams to name), or a
+    # container instance that may have logged inside the window is no longer readable.
     scan_limited: bool
     # Streams with nothing to read (a container that never started), as "pod/container".
     unavailable: Annotated[

@@ -33,8 +33,11 @@ _APP = 'namespace="$ns",app="$svc"'
 _CADVISOR = 'namespace="$ns",pod=~"$pods",container!="",container!="POD"'
 TEMPLATES: dict[str, Template] = {
     "request_rate": Template(f"sum(rate(http_requests_total{{{_APP}}}[${{r}}s]))"),
+    # The 5xx series exists only after a first 5xx, so without `or vector(0)` a healthy
+    # service would read as no data, not 0 (found at the Milestone 6 review). With it:
+    # no errors -> 0, no traffic -> 0/0 = NaN (the non-finite tag), no series at all -> none.
     "error_rate": Template(
-        f'sum(rate(http_requests_total{{{_APP},code=~"5[0-9][0-9]"}}[${{r}}s]))'
+        f'(sum(rate(http_requests_total{{{_APP},code=~"5[0-9][0-9]"}}[${{r}}s])) or vector(0))'
         f" / sum(rate(http_requests_total{{{_APP}}}[${{r}}s]))"
     ),
     "latency_p95_seconds": Template(

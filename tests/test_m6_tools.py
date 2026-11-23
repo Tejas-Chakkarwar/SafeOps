@@ -835,7 +835,8 @@ def test_get_metrics_queries_are_fixed_templates() -> None:
     ctx, _ = ctx_for(by_verb({}))
     q = query(ctx, "orders", "error_rate", 20)
     assert q == (
-        'sum(rate(http_requests_total{namespace="testbed",app="orders",code=~"5[0-9][0-9]"}[20s]))'
+        '(sum(rate(http_requests_total{namespace="testbed",app="orders",code=~"5[0-9][0-9]"}[20s]))'
+        " or vector(0))"
         ' / sum(rate(http_requests_total{namespace="testbed",app="orders"}[20s]))'
     )
     assert 'pod=~"postgres-[0-9]+"' in query(ctx, "postgres", "memory_working_set_bytes", 20)
@@ -1306,3 +1307,108 @@ def test_get_logs_admits_every_stream_it_did_not_read() -> None:
     few = [pod(f"orders-{i}") for i in range(3)]
     ctx, _ = ctx_for(_log_handler({}, pods=few, waiting={p["metadata"]["name"] for p in few}))
     assert get_logs(ctx, "orders", 5, "info", 10)["scan_limited"] is False
+
+
+# --- Milestone 6 review: restarted containers, events before the window ------------------------
+
+
+def _restarted(*, restarts=1, last_started=8, last_finished=2.5, state=None):
+    """A pod whose container restarted: the previous instance ran from `last_started` to
+    `last_finished` minutes ago."""
+    p = pod("orders-1", restarts=restarts, state=state or {"running": {"startedAt": ts(2)}})
+    p["status"]["containerStatuses"][0]["lastState"] = {
+        "terminated": {
+            "reason": "Error",
+            "exitCode": 1,
+            "startedAt": ts(last_started),
+            "finishedAt": ts(last_finished),
+        }
+    }
+    return p
+
+
+def _instance_handler(p, *, previous=None):
+    """Logs by instance: --previous answers `previous` (a list, or an exception)."""
+
+    def handler(args):
+        if args[:2] == ("get", "pods"):
+            return listing(p)
+        if "--previous" in args:
+            if isinstance(previous, BaseException):
+                return previous
+            return "\n".join(previous or []) + "\n"
+        return jline(30, "info", "after the restart") + "\n"
+
+    return handler
+
+
+def test_get_logs_reads_the_instance_before_a_restart_inside_the_window() -> None:
+    ctx, reader = ctx_for(_instance_handler(_restarted(), previous=[jline(200, "error", "crash")]))
+    out = get_logs(ctx, "orders", 5, "info", 10)
+    assert [(x["instance"], x["level"]) for x in out["lines"]] == [
+        ("previous", "error"),
+        ("latest", "info"),
+    ]
+    assert out["scan_limited"] is False  # the previous instance began before since
+    logs = [call for call in reader.calls if call[1] == "logs"]
+    assert len(logs) == 2 and sum("--previous" in call for call in logs) == 1
+    for call in logs:
+        assert f"--tail={c.LOG_SCAN_LINES + 1}" in call
+
+
+def test_get_logs_admits_instances_it_can_no_longer_read() -> None:
+    # Three restarts, the previous one started inside the window: older ones logged there too.
+    ctx, _ = ctx_for(_instance_handler(_restarted(restarts=3, last_started=3), previous=[]))
+    assert get_logs(ctx, "orders", 5, "info", 10)["scan_limited"] is True
+    # The kubelet already discarded the previous instance: unread, admitted, not a failure.
+    gone = CommandError("kubectl logs failed: previous terminated container not found")
+    ctx, _ = ctx_for(_instance_handler(_restarted(), previous=gone))
+    out = get_logs(ctx, "orders", 5, "info", 10)
+    assert out["scan_limited"] is True and out["line_count"] == 1
+    # Any other failure of that read fails the call.
+    ctx, _ = ctx_for(_instance_handler(_restarted(), previous=CredentialError("rejected")))
+    with pytest.raises(ToolError) as exc:
+        get_logs(ctx, "orders", 5, "info", 10)
+    assert exc.value.kind == "credential"
+
+
+def test_get_logs_reads_one_stream_when_no_restart_falls_inside_the_window() -> None:
+    old = _restarted(last_started=40, last_finished=30)  # restarted before the window
+    ctx, reader = ctx_for(_instance_handler(old, previous=[jline(10, "error")]))
+    out = get_logs(ctx, "orders", 5, "info", 10)
+    assert not any("--previous" in call for call in reader.calls)
+    assert out["scan_limited"] is False
+    # Waiting to restart: `kubectl logs` already serves the last instance that ran.
+    waiting = _restarted(state={"waiting": {"reason": "CrashLoopBackOff"}})
+    ctx, reader = ctx_for(_instance_handler(waiting, previous=[jline(10, "error")]))
+    out = get_logs(ctx, "orders", 5, "info", 10)
+    assert not any("--previous" in call for call in reader.calls)
+    assert {x["instance"] for x in out["lines"]} == {"latest"}
+
+
+def test_events_that_began_before_the_window_are_flagged() -> None:
+    recurring = event("e-recurring", 1, reason="Unhealthy", count=40)
+    recurring["firstTimestamp"] = ts(30)  # first seen during the reset, before the load
+    fresh = event("e-fresh", 2, reason="Started")
+    ctx, _ = ctx_for(by_verb({("get", "events"): listing(recurring, fresh)}))
+    out = get_events(ctx, "testbed", 5)
+    flags = {e["reason"]: (e["began_before_since"], e["count"]) for e in out["events"]}
+    assert flags == {"Unhealthy": (True, 40), "Started": (False, 1)}
+    tool, args = "get_events", {"namespace": "testbed", "last_minutes": 5}
+    for i, value in ((0, False), (1, True)):
+        result = {"status": "ok", "data": copy.deepcopy(out)}
+        result["data"]["events"][i]["began_before_since"] = not result["data"]["events"][i][
+            "began_before_since"
+        ]
+        assert any(
+            "began_before_since" in p
+            for p in step_problems(tool, args, result, result_digest(result))
+        ), (i, value)
+
+
+def test_get_logs_an_empty_running_state_is_still_a_running_instance() -> None:
+    p = _restarted(state={"running": {}})  # no startedAt
+    ctx, reader = ctx_for(_instance_handler(p, previous=[jline(200, "error", "crash")]))
+    out = get_logs(ctx, "orders", 5, "info", 10)
+    assert sum("--previous" in call for call in reader.calls) == 1
+    assert [x["instance"] for x in out["lines"]] == ["previous", "latest"]

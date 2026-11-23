@@ -618,3 +618,29 @@ def test_the_probe_goes_through_the_guarded_runtime_path() -> None:
                 "metadata": {"name": "x", "namespace": "default"},
             }
         )
+
+
+def test_a_failure_before_the_load_was_requested_stops_nothing(tmp_path) -> None:
+    """Milestone 6 review: a failed first reading must not stop a load this run never asked
+    for: the generator may be running someone else's."""
+    r = _runner(tmp_path)
+    stopped = []
+    r.workload.stop_workload = lambda: stopped.append(True)
+    r.environment.read_clock = ProbeFails(r.environment, 1)
+    with pytest.raises(ClockProbeError):
+        r.run(UNIT)
+    assert stopped == []
+
+
+def test_a_failure_once_the_load_was_requested_still_stops_it(tmp_path) -> None:
+    r = _runner(tmp_path)
+    stopped = []
+    r.workload.stop_workload = lambda: stopped.append(True)
+
+    def lost():
+        raise RuntimeError("the start's response was lost; it may be running")
+
+    r.workload.start_workload = lost
+    with pytest.raises(RuntimeError):
+        r.run(UNIT)
+    assert stopped == [True]
