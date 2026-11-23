@@ -292,6 +292,20 @@ def kubeconfig_for(cfg: ClusterConfig, phase: Phase) -> Path:
 
 # --- kubectl -------------------------------------------------------------------------
 
+
+def decode_raw(data: bytes | str | None) -> str:
+    """Bytes from a raw kubectl call as text: UTF-8 with errors="replace", whatever the
+    process locale (decision 0023, second closure amendment). It never raises, and it is
+    deterministic: the same bytes always give the same text, with no surrogate code points
+    (surrogateescape would make canonical JSON fail; ignore would delete evidence). A str
+    passes through unchanged (test doubles that return text)."""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    return bytes(data).decode("utf-8", errors="replace")
+
+
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
@@ -368,18 +382,29 @@ class Kubectl:
             )
         self._identity_verified = True
 
-    def _exec(self, args: list[str], stdin: str | None = None, timeout: float = 120) -> str:
+    def _exec(
+        self, args: list[str], stdin: str | None = None, timeout: float = 120, *, raw: bool = False
+    ) -> str:
+        """Run kubectl. `raw` takes the output as bytes and decodes it here (decode_raw), with
+        no newline translation: text mode's universal newlines turn "\r" and "\r\n" into
+        "\n" before the caller sees them (decision 0023, second closure amendment). A raw
+        call takes no stdin, so a str can never meet a binary pipe."""
         self._verify_identity()
+        if raw and stdin is not None:
+            raise GuardError("a raw kubectl call takes no stdin")
         proc = self._run(
             self.base_args() + args,
             input=stdin,
             capture_output=True,
-            text=True,
+            text=not raw,
             timeout=timeout,
             check=False,
         )
+        stdout, stderr = proc.stdout, proc.stderr
+        if raw:
+            stdout, stderr = decode_raw(stdout), decode_raw(stderr)
         if proc.returncode != 0:
-            err = (proc.stderr or "").strip().splitlines()
+            err = (stderr or "").strip().splitlines()
             detail = err[-1] if err else f"exit {proc.returncode}"
             if "Unauthorized" in detail or "must be logged in" in detail:
                 raise CredentialError(
@@ -387,10 +412,22 @@ class Kubectl:
                     " Runtime never falls back to the admin kubeconfig."
                 )
             raise CommandError(f"kubectl {args[0]} failed: {detail}")
-        return proc.stdout
+        return stdout
 
     def read(self, *args: str, timeout: float = 120) -> str:
         """Run a read-only kubectl command. Caller arguments can't override the identity."""
+        self._check_read(args)
+        return self._exec(list(args), timeout=timeout)
+
+    def read_raw(self, *args: str, timeout: float = 120) -> str:
+        """read(), behind the same guard, identity check, timeout and errors, with the output
+        taken as bytes and decoded explicitly (see _exec). For `kubectl logs`, whose output
+        is application data: every character except kubectl's own "\n" must arrive as is."""
+        self._check_read(args)
+        return self._exec(list(args), timeout=timeout, raw=True)
+
+    @staticmethod
+    def _check_read(args: tuple[str, ...]) -> None:
         verb = args[0] if args else ""
         allowed_sub = _READ_SUBCOMMANDS.get(verb)
         if allowed_sub is not None:
@@ -399,7 +436,6 @@ class Kubectl:
         elif verb not in _READ_VERBS:
             raise GuardError(f"kubectl {verb!r} is not a read-only command")
         _check_caller_args(args)
-        return self._exec(list(args), timeout=timeout)
 
     def get_json(self, *args: str) -> dict:
         return json.loads(self.read("get", *args, "-o", "json"))

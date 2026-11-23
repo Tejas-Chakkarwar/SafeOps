@@ -79,6 +79,11 @@ class ToolContext:
         """One read through the reader client; every failure becomes a typed ToolError."""
         return _guarded(lambda: self.kubectl.read(*args, timeout=self.timeout_s))
 
+    def read_raw(self, *args: str) -> str:
+        """read(), with the output taken as raw bytes and decoded explicitly (Kubectl.read_raw):
+        for `kubectl logs`, so "\r" and every other non-"\n" character survive as data."""
+        return _guarded(lambda: self.kubectl.read_raw(*args, timeout=self.timeout_s))
+
     def read_json(self, *args: str) -> dict:
         return _json(self.read(*args, "-o", "json"))
 
@@ -97,6 +102,8 @@ def _guarded(call: Callable[[], str]) -> str:
         raise ToolError("command_failed", str(exc)) from exc
     except subprocess.TimeoutExpired as exc:
         raise ToolError("timeout", f"the read did not finish in {exc.timeout}s") from exc
+    except UnicodeDecodeError as exc:  # a text-mode read of undecodable output: never untyped
+        raise ToolError("malformed_response", f"the output is not valid text: {exc}") from exc
 
 
 def _json(text: str) -> dict:

@@ -28,7 +28,12 @@ from safeops.tools.reader import ToolContext, cap, items, parse_time
 # pinned kubelet (decision 0023, closure amendment): `Error from server (BadRequest):
 # previous terminated container "<c>" in pod "<p>" not found`. Only this is "history
 # unavailable"; any other failure of a --previous read is a failed read.
-_NO_PREVIOUS = re.compile(r'previous terminated container "[^"]*" in pod "[^"]*" not found')
+# Anchored at the end, never fullmatch()ed against the whole message: the project's own
+# "kubectl logs failed:" wrapper may change, and the kubelet's answer must still count.
+_NO_PREVIOUS = re.compile(
+    r"Error from server \(BadRequest\): previous terminated container "
+    r'"[^"]*" in pod "[^"]*" not found\Z'
+)
 
 
 def split_records(out: str) -> list[str]:
@@ -341,7 +346,7 @@ def get_logs(
             instances = [("previous", 0), ("latest", 1)] if stream["previous"] else [("latest", 1)]
             for instance, order in instances:
                 try:
-                    out = ctx.read(
+                    out = ctx.read_raw(  # bytes, decoded explicitly: "\r" is data
                         "logs",
                         name,
                         "-n",

@@ -391,7 +391,7 @@ Milestone 6's final pass. The clock policy, schema, stages, RBAC, evidence floor
 - **Effect:** one valid record containing any of them, a bare `\r` from progress output in practice, became several pieces. Only the first carried the timestamp, so the whole call failed as `malformed_response`.
 - **Fix:** records are framed on literal `\n` only (`kube.split_records`). Exactly one element is dropped: the empty one after the final `\n`, which is a delimiter artifact and not a record. That happens before the `LOG_SCAN_LINES` comparison and the record count.
 - **Strictness is kept.** An empty element in the middle is not dropped; nor is any other record without a valid timestamp prefix. Both still fail as `malformed_response`. A timestamped record with an empty message is a real record.
-- **Contract: a `\r` before kubectl's `\n` is application text and is kept.** `"<ts> message\r\n"` yields the text `"message\r"`, which counts toward the canonical result and its digest. This deliberately differs from the old behavior, which silently changed application data.
+- **Contract: a `\r` before kubectl's `\n` is application text and is kept.** `"<ts> message\r\n"` yields the text `"message\r"`, which counts toward the canonical result and its digest. This deliberately differs from the old behavior, which silently changed application data. *(Correction, second closure amendment: in `0aadce9` this held for the parser only. In production, subprocess text mode had already turned `\r` and `\r\n` into `\n` before `split_records()` ran, so bare `\r` still split records and a trailing `\r` never reached the digest. It holds end to end since the raw read below.)*
 - **Tests:** all nine separators, the CRLF case and the digest, the scan-cap boundary (exactly `LOG_SCAN_LINES` records plus the final newline is not limited; one more is), malformed records, and an empty message.
 
 **CrashLoopBackOff, observed on the pinned kubelet (Kubernetes v1.37.0, 2026-11-23).** The fixture was a temporary Deployment running the loaded testbed image. It printed a unique marker and exited 3, and was observed through the reader's own token. The status was read before and after the log reads, and the observation was accepted only when the same terminated instance held throughout (the first attempt raced a restart and was discarded).
@@ -429,3 +429,49 @@ Milestone 6's final pass. The clock policy, schema, stages, RBAC, evidence floor
   - any `--previous` command failure treated as unavailable.
   - No waiting-branch mutant: that code didn't change.
 - Live: `test_crashloop_live.py` (2), `test_tools_live.py` and `test_records_live.py`, 39 passed. `safeops verify` was CLEAN before and after every fixture, and at the end. `manifests/` and `config/` are unchanged, so RBAC is unchanged.
+
+## Second closure amendment, 2026-11-23: the logs read crosses the subprocess boundary as bytes
+
+**The bug, a layer below the framing fix.**
+- `Kubectl._exec` ran every kubectl call with `text=True`. Text mode's universal newlines translate `\r` and `\r\n` into `\n` before the caller sees the string.
+- So `split_records()` was right, but in production a bare `\r` still split a record (the second half has no timestamp, so the call failed as `malformed_response`), and a CRLF record arrived with its `\r` already gone.
+- Measured across a real subprocess: eight of the nine separators survived; `\r` did not.
+- **The same boundary, a second bug:** under text mode an invalid UTF-8 byte raised `UnicodeDecodeError` inside `subprocess.run`. `_guarded` didn't type it, so it would have escaped `invoke()` and discarded the run instead of failing one call.
+
+**Fix: only the logs read is raw.**
+- `Kubectl.read_raw()` sits behind exactly `read()`'s checks: one extracted `_check_read` (`_READ_VERBS`, `_READ_SUBCOMMANDS`, `_check_caller_args`), then `_exec(..., raw=True)`. It gets the same identity verification, timeout and typed errors (`CredentialError`, `CommandError`).
+- `_exec(raw=True)` runs the child with `text=False` and refuses stdin, so a `str` never meets a binary pipe.
+- `ToolContext.read_raw()` maps failures like every read. `get_logs` uses it for `kubectl logs` and nothing else; every JSON read stays in text mode, unchanged.
+- `_guarded` also types a `UnicodeDecodeError` from any text-mode read as `malformed_response`, so a decode error can't escape untyped anywhere.
+
+**Decoding policy.** On the raw path, stdout and stderr are decoded explicitly with `bytes.decode("utf-8", errors="replace")` (`cluster.decode_raw`), whatever the process locale.
+- **`replace`** is deterministic (the same bytes always give the same text) and introduces no surrogate code points, so the evidence stays canonical-JSON-safe and digest-stable.
+- **`surrogateescape`** would put surrogates in the text, which `canonical_json` rejects.
+- **`ignore`** would silently delete evidence.
+- Undecodable bytes become U+FFFD in the text; they can no longer raise.
+
+**`_NO_PREVIOUS`, tightened.**
+- The pattern is now `Error from server \(BadRequest\): previous terminated container "[^"]*" in pod "[^"]*" not found\Z`, used with `.search()`.
+- It requires the kubelet's own `BadRequest` context and ends at the end of the message, so the observed answer with anything appended is a typed failure.
+- It is deliberately not `fullmatch()` against the whole message. That would bind the kubelet's answer to the project's own `kubectl logs failed:` wrapper: if the wrapper changed, every legitimate no-previous answer would become a failure, on exactly the crash-looping containers this milestone verified.
+- It still matches the observed string offline and the pinned kubelet live.
+
+**Lesson, the reason the new tests exist.** A test that stubs the client proves the parser, not the operating-system and subprocess boundary. The first closure's nine separator tests all passed against `FakeReader`, which hands back a Python `str`, while `\r` was still broken in production. Any claim about raw bytes or newline preservation now has at least one test across a real subprocess. `tests/test_m6_tools.py` covers that path, `child raw bytes -> subprocess.run -> Kubectl.read_raw -> ToolContext -> get_logs -> split_records`, for:
+- all nine separators;
+- a bare `\r`;
+- CRLF, whose retained `\r` changes the digest;
+- invalid UTF-8;
+- the scan-cap boundary;
+- the kubelet's no-previous answer on stderr.
+
+The clock, schema, stages, cohort, rollout history, event filtering and RBAC are unchanged.
+
+**Verification:**
+- **Offline:** 1630 passed, with 18 new; lint, format, repository policy and information wall (19) clean; no offline test touched the real `.safeops/`.
+- **Mutation checks:** 50 attempted, 50 killed. The 46 existing needed no re-pointing; the 4 new are:
+  - SA, the logs read back in text mode: the CR boundary, bare-CR and CRLF tests fail;
+  - SB, `surrogateescape`: the invalid-UTF-8 test fails on canonical JSON;
+  - SC, no `\Z`: the trailing-context test fails;
+  - SD, the raw read skipping the guard: the guard test fails.
+- **Live:** 39 passed (`test_crashloop_live.py`, `test_tools_live.py`, `test_records_live.py`); `safeops verify` CLEAN.
+  - The live run showed raw `kubectl` stderr ends in `\n`, which `\Z` deliberately rejects. `get_logs` matches the `CommandError` that `_exec` builds from the stripped last stderr line. The live test now checks that production form, through the reader's real `read_raw`.

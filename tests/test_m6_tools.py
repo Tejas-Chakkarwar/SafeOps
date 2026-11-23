@@ -75,6 +75,16 @@ class FakeReader:
             raise out
         return out if isinstance(out, str) else json.dumps(out)
 
+    def read_raw(self, *args, timeout=None):
+        """The logs read. A fake returning str never crosses the subprocess boundary, which
+        is how text mode's "\r" translation stayed hidden: tests/test_m6_tools.py's
+        real-subprocess tests cover that boundary (decision 0023, second closure amendment)."""
+        self.calls.append(("read_raw", *args))
+        out = self.handler(args)
+        if isinstance(out, BaseException):
+            raise out
+        return out if isinstance(out, str) else json.dumps(out)
+
     def raw(self, method, path, body=None, timeout=None):
         self.calls.append(("raw", method, path))
         out = self.handler(("raw", path))
@@ -265,7 +275,7 @@ def _reader_cfg(tmp_path):
     import dataclasses
 
     state = tmp_path / ".safeops"
-    state.mkdir()
+    state.mkdir(exist_ok=True)  # several readers may share one temporary path
     return dataclasses.replace(
         CFG,
         kubeconfig_path=state / "kubeconfig",
@@ -414,7 +424,8 @@ def test_tool_code_never_names_another_identity() -> None:
                     isinstance(inner, ast.Name) and inner.id == "kubectl"
                 ):
                     client_uses.add(node.attr)
-    assert client_uses == {"read", "raw", "cfg"}, client_uses  # raw is GET-only for the reader
+    # raw is GET-only for the reader; read_raw is read() taken as bytes (the logs read)
+    assert client_uses == {"read", "read_raw", "raw", "cfg"}, client_uses
 
 
 # --- RBAC manifest: exactly the §4 reader surface ------------------------------------------------
@@ -1094,7 +1105,8 @@ def test_no_tool_can_mutate_or_escape_under_hostile_arguments(tool) -> None:
                 assert result["error"]["kind"] == "invalid_argument", (name, bad, result)
                 assert reader.calls == [], (name, bad)
             for call in reader.calls:  # only fixed reads; a value is never its own argument
-                assert call[0] in ("read", "raw") and (call[0] == "read" or call[1] == "GET")
+                assert call[0] in ("read", "read_raw", "raw")
+                assert call[0] != "raw" or call[1] == "GET"
                 if not isinstance(bad, str) or not bad:
                     continue
                 for part in call:
@@ -1605,3 +1617,163 @@ def test_a_foreign_replica_set_never_reaches_projection() -> None:
     )
     out = get_rollout_history(ctx, "testbed", "orders")
     assert [r["replica_set"] for r in out["revisions"]] == ["orders-r1"]
+
+
+# --- Milestone 6 second closure: the real subprocess boundary -----------------------------------
+#
+# The first closure's framing tests used FakeReader, which hands back a Python str and never
+# crosses the operating-system boundary. All nine passed while subprocess text mode was still
+# turning "\r" into "\n" in production. These run a real child process that writes raw bytes,
+# through the real subprocess.run with the exact arguments Kubectl._exec passes, and on
+# through Kubectl (Phase.READER) -> ToolContext -> get_logs -> split_records.
+
+import sys as _sys  # noqa: E402
+
+from safeops.cluster import decode_raw  # noqa: E402
+
+
+def _child_runner(logs: bytes, *, previous: tuple[bytes, int] | None = None):
+    """A runner for Kubectl: each kubectl call becomes a real child process. `get pods`
+    prints one running pod; `logs` writes `logs` as raw bytes; `logs --previous` writes the
+    given (stderr bytes, exit code). The child never touches a cluster or .safeops/."""
+
+    def run(args, **kw):
+        assert args[0] == "kubectl" and "--context" in args
+        if "logs" in args and "--previous" in args:
+            err, code = previous or (b"", 0)
+            script = f"import sys; sys.stderr.buffer.write({err!r}); sys.exit({code})"
+        elif "logs" in args:
+            script = f"import sys; sys.stdout.buffer.write({logs!r})"
+        else:
+            body = json.dumps(listing(pod("orders-1"))).encode()
+            script = f"import sys; sys.stdout.buffer.write({body!r})"
+        return subprocess.run([_sys.executable, "-I", "-c", script], **kw)
+
+    return run
+
+
+def _real_ctx(tmp_path, logs: bytes, **kw) -> ToolContext:
+    return ToolContext(
+        _reader(tmp_path, _child_runner(logs, **kw)), TOPOLOGY, LOAD_START, clock=lambda: NOW
+    )
+
+
+def _raw_record(text: str, seconds_ago: float = 3) -> bytes:
+    return f"{_stamped(seconds_ago)} {text}\n".encode()
+
+
+LOG_ARGS = {"service": "orders", "last_minutes": 5, "severity": "debug", "max_lines": 200}
+
+
+@pytest.mark.parametrize("sep", SEPARATORS.values(), ids=SEPARATORS.keys())
+def test_every_separator_survives_the_real_subprocess_boundary(tmp_path, sep) -> None:
+    out = get_logs(_real_ctx(tmp_path, _raw_record(f"before{sep}after")), **LOG_ARGS)
+    assert out["line_count"] == 1 and out["matched_count"] == 1 and not out["scan_limited"]
+    assert out["lines"][0]["text"] == f"before{sep}after"
+
+
+def test_a_bare_carriage_return_crosses_the_boundary_as_data(tmp_path) -> None:
+    out = get_logs(_real_ctx(tmp_path, _raw_record("before\rafter")), **LOG_ARGS)
+    assert out["line_count"] == 1 and out["scan_limited"] is False
+    assert out["lines"][0]["text"] == "before\rafter" and "\r" in out["lines"][0]["text"]
+
+
+def test_crlf_keeps_its_carriage_return_across_the_boundary_and_in_the_digest(tmp_path) -> None:
+    crlf = get_logs(_real_ctx(tmp_path, f"{_stamped()} before\r\n".encode()), **LOG_ARGS)
+    lf = get_logs(_real_ctx(tmp_path, f"{_stamped()} before\n".encode()), **LOG_ARGS)
+    assert crlf["lines"][0]["text"] == "before\r" and lf["lines"][0]["text"] == "before"
+    with_cr, without_cr = ({"status": "ok", "data": d} for d in (crlf, lf))
+    assert result_digest(with_cr) != result_digest(without_cr)  # the byte is evidence
+    assert step_problems("get_logs", LOG_ARGS, with_cr, result_digest(with_cr)) == []
+
+
+def test_invalid_utf8_is_replaced_deterministically_never_raised(tmp_path) -> None:
+    payload = f"{_stamped()} binary ".encode() + b"\xff\xfe junk\n"
+    first = get_logs(_real_ctx(tmp_path, payload), **LOG_ARGS)
+    again = get_logs(_real_ctx(tmp_path, payload), **LOG_ARGS)
+    (line,) = first["lines"]
+    assert "�" in line["text"] and line["text"].startswith("binary ")
+    assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in line["text"])  # no surrogates
+    result = {"status": "ok", "data": first}
+    canonical_json(result)  # strict, ASCII-escaped canonical JSON accepts it
+    assert result_digest(result) == result_digest({"status": "ok", "data": again})
+    assert step_problems("get_logs", LOG_ARGS, result, result_digest(result)) == []
+
+
+def test_the_scan_cap_boundary_holds_across_the_real_subprocess(tmp_path) -> None:
+    def records(n: int) -> bytes:
+        return b"".join(_raw_record(f"r{i}", 1 + i * 0.01) for i in range(n))
+
+    full = get_logs(_real_ctx(tmp_path, records(c.LOG_SCAN_LINES)), **LOG_ARGS)
+    assert full["scan_limited"] is False and full["matched_count"] == c.LOG_SCAN_LINES
+    over = get_logs(_real_ctx(tmp_path, records(c.LOG_SCAN_LINES + 1)), **LOG_ARGS)
+    assert over["scan_limited"] is True
+
+
+def test_the_kubelet_no_previous_answer_crosses_the_boundary_on_stderr(tmp_path) -> None:
+    """stderr is decoded on the raw path too: the CommandError carries text, and the real
+    kubelet answer (with an invalid byte elsewhere on stderr) is still recognized."""
+    restarted = _restarted()
+    observed = OBSERVED_NO_PREVIOUS.split("failed: ", 1)[1].encode()
+
+    def run(args, **kw):
+        if args[-3:] == ["-o", "json"] or "pods" in args and "logs" not in args:
+            body = json.dumps(listing(restarted)).encode()
+            return subprocess.run(
+                [_sys.executable, "-I", "-c", f"import sys; sys.stdout.buffer.write({body!r})"],
+                **kw,
+            )
+        return _child_runner(
+            _raw_record("after the restart", 30), previous=(b"warning \xff\n" + observed + b"\n", 1)
+        )(args, **kw)
+
+    ctx = ToolContext(_reader(tmp_path, run), TOPOLOGY, LOAD_START, clock=lambda: NOW)
+    out = get_logs(ctx, "orders", 5, "info", 10)
+    assert out["scan_limited"] is True and out["line_count"] == 1
+
+
+def test_decode_raw_policy() -> None:
+    assert decode_raw(b"a\r\nb\rc\xff") == "a\r\nb\rc�"  # no newline translation
+    assert decode_raw(None) == "" and decode_raw("already text\r") == "already text\r"
+
+
+def test_the_raw_read_is_behind_the_same_guard(tmp_path) -> None:
+    k = _reader(tmp_path)  # its runner fails the test if anything reaches kubectl
+    for args in (
+        ("delete", "pod", "x"),
+        ("apply", "-f", "-"),
+        ("rollout", "restart", "deployment/orders"),
+        ("logs", "x", "--kubeconfig=/tmp/admin"),
+        ("logs", "x", "--as=system:admin"),
+        (),
+    ):
+        with pytest.raises(GuardError):
+            k.read_raw(*args)
+    with pytest.raises(GuardError, match="no stdin"):
+        k._exec(["logs", "x"], stdin="a str on a binary pipe", raw=True)
+
+
+def test_a_raw_read_keeps_typed_errors_and_the_timeout(tmp_path) -> None:
+    def failing(args, **kw):
+        assert kw["text"] is False and kw["timeout"] == 7
+        return subprocess.CompletedProcess(args, 1, b"", b"error: You must be logged in\n")
+
+    with pytest.raises(CredentialError):
+        _reader(tmp_path, failing).read_raw("logs", "x", timeout=7)
+
+    def slow(args, **kw):
+        raise subprocess.TimeoutExpired(args, kw["timeout"])
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _reader(tmp_path, slow).read_raw("logs", "x", timeout=7)
+
+
+def test_no_previous_with_trailing_context_is_still_a_failure() -> None:
+    for trailing in (" (extra context)", "; also: something else", "\n"):
+        failure = CommandError(OBSERVED_NO_PREVIOUS + trailing)
+        ctx, _ = ctx_for(_instance_handler(_restarted(), previous=failure))
+        with pytest.raises(ToolError) as exc:
+            get_logs(ctx, "orders", 5, "info", 10)
+        assert exc.value.kind == "command_failed"
+    ctx, _ = ctx_for(_instance_handler(_restarted(), previous=CommandError(OBSERVED_NO_PREVIOUS)))
+    assert get_logs(ctx, "orders", 5, "info", 10)["scan_limited"] is True
