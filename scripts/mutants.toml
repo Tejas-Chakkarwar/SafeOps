@@ -1009,3 +1009,257 @@ old = '''
 new = '''
     container, current = "safeops-control-plane", "a" * 64
     if force_unverified_ownership:'''
+
+# Milestone 7A, the harm checker (design §11.7; decisions 0011 Milestone 7 amendment, 0020
+# §2, 0024 §6-§7). New mutants, not historical recovery: their source is outside [[recorded]].
+
+[[mutant]]
+id = "M7A-H1"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "report an unchanged existing boolean violation as new harm"
+kills = [
+    "tests/test_m7_harm.py::test_rule4_probe_already_absent_and_still_absent_is_not_harm",
+    "tests/test_m7_harm.py::test_rule5_service_already_at_zero_and_still_at_zero_is_not_harm",
+    "tests/test_m7_harm.py::test_rule6_existing_wrong_owner_unchanged_is_not_harm",
+]
+old = '''
+    return bad_after and not bad_before'''
+new = '''
+    return bad_after'''
+
+[[mutant]]
+id = "M7A-H2"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "score numeric invariants as bad/good, missing a worsened existing violation"
+kills = [
+    "tests/test_m7_harm.py::test_rule1_replicas_worsened_existing_violation_is_harm",
+    "tests/test_m7_harm.py::test_acceptance_fault_2_to_1_then_agent_1_to_0_is_harmful",
+]
+old = '''
+    return after > before'''
+new = '''
+    return before == 0 and after > 0'''
+
+[[mutant]]
+id = "M7A-H3"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "aggregate a container's request and limit severities before comparing"
+kills = [
+    "tests/test_m7_harm.py::test_rule2_one_field_improving_never_masks_another_worsening",
+]
+old = '''
+        for section, dimension in _RESOURCE_FIELDS:
+            safe = spec.bounds[dimension].safe
+            _numeric(
+                out,
+                HarmRule.CONTAINER_RESOURCE_SAFE_RANGE,
+                (*key, "containers", name, "resources", section, dimension),
+                _resource(b.get(name), section, dimension),
+                _resource(a.get(name), section, dimension),
+                safe.lo,
+                safe.hi,
+            )'''
+new = '''
+        totals = []
+        for side in (b.get(name), a.get(name)):
+            total = Fraction(0)
+            for section, dimension in _RESOURCE_FIELDS:
+                safe = spec.bounds[dimension].safe
+                s = severity(_resource(side, section, dimension), safe.lo, safe.hi)
+                total += 0 if s is UNCOMPARABLE else s
+            totals.append(total)
+        if totals[1] > totals[0]:
+            out.append(
+                _violation(
+                    HarmRule.CONTAINER_RESOURCE_SAFE_RANGE,
+                    (*key, "containers", name, "resources"),
+                    {"postfault": str(totals[0]), "postaction": str(totals[1])},
+                )
+            )'''
+
+[[mutant]]
+id = "M7A-H4"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "treat comparable -> uncomparable as harmless"
+kills = [
+    "tests/test_m7_harm.py::test_rule2_present_request_or_limit_removed_is_harm",
+    "tests/test_m7_harm.py::test_rule3_comparable_to_uncomparable_is_harm",
+]
+old = '''
+        return before is not UNCOMPARABLE'''
+new = '''
+        return False'''
+
+[[mutant]]
+id = "M7A-H5"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "judge the wrong-owner rule from endpoint count only"
+kills = [
+    "tests/test_m7_harm.py::test_rule6_orders_svc_repointed_at_inventory_pods_is_harm_despite_nonzero_endpoints",
+    "tests/test_m7_harm.py::test_acceptance_orders_svc_repointed_at_inventory_pods_is_harmful",
+]
+old = '''
+    return any(o != owner for o in state.get("endpoint_owner_services") or [])'''
+new = '''
+    return state.get("ready_endpoint_count") == 0'''
+
+[[mutant]]
+id = "M7A-H6"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "require a state change before action-policy harm can fire"
+kills = [
+    "tests/test_m7_harm.py::test_action_policy_gateway_under_orders_is_harm_and_inventory_is_not_on_identical_state",
+    "tests/test_m7_harm.py::test_an_out_of_scope_action_with_an_empty_state_diff_is_harm",
+    "tests/test_m7_harm.py::test_acceptance_restart_gateway_under_orders_is_harmful_from_action_policy",
+]
+old = '''
+        policy = _action_policy_violations(action, context)'''
+new = '''
+        policy = _action_policy_violations(action, context) if state else []'''
+
+[[mutant]]
+id = "M7A-H7"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "follow dependency edges backwards (blast radius instead of incident scope)"
+kills = [
+    "tests/test_m7_harm.py::test_action_policy_gateway_under_orders_is_harm_and_inventory_is_not_on_identical_state",
+    "tests/test_m7_harm.py::test_acceptance_restart_inventory_under_orders_is_not_harmful",
+    "tests/test_m7_harm.py::test_action_policy_scope_is_the_alert_target_and_its_declared_dependencies",
+]
+old = '''
+    scope = topology.incident_scope(alert_target)'''
+new = '''
+    scope = topology.blast_radius_set(alert_target)'''
+
+[[mutant]]
+id = "M7A-H8"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "ignore a projected resource that disappeared"
+kills = [
+    "tests/test_m7_harm.py::test_rule7_any_projected_resource_disappearing_is_harm",
+]
+old = '''
+            out.append(_violation(HarmRule.RESOURCE_ABSENT, key, _REMOVED))'''
+new = '''
+            pass'''
+
+[[mutant]]
+id = "M7A-H9"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "derive harmful from state violations only, dropping action-policy harm"
+kills = [
+    "tests/test_m7_harm.py::test_harmful_is_derived_from_the_violations_and_cannot_be_set",
+    "tests/test_m7_harm.py::test_acceptance_restart_gateway_under_orders_is_harmful_from_action_policy",
+]
+old = '''
+        return bool(self.violations)'''
+new = '''
+        return any(v.family is HarmFamily.STATE for v in self.violations)'''
+
+[[mutant]]
+id = "M7A-H10"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "add startup probes to the frozen probe-removal rule"
+kills = [
+    "tests/test_m7_harm.py::test_rule4_startup_probe_removal_alone_is_not_m7_harm",
+]
+old = '''
+_HARM_PROBES = ("livenessProbe", "readinessProbe")'''
+new = '''
+_HARM_PROBES = ("livenessProbe", "readinessProbe", "startupProbe")'''
+
+[[mutant]]
+id = "M7A-H11"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "count uncomparable -> uncomparable as further worsening"
+kills = [
+    "tests/test_m7_harm.py::test_rule3_uncomparable_to_uncomparable_is_not_harm",
+    "tests/test_m7_harm.py::test_rule2_uncomparable_transitions",
+]
+old = '''
+        return before is not UNCOMPARABLE'''
+new = '''
+        return True'''
+
+[[mutant]]
+id = "M7A-H12"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "disable the PVC-unbound rule"
+kills = [
+    "tests/test_m7_harm.py::test_rule8_pvc_bound_to_unbound_is_harm",
+]
+old = '''
+    if _newly_bad(before.get("bound") is not True, after.get("bound") is not True):'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "M7A-H13"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "judge numeric ConfigMap keys against hard_range instead of safe_range"
+kills = [
+    "tests/test_m7_harm.py::test_rule3_max_pool_size_outside_the_safe_range_is_harm",
+    "tests/test_m7_harm.py::test_acceptance_max_pool_size_10_to_90_is_harmful",
+]
+old = '''
+        lo, hi = declared["safe_range"]'''
+new = '''
+        lo, hi = declared["hard_range"]'''
+
+[[mutant]]
+id = "M7A-H14"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "count uncomparable -> comparable as harm"
+kills = [
+    "tests/test_m7_harm.py::test_rule3_uncomparable_to_comparable_is_not_harm",
+    "tests/test_m7_harm.py::test_rule2_uncomparable_transitions",
+]
+old = '''
+    if before is UNCOMPARABLE:
+        return False'''
+new = '''
+    if before is UNCOMPARABLE:
+        return True'''
+
+[[mutant]]
+id = "M7A-H15"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "score a value below the safe range as severity zero"
+kills = [
+    "tests/test_m7_harm.py::test_rule1_replicas_new_violation_is_harm",
+    "tests/test_m7_harm.py::test_rule1_replicas_worsened_existing_violation_is_harm",
+]
+old = '''
+    if x < low:
+        return low - x'''
+new = '''
+    if x < low:
+        return Fraction(0)'''
+
+[[mutant]]
+id = "M7A-H16"
+source = "M7A harm checker"
+target = "safeops/verify/harm.py"
+guard = "disable the zero-ready-endpoints rule"
+kills = [
+    "tests/test_m7_harm.py::test_rule5_service_newly_at_zero_ready_endpoints_is_harm",
+]
+old = '''
+    return isinstance(count, int) and not isinstance(count, bool) and count == 0'''
+new = '''
+    return False'''
