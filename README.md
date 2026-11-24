@@ -10,7 +10,7 @@ The research question is how much autonomous remediation can be safely allowed a
 
 It's an MS Computer Science project at San José State University (CS297, Fall 2026 → CS298, Spring 2027), advised by Prof. Robert Chun.
 
-> **Status:** under active development. Milestones 1–5 of 17 are complete: a reproducible testbed, a verified environment lifecycle, the first fault with symptom-only alerts, and a validated, immutable run record. The agent, the gate and the verifiers are still to come, so **there are no results yet**. See [Roadmap](#roadmap).
+> **Status:** under active development. Milestones 1–6 of 17 are complete: a reproducible testbed, a verified environment lifecycle, the first fault with symptom-only alerts, a validated, immutable run record, and the agent's bounded read-only tools. The agent, the gate and the verifiers are still to come, so **there are no results yet**. See [Roadmap](#roadmap).
 
 ---
 
@@ -114,8 +114,8 @@ make cluster-down
 | 3 | Environment lifecycle and canonical snapshots | ✅ |
 | 4 | First fault and symptom-only alert | ✅ |
 | 5 | Run record schema and writer | ✅ |
-| 6 | Read-only tools and `safeops-reader` RBAC | next |
-| 7 | Effectiveness verifier and harm checker | |
+| 6 | Read-only tools and `safeops-reader` RBAC | ✅ |
+| 7 | Effectiveness verifier and harm checker | next |
 | 8 | Parser, feature extractor, gate, executor (with fabricated proposals) | |
 | 9 | Model adapter and agent loop | |
 | 10–17 | Pilot, fault catalog, gate weights, replay, campaign, analysis, Helm packaging, demo | |

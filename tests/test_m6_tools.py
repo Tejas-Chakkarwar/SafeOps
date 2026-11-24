@@ -76,7 +76,7 @@ class FakeReader:
         return out if isinstance(out, str) else json.dumps(out)
 
     def read_raw(self, *args, timeout=None):
-        """The logs read. A fake returning str never crosses the subprocess boundary, which
+        r"""The logs read. A fake returning str never crosses the subprocess boundary, which
         is how text mode's "\r" translation stayed hidden: tests/test_m6_tools.py's
         real-subprocess tests cover that boundary (decision 0023, second closure amendment)."""
         self.calls.append(("read_raw", *args))
@@ -1441,8 +1441,8 @@ SEPARATORS = {
     "GS": "\x1d",
     "RS": "\x1e",
     "NEL": "\x85",
-    "LS": " ",
-    "PS": " ",
+    "LS": "\u2028",
+    "PS": "\u2029",
 }
 
 
@@ -1777,3 +1777,23 @@ def test_no_previous_with_trailing_context_is_still_a_failure() -> None:
         assert exc.value.kind == "command_failed"
     ctx, _ = ctx_for(_instance_handler(_restarted(), previous=CommandError(OBSERVED_NO_PREVIOUS)))
     assert get_logs(ctx, "orders", 5, "info", 10)["scan_limited"] is True
+
+
+def test_a_text_mode_decode_failure_is_a_typed_malformed_response(tmp_path) -> None:
+    """Milestone 6 cleanup: the guarded text-mode read (every read but the logs read) types a
+    UnicodeDecodeError as malformed_response. The raw logs read decodes with
+    errors="replace" and can't raise one, so only a text-mode read reaches this branch. The
+    error is genuine (an actual UTF-8 decode of an invalid byte, as subprocess text mode
+    raises it), not dependent on the machine's locale."""
+
+    def undecodable(args, **kw):
+        assert kw["text"] is True  # the ordinary text-mode read, not read_raw
+        b"\xff not utf-8".decode("utf-8")  # raises UnicodeDecodeError
+
+    ctx = ToolContext(_reader(tmp_path, undecodable), TOPOLOGY, LOAD_START, clock=lambda: NOW)
+    with pytest.raises(ToolError) as exc:
+        ctx.read_json("get", "pods", "-n", "testbed")
+    assert exc.value.kind == "malformed_response"
+    assert isinstance(exc.value.__cause__, UnicodeDecodeError)
+    result = invoke(get_pods, ctx, {"namespace": "testbed"})  # a real tool, end to end
+    assert result["status"] == "error" and result["error"]["kind"] == "malformed_response"

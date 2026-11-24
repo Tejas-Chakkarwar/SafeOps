@@ -385,7 +385,7 @@ class Kubectl:
     def _exec(
         self, args: list[str], stdin: str | None = None, timeout: float = 120, *, raw: bool = False
     ) -> str:
-        """Run kubectl. `raw` takes the output as bytes and decodes it here (decode_raw), with
+        r"""Run kubectl. `raw` takes the output as bytes and decodes it here (decode_raw), with
         no newline translation: text mode's universal newlines turn "\r" and "\r\n" into
         "\n" before the caller sees them (decision 0023, second closure amendment). A raw
         call takes no stdin, so a str can never meet a binary pipe."""
@@ -420,7 +420,7 @@ class Kubectl:
         return self._exec(list(args), timeout=timeout)
 
     def read_raw(self, *args: str, timeout: float = 120) -> str:
-        """read(), behind the same guard, identity check, timeout and errors, with the output
+        r"""read(), behind the same guard, identity check, timeout and errors, with the output
         taken as bytes and decoded explicitly (see _exec). For `kubectl logs`, whose output
         is application data: every character except kubectl's own "\n" must arrive as is."""
         self._check_read(args)

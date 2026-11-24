@@ -80,7 +80,7 @@ class ToolContext:
         return _guarded(lambda: self.kubectl.read(*args, timeout=self.timeout_s))
 
     def read_raw(self, *args: str) -> str:
-        """read(), with the output taken as raw bytes and decoded explicitly (Kubectl.read_raw):
+        r"""read(), with the output taken as raw bytes and decoded explicitly (Kubectl.read_raw):
         for `kubectl logs`, so "\r" and every other non-"\n" character survive as data."""
         return _guarded(lambda: self.kubectl.read_raw(*args, timeout=self.timeout_s))
 

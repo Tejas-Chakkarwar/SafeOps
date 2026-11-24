@@ -37,7 +37,7 @@ _NO_PREVIOUS = re.compile(
 
 
 def split_records(out: str) -> list[str]:
-    """kubectl's log records: framed on literal "\n" only. Every other character Python's
+    r"""kubectl's log records: framed on literal "\n" only. Every other character Python's
     str.splitlines() would break on (\r, \v, \f, \x1c-\x1e, \x85, \u2028, \u2029) is
     application data, and a "\r" before the "\n" is kept as part of the text (decision 0023,
     closure amendment). Only the empty element after the final "\n" is dropped: it is an

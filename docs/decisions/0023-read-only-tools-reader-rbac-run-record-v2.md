@@ -56,7 +56,7 @@ Everything below is an implementation choice the design leaves open, or a struct
   - it uses the reader's own credential and refuses the admin or harness kubeconfig;
   - `check_object` refuses every mutation in this phase;
   - raw calls may only GET `…/services/prometheus-server:80/proxy/api/v1/{query,query_range}?…`, with no `..` or `#` anywhere in the path.
-  - A static test asserts that tool code calls only `read`, `raw` and `cfg` on the client, and never names `Phase.RUNTIME`, `Phase.BOOTSTRAP`, the harness credential or `WorkloadProxy`.
+  - A static test asserts that tool code calls only `read`, `raw` and `cfg` on the client, and never names `Phase.RUNTIME`, `Phase.BOOTSTRAP`, the harness credential or `WorkloadProxy`. *(Correction, Milestone 6 cleanup: since the second closure amendment the allowed set is `{read, read_raw, raw, cfg}`. `read_raw` is `read()` behind the same guard, with its output taken as bytes, and only the logs read uses it.)*
 - **Checked both ways:**
   - `bootstrap.reader_rbac_expectations` lists 101 `can-i` expectations: 26 allowed, the rest denied, including the bare-name proxy. `cluster-up` runs them.
   - The live tests run them again with the reader's own token.

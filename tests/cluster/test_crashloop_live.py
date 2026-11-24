@@ -165,14 +165,29 @@ def test_the_no_previous_answer_is_the_form_get_logs_recognizes() -> None:
 
     harness = Kubectl(CFG, Phase.RUNTIME)
     pods = harness.get_json("pods", "-n", NS, "-l", "app=orders,!safeops-test")["items"]
-    pod = pods[0]["metadata"]["name"]  # a never-restarted orders pod, not a fixture
+    # The precondition, proven rather than assumed: a container that has never restarted
+    # and has no terminated last state, so the kubelet has no previous instance to serve.
+    candidates = [
+        (p["metadata"]["name"], cs["name"])
+        for p in pods
+        for cs in (p.get("status") or {}).get("containerStatuses") or []
+        if cs.get("restartCount") == 0
+        and "running" in (cs.get("state") or {})
+        and not (cs.get("lastState") or {}).get("terminated")
+    ]
+    if not candidates:
+        pytest.fail("precondition: no running orders container with restartCount 0 to test")
+    pod, container = sorted(candidates)[0]
     # Through the production path (the reader client's raw read): the CommandError carries the
     # kubelet's last stderr line, which is what get_logs matches. Raw stderr ends in "\n",
     # which the end-anchored pattern deliberately doesn't accept.
     from safeops.cluster import CommandError
 
     with pytest.raises(CommandError) as exc:
-        Kubectl(CFG, Phase.READER).read_raw("logs", pod, "-n", NS, "--previous", "--timestamps")
+        Kubectl(CFG, Phase.READER).read_raw(
+            "logs", pod, "-n", NS, "-c", container, "--previous", "--timestamps"
+        )
     assert _NO_PREVIOUS.search(str(exc.value)), str(exc.value)
-    raw = _run(READER + ["logs", pod, "-n", NS, "--previous"])  # the same answer, unwrapped
+    assert f'previous terminated container "{container}" in pod "{pod}"' in str(exc.value)
+    raw = _run(READER + ["logs", pod, "-n", NS, "-c", container, "--previous"])  # unwrapped
     assert raw.returncode != 0 and _NO_PREVIOUS.search(raw.stderr.strip()), raw.stderr
