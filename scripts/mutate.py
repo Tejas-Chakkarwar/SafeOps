@@ -249,7 +249,10 @@ class Verdict:
 
 def junit_nodeid(root: Path, classname: str, name: str) -> str:
     """pytest's node id from a JUnit testcase: classname is the module path, dotted, then any
-    test class names."""
+    test class names. A collection error has an empty classname: there is no module to
+    rebuild, so it keeps the fallback form, and classify() still sees its error."""
+    if not classname:
+        return f"{classname}::{name}"
     parts = classname.split(".")
     for k in range(len(parts), 0, -1):
         module = PurePosixPath(*parts[:k]).with_suffix(".py")

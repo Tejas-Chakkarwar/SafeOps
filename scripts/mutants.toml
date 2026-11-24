@@ -1330,9 +1330,9 @@ kills = [
     "tests/test_m7_effectiveness.py::test_eu3_every_window_that_fits_fails_is_ineffective_and_censored",
 ]
 old = '''
-        while now + window_s <= deadline:'''
+        while schedule_time + window_s <= deadline:'''
 new = '''
-        while now < deadline:'''
+        while schedule_time < deadline:'''
 
 [[mutant]]
 id = "M7B-E5"
@@ -1343,7 +1343,7 @@ kills = [
     "tests/test_m7_effectiveness.py::test_eu6_a_window_that_closes_after_the_deadline_is_a_measurement_failure",
 ]
 old = '''
-            if now > deadline:'''
+            if close_time > deadline:'''
 new = '''
             if False:'''
 
@@ -1401,9 +1401,9 @@ kills = [
     "tests/test_m7_effectiveness.py::test_eu1_the_first_window_recovers_at_its_actual_close",
 ]
 old = '''
-                return EffectivenessResult(True, now - start)'''
+                return EffectivenessResult(True, close_time - start)'''
 new = '''
-                return EffectivenessResult(True, round((now - start) / window_s) * window_s)'''
+                return EffectivenessResult(True, round((close_time - start) / window_s) * window_s)'''
 
 [[mutant]]
 id = "M7B-E10"
@@ -1441,9 +1441,9 @@ kills = [
     "tests/test_m7_effectiveness.py::test_eu5_a_window_that_closes_exactly_at_the_deadline_counts",
 ]
 old = '''
-            if now > deadline:'''
+            if close_time > deadline:'''
 new = '''
-            if now >= deadline:'''
+            if close_time >= deadline:'''
 
 [[mutant]]
 id = "M7B-E13"
@@ -1524,3 +1524,32 @@ old = '''
                 and self.effectiveness.workload is not self.workload'''
 new = '''
                 and False'''
+
+# Milestone 7 review fixes (decision 0024, closure amendment): exact scheduling readings.
+
+[[mutant]]
+id = "M7R-S1"
+source = "M7 review fixes"
+target = "safeops/verify/effectiveness.py"
+guard = "schedule the next window on the previous close time, not a fresh reading"
+kills = [
+    "tests/test_m7_effectiveness.py::test_each_later_window_is_scheduled_on_a_fresh_reading",
+]
+old = '''
+            schedule_time = self._clock()'''
+new = '''
+            schedule_time = close_time'''
+
+[[mutant]]
+id = "M7R-S2"
+source = "M7 review fixes"
+target = "safeops/verify/effectiveness.py"
+guard = "split the shared entry reading into separate start and schedule readings"
+kills = [
+    "tests/test_m7_effectiveness.py::test_a_budget_of_exactly_one_window_measures_that_window",
+]
+old = '''
+        start = schedule_time = self._clock()'''
+new = '''
+        start = self._clock()
+        schedule_time = self._clock()'''

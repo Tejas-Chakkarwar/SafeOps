@@ -135,7 +135,9 @@ class FakeWorkload:
         pass
 
     def verify_steady_state(self) -> SteadyState:
-        return SteadyState("w1", "complete", 300, 300, 300, 297, 1.0, 10.0)
+        """A healthy, passed baseline of this fake's own window: every attempt succeeded."""
+        n = self.settings.window_attempts
+        return SteadyState("w1", "complete", n, n, n, self.settings.min_successes, 1.0, 10.0)
 
     def stop_workload(self) -> None:
         pass

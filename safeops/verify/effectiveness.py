@@ -113,20 +113,24 @@ class EffectivenessVerifier:
             # Zero windows would score the run ineffective without measuring anything; the
             # settings refuse such a budget, and so does the verifier (decision 0024 §3).
             raise ValueError(f"recovery budget {timeout_s!r}s can't fit one {window_s:g}s window")
-        # One clock reading per window boundary: the start, then each window's close.
-        start = now = self._clock()
+        # One reading at entry is both the start and the first scheduling time, so a budget of
+        # exactly one window always fits it. Each window's close is read on its own, for the
+        # deadline and the recovery time; each later scheduling decision takes a fresh
+        # reading, so time between windows counts against the budget (decision 0024 §3).
+        start = schedule_time = self._clock()
         deadline = start + timeout_s
-        while now + window_s <= deadline:
+        while schedule_time + window_s <= deadline:
             m = self.workload.measure_recovery_window()
-            now = self._clock()
+            close_time = self._clock()
             problem = _window_problem(m, s)
             if problem is not None:
                 raise RecoveryMeasurementError(f"recovery window not validly measured: {problem}")
-            if now > deadline:
+            if close_time > deadline:
                 raise RecoveryMeasurementError(
-                    f"recovery window {m.window_id} closed {now - deadline:g}s after the"
+                    f"recovery window {m.window_id} closed {close_time - deadline:g}s after the"
                     f" {timeout_s:g}s recovery deadline (decision 0024, late-window amendment)"
                 )
             if m.summary["succeeded"] >= steady_state.min_successes:
-                return EffectivenessResult(True, now - start)
+                return EffectivenessResult(True, close_time - start)
+            schedule_time = self._clock()
         return EffectivenessResult(False, None)

@@ -224,6 +224,48 @@ def test_a_named_test_that_passes_is_a_survivor(verdict) -> None:
     assert verdict(0, ("test_guard", "passed", "")).result == "survived"
 
 
+# A pytest collection error: JUnit names no module (classname="").
+COLLECTION_ERROR = (
+    "<testsuites><testsuite>"
+    '<testcase classname="" name="test_broken">'
+    '<error message="collection failure">ImportError while importing test module</error>'
+    "</testcase>"
+    '<testcase classname="tests.test_mod" name="test_guard">'
+    '<failure message="assert 1 == 0">trace</failure>'
+    "</testcase>"
+    "</testsuite></testsuites>"
+)
+
+
+def test_an_empty_junit_classname_keeps_the_fallback_node_id(tmp_path) -> None:
+    root = _repo(tmp_path)
+    assert mutate.junit_nodeid(root, "", "test_broken") == "::test_broken"
+    # Dotted reconstruction is unchanged.
+    assert mutate.junit_nodeid(root, "tests.test_mod", "test_guard") == (
+        "tests/test_mod.py::test_guard"
+    )
+    assert mutate.junit_nodeid(root, "tests.test_mod.TestX", "test_y") == (
+        "tests/test_mod.py::TestX::test_y"
+    )
+    assert mutate.junit_nodeid(root, "nowhere.mod", "t") == "nowhere.mod::t"
+
+
+def test_a_collection_error_parses_into_an_error_case(tmp_path) -> None:
+    (broken, guard) = mutate.parse_junit(COLLECTION_ERROR, _repo(tmp_path))
+    assert (broken.nodeid, broken.outcome) == ("::test_broken", "error")
+    assert (guard.nodeid, guard.outcome) == ("tests/test_mod.py::test_guard", "failed")
+
+
+@pytest.mark.parametrize("returncode", [1, 2])
+def test_a_collection_error_is_a_harness_error_never_a_kill(tmp_path, returncode) -> None:
+    """Even beside a failing named test: a module that didn't collect is not evidence."""
+    root = _repo(tmp_path)
+    run = mutate.TestRun(returncode, COLLECTION_ERROR, "")
+    v = mutate.classify(_mutant(), run, mutate.parse_junit(run.junit, root))
+    assert v.result == "error"
+    assert v.killer is None
+
+
 # --- the run as a whole ---------------------------------------------------------------------------
 
 

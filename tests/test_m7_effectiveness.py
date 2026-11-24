@@ -728,3 +728,77 @@ def test_the_offline_runner_factory_keeps_one_shared_workload(offline_runner_fac
         r.workload.verify_steady_state(), CONFIG.recovery_timeout_s
     )
     assert result == EffectivenessResult(True, 0.0)  # the fake's window passes at once
+
+
+# --- review fixes: exact scheduling readings ----------------------------------------------------
+
+
+class ScriptedClock:
+    """Every monotonic reading is the next value the test wrote down; nothing else moves it."""
+
+    def __init__(self, values) -> None:
+        self.values = list(values)
+        self.calls = 0
+
+    def __call__(self) -> float:
+        value = self.values[self.calls]
+        self.calls += 1
+        return value
+
+
+class StillWorkload:
+    """Scripted windows that never touch the clock: the clock script is the only time."""
+
+    def __init__(self, windows, settings: WorkloadSettings = CONFIG) -> None:
+        self.windows, self.settings = list(windows), settings
+        self.measured = 0
+
+    def measure_recovery_window(self) -> WindowMeasurement:
+        self.measured += 1
+        return self.windows.pop(0)
+
+
+def test_each_later_window_is_scheduled_on_a_fresh_reading() -> None:
+    """Window 1 closes at 1032.5 and fails; the next scheduling reading is 1034.5, and
+    1034.5 + 32.5 = 1067 > the 1066 deadline, so window 2 never starts. Reusing the close
+    time (1032.5 + 32.5 = 1065) would start it. A synthetic exactness check: in the real
+    loop the gap between a close and the next decision is microseconds."""
+    assert WINDOW_S == 32.5
+    clock = ScriptedClock([1000.0, 1032.5, 1034.5, 1067.0])  # the last one is spare
+    workload = StillWorkload([_ok(0), _ok(300)])
+    result = EffectivenessVerifier(workload=workload, clock=clock).verify(
+        BASELINE, 2 * WINDOW_S + 1
+    )
+    assert workload.measured == 1 and workload.windows  # window 2 was never requested
+    assert result == EffectivenessResult(False, None)
+    assert clock.calls == 3  # start, window 1's close, the fresh scheduling reading
+
+
+def test_a_budget_of_exactly_one_window_measures_that_window() -> None:
+    """One reading at entry is both the start and the first scheduling time. Two separate
+    readings (1000.0, then 1032.5) would leave no room for the only window the budget has."""
+    clock = ScriptedClock([1000.0, 1032.5])
+    workload = StillWorkload([_ok(300)])
+    result = EffectivenessVerifier(workload=workload, clock=clock).verify(BASELINE, WINDOW_S)
+    assert workload.measured == 1
+    assert result == EffectivenessResult(True, 32.5)  # closes exactly on the deadline
+    assert clock.calls == 2
+
+
+# --- review fixes: the fake workload follows its own settings -----------------------------------
+
+
+def test_the_fake_workload_stays_consistent_when_its_settings_are_retuned() -> None:
+    fake = FakeWorkload()
+    fake.settings = _settings(window_attempts=200, min_successes=198)
+    baseline = fake.verify_steady_state()
+    assert baseline.size == baseline.scheduled == 200
+    assert baseline.min_successes == 198 and baseline.state == "complete"
+    assert baseline.baseline_ok and baseline.succeeded >= baseline.min_successes
+    window = fake.measure_recovery_window()
+    assert window.size == window.scheduled == 200
+    verifier = EffectivenessVerifier(workload=fake, clock=Clock())
+    assert verifier.verify(baseline, fake.settings.recovery_timeout_s).effective is True
+    assert FakeWorkload().verify_steady_state() == SteadyState(
+        "w1", "complete", 300, 300, 300, 297, 1.0, 10.0
+    )  # the default fake is unchanged
