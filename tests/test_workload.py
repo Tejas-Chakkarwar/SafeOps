@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from safeops.environment.workload import (
+    WORKLOAD_CONFIG_PATH,
     SteadyState,
     SteadyStateMeasurementFailed,
     SteadyStateNotReached,
@@ -355,3 +356,97 @@ def test_the_loaded_settings_are_unchanged_by_the_hardening() -> None:
         recovery_timeout_s=120.0,
     )
     assert LOADED.closes_after_s(LOADED.window_attempts) == 32.5
+
+
+# --- integer settings are integers (second pre-Milestone-8 hardening) --------------------------
+#
+# The loader used to int()-coerce window_attempts and min_successes before WorkloadSettings
+# saw them: 297.9 became 297, "297" became 297, and min_successes: true became a threshold of
+# 1. Now the loader passes them through as read and WorkloadSettings requires type int.
+
+
+def _load_with(tmp_path, **changes) -> WorkloadSettings:
+    import yaml
+
+    raw = yaml.safe_load(WORKLOAD_CONFIG_PATH.read_text())
+    path = tmp_path / "workload.yaml"
+    path.write_text(yaml.safe_dump({**raw, **changes}))
+    return load_workload_settings(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("window_attempts", 301.9),
+        ("min_successes", 297.9),
+        ("window_attempts", 300.0),
+        ("min_successes", 297.0),
+        ("window_attempts", "300"),
+        ("min_successes", "297"),
+        ("window_attempts", True),
+        ("min_successes", True),
+    ],
+)
+def test_the_loader_never_coerces_an_integer_setting(tmp_path, field, value) -> None:
+    with pytest.raises(ValueError, match=f"^{field} must be an integer"):
+        _load_with(tmp_path, **{field: value})
+
+
+def test_a_fractional_threshold_is_not_truncated_by_the_loader(tmp_path) -> None:
+    """Before: 297.9 -> int() -> 297, accepted."""
+    with pytest.raises(ValueError, match="^min_successes must be an integer, got 297.9"):
+        _load_with(tmp_path, min_successes=297.9)
+
+
+def test_a_boolean_threshold_never_becomes_one() -> None:
+    """Before: min_successes: true -> int(True) == 1, so one success out of 300 passed."""
+    with pytest.raises(ValueError, match="^min_successes must be an integer, got True"):
+        _with(min_successes=True)
+    with pytest.raises(ValueError, match="^min_successes must be an integer"):
+        _with(min_successes=False)
+
+
+def test_a_boolean_window_is_named_as_itself() -> None:
+    """Before: rejected only through the relationship check, as if min_successes were wrong."""
+    with pytest.raises(ValueError, match="^window_attempts must be an integer, got True"):
+        _with(window_attempts=True)
+
+
+@pytest.mark.parametrize("value", [300.5, 300.0, math.nan, math.inf, "300"])
+def test_the_constructor_requires_an_int_window(value) -> None:
+    with pytest.raises(ValueError, match="^window_attempts must be an integer"):
+        _with(window_attempts=value)
+
+
+@pytest.mark.parametrize("value", [297.5, 297.0, math.nan, math.inf, "297"])
+def test_the_constructor_requires_an_int_threshold(value) -> None:
+    with pytest.raises(ValueError, match="^min_successes must be an integer"):
+        _with(min_successes=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_a_non_positive_int_window_reaches_the_positivity_check(value) -> None:
+    """The type guard passes a real int on to the range checks: none of them is dead."""
+    with pytest.raises(ValueError, match="^window_attempts must be positive$"):
+        _with(window_attempts=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, 301])
+def test_an_out_of_range_int_threshold_reaches_the_relationship_check(value) -> None:
+    with pytest.raises(ValueError, match=r"^min_successes must be in 1\.\.window_attempts$"):
+        _with(min_successes=value)
+
+
+def test_valid_integer_settings_are_unchanged() -> None:
+    assert _with(window_attempts=300, min_successes=297).min_successes == 297
+    assert _with(window_attempts=297, min_successes=297).window_attempts == 297  # equality ok
+    assert type(LOADED.window_attempts) is int and type(LOADED.min_successes) is int
+    for name in (
+        "rate_rps",
+        "attempt_deadline_s",
+        "warmup_s",
+        "window_poll_timeout_s",
+        "window_poll_interval_s",
+        "recovery_timeout_s",
+    ):
+        assert type(getattr(LOADED, name)) is float, name  # the loader's widening is intact

@@ -43,6 +43,14 @@ class SteadyStateNotReached(SteadyStateError):
     """The window was measured, but too few of its scheduled attempts succeeded."""
 
 
+def _exact_int(name: str, value: object) -> None:
+    # Type only: the range checks stay in __post_init__. `type(...) is int`, not isinstance,
+    # because bool is an int subclass (True would mean 1).
+    if type(value) is int:
+        return
+    raise ValueError(f"{name} must be an integer, got {value!r}")
+
+
 def _finite_positive(name: str, value: float) -> None:
     # Positive form on purpose: NaN fails `value > 0` too, so dropping the finiteness
     # clause by accident would still refuse NaN (only infinity would slip through).
@@ -68,10 +76,16 @@ class WorkloadSettings:
     recovery_timeout_s: float  # effectiveness budget (decision 0024 §3)
 
     def __post_init__(self) -> None:
-        if not 0 < self.min_successes <= self.window_attempts:
-            raise ValueError("min_successes must be in 1..window_attempts")
+        # The integer settings are checked for type first, so a malformed value is named as
+        # itself rather than surfacing through the relationship check below.
+        _exact_int("window_attempts", self.window_attempts)
+        _exact_int("min_successes", self.min_successes)
+        # Positivity before the relationship: otherwise a non-positive window always fails
+        # the relationship first, and this check could never report its own field.
         if self.window_attempts <= 0:
             raise ValueError("window_attempts must be positive")
+        if not 0 < self.min_successes <= self.window_attempts:
+            raise ValueError("min_successes must be in 1..window_attempts")
         # Each timing field is checked on its own, before anything is derived from it. A
         # comparison against NaN is always false, so without these, malformed values failed
         # open: a NaN rate or attempt deadline made the window duration NaN, which passed
@@ -114,13 +128,16 @@ def load_workload_settings(path: Path = WORKLOAD_CONFIG_PATH) -> WorkloadSetting
     import yaml
 
     data = yaml.safe_load(path.read_text())
+    # float() on the timing fields is deliberate, exact widening (YAML 10 -> 10.0). The
+    # integer fields are passed through as read: int() would truncate 297.9, accept "297",
+    # and turn true into 1. WorkloadSettings refuses anything that isn't an int.
     return WorkloadSettings(
         target_path=str(data["target_path"]),
         rate_rps=float(data["rate_rps"]),
         attempt_deadline_s=float(data["attempt_deadline_s"]),
         warmup_s=float(data["warmup_s"]),
-        window_attempts=int(data["window_attempts"]),
-        min_successes=int(data["min_successes"]),
+        window_attempts=data["window_attempts"],
+        min_successes=data["min_successes"],
         window_poll_timeout_s=float(data["window_poll_timeout_s"]),
         window_poll_interval_s=float(data["window_poll_interval_s"]),
         recovery_timeout_s=float(data["recovery_timeout_s"]),

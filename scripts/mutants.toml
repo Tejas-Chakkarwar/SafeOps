@@ -1584,3 +1584,31 @@ old = '''
     if not (math.isfinite(value) and value >= 0):'''
 new = '''
     if not math.isfinite(value):'''
+
+# Second pre-Milestone-8 hardening: integer workload settings are never coerced.
+
+[[mutant]]
+id = "PRE8-I1"
+source = "pre-M8 workload hardening"
+target = "safeops/environment/workload.py"
+guard = "exact int type check weakened to isinstance, admitting bool"
+kills = [
+    "tests/test_workload.py::test_a_boolean_threshold_never_becomes_one",
+]
+old = '''
+    if type(value) is int:'''
+new = '''
+    if isinstance(value, int):'''
+
+[[mutant]]
+id = "PRE8-I2"
+source = "pre-M8 workload hardening"
+target = "safeops/environment/workload.py"
+guard = "the loader int()-coerces min_successes again"
+kills = [
+    "tests/test_workload.py::test_a_fractional_threshold_is_not_truncated_by_the_loader",
+]
+old = '''
+        min_successes=data["min_successes"],'''
+new = '''
+        min_successes=int(data["min_successes"]),'''
