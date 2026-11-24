@@ -111,3 +111,21 @@ This records a known frozen-scope limitation; it is not a Milestone 7 implementa
 - The stabilization window and its timeout (§5, decision 0013).
 - The harm baseline (post-fault, Rule 8), the two harm families (Rule 9), and the harm comparison's use of `snapshot.diff()` equality (decision 0020 §2).
 - Milestone 7 remains fabricated-input work: no LLM, model adapter, prompt or agent loop (§14; Milestone 9 brings the agent).
+
+## Amendment, 2026-11-23: a started window that closes after the recovery deadline
+
+This resolves an ambiguous boundary case in §3. The text above is unchanged, and so is every other Milestone 7 measurement rule.
+
+**The boundary, checked against the code.**
+- A 300-attempt window closes `closes_after_s(300)` = 300 / 10 + 1.0 + 1.5 = 32.5 s after it opens (`WorkloadSettings.closes_after_s`, `WINDOW_CLOSE_MARGIN_S`).
+- Recovery windows therefore open at about 0, 32.5 and 65 s, and the third closes nominally at about 97.5 s.
+- `_collect` waits up to `window_poll_timeout_s` (60 s) after opening a window before declaring it a measurement failure. So under decision 0009 the third window can still be a valid measurement until about 125 s.
+- The recovery deadline is 120 s. That leaves a band of roughly 120–125 s in which a window could meet decision 0009's measurement mechanics but close after the Milestone 7 recovery deadline.
+
+**Resolution.**
+- A recovery window is started only when deterministic scheduling says it fits inside the remaining recovery budget (§3).
+- If a window started that way nevertheless closes after the recovery deadline, the late close is evidence that the expected scheduling and timing contract didn't hold.
+- For Milestone 7 such a window enters the decision-0009 measurement-failure path, and the run becomes an `infrastructure_failure` discard (§4). It is not treated as a valid but merely late effectiveness observation.
+- It never counts as recovery, and it never becomes `effective = false`.
+- The roughly 120–125 s region is the only boundary currently identified where decision 0009's polling allowance and the Milestone 7 recovery deadline can diverge.
+- The current expectation is that this doesn't happen under normal experimental timing. Milestone 10's pilot must report whether it ever does.
