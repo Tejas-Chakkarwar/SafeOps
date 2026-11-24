@@ -4,7 +4,9 @@ harness-side rule, both tested against fabricated attempts (decision 0009).
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
+import math
 import sys
 from pathlib import Path
 
@@ -228,3 +230,128 @@ def test_verify_before_start_is_a_measurement_failure() -> None:
 
 def test_construction_has_no_side_effects() -> None:
     WorkloadGenerator()  # no config read, no cluster contact
+
+
+# --- fail-closed numeric settings (pre-Milestone-8 hardening) ----------------------------------
+#
+# A comparison against NaN is always false, so before this hardening malformed values could
+# pass the relationship checks. Each timing field now has its own explicit contract, checked
+# before anything is derived from it. The relationship checks below it are unchanged.
+
+LOADED = load_workload_settings()
+POSITIVE = ("rate_rps", "attempt_deadline_s", "window_poll_timeout_s", "window_poll_interval_s")
+
+
+def _with(**changes) -> WorkloadSettings:
+    return dataclasses.replace(LOADED, **changes)
+
+
+@pytest.mark.parametrize("field", POSITIVE)
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 0.0, -1.0])
+def test_each_positive_timing_field_must_be_finite_and_positive(field, value) -> None:
+    with pytest.raises(ValueError, match=f"^{field} must be a finite number > 0"):
+        _with(**{field: value})
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_a_non_finite_warmup_is_rejected(value) -> None:
+    """Before: NaN and -inf skipped the warmup sleep silently; +inf failed in sleep()."""
+    with pytest.raises(ValueError, match="^warmup_s must be a finite number >= 0"):
+        _with(warmup_s=value)
+
+
+def test_a_negative_warmup_is_rejected() -> None:
+    """Before: a negative warmup silently skipped the warmup sleep."""
+    with pytest.raises(ValueError, match="^warmup_s must be a finite number >= 0"):
+        _with(warmup_s=-1.0)
+
+
+def test_a_zero_warmup_is_still_valid() -> None:
+    assert _with(warmup_s=0.0).warmup_s == 0.0
+
+
+def test_a_nan_rate_can_no_longer_reach_a_zero_window_verdict() -> None:
+    """Before: rate NaN was accepted, the window duration was NaN, both relationship checks
+    failed open, and the verifier measured zero windows and returned effective=false."""
+    with pytest.raises(ValueError, match="^rate_rps must be"):
+        _with(rate_rps=math.nan)
+
+
+def test_an_infinite_rate_is_rejected_at_its_own_field() -> None:
+    """+inf gives a finite but meaningless window duration (2.5 s), so only the field's own
+    contract can refuse it."""
+    assert 300 / math.inf + LOADED.attempt_deadline_s + 1.5 == 2.5
+    with pytest.raises(ValueError, match="^rate_rps must be a finite number > 0"):
+        _with(rate_rps=math.inf)
+
+
+def test_an_infinite_attempt_deadline_is_rejected_at_its_own_field() -> None:
+    """Already refused before, but only through the derived window duration and the poll
+    timeout. Now it is refused by its own contract."""
+    with pytest.raises(ValueError, match="^attempt_deadline_s must be a finite number > 0"):
+        _with(attempt_deadline_s=math.inf)
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf])
+def test_a_poll_timeout_that_would_disable_the_poll_deadline_is_rejected(value) -> None:
+    """Before: accepted; `clock() > deadline` was never true, so a window that never closed
+    could be polled without bound."""
+    with pytest.raises(ValueError, match="^window_poll_timeout_s must be a finite number > 0"):
+        _with(window_poll_timeout_s=value)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, -math.inf])
+def test_a_non_positive_poll_timeout_is_rejected_by_its_own_contract(value) -> None:
+    """Already refused before, incidentally, because the window duration exceeded it. Now
+    refused at the field itself, before any window duration is compared with it."""
+    with pytest.raises(ValueError, match="^window_poll_timeout_s must be a finite number > 0"):
+        _with(window_poll_timeout_s=value)
+
+
+def test_a_valid_poll_timeout_bounds_a_window_that_never_closes() -> None:
+    """The time-based exit the field contract protects: a window that never reports
+    complete or failed ends as a timeout once the configured poll timeout passes."""
+    clock = {"t": 0.0}
+
+    def sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    running = {"state": "running", "scheduled": 10}
+    g = WorkloadGenerator(FakeProxy([running]), LOADED, clock=lambda: clock["t"], sleep=sleep)
+    g._started_at = 0.0
+    m = g.measure_recovery_window()
+    assert m.state == "timeout"
+    assert clock["t"] <= LOADED.window_poll_timeout_s + 2 * LOADED.window_poll_interval_s
+
+
+def test_finite_but_unreasonable_values_still_fail_the_relationship_checks() -> None:
+    with pytest.raises(ValueError, match="window poll timeout"):
+        _with(rate_rps=0.001)  # a 300-attempt window would take 300,000 s
+    with pytest.raises(ValueError, match="window poll timeout"):
+        _with(attempt_deadline_s=1e308, window_poll_timeout_s=1e308)  # duration == timeout
+    assert math.isinf(_inf_duration := 300 / 1e-306 + 1.0 + 1.5)  # finite inputs, inf duration
+    with pytest.raises(ValueError, match="window poll timeout"):
+        _with(rate_rps=1e-306)
+    with pytest.raises(ValueError, match="recovery_timeout_s"):
+        _with(recovery_timeout_s=LOADED.closes_after_s(300) - 0.1)
+    assert _with(recovery_timeout_s=LOADED.closes_after_s(300))  # exactly one window
+
+
+def test_an_oversized_finite_poll_interval_is_left_alone() -> None:
+    """Deliberately out of scope: no interval <= timeout constraint."""
+    assert _with(window_poll_interval_s=600.0).window_poll_interval_s == 600.0
+
+
+def test_the_loaded_settings_are_unchanged_by_the_hardening() -> None:
+    assert LOADED == WorkloadSettings(
+        target_path="/checkout",
+        rate_rps=10.0,
+        attempt_deadline_s=1.0,
+        warmup_s=15.0,
+        window_attempts=300,
+        min_successes=297,
+        window_poll_timeout_s=60.0,
+        window_poll_interval_s=1.0,
+        recovery_timeout_s=120.0,
+    )
+    assert LOADED.closes_after_s(LOADED.window_attempts) == 32.5

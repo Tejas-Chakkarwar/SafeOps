@@ -11,8 +11,11 @@
 # definitions, recovered from the session that ran them (the 0023 runner's mutant list, and
 # the 0022 runs' recorded commands), not re-derived from the decisions' prose. Its `source`
 # names the decision entry that recorded it, and [[recorded]] holds that entry's own count.
-# The harness checks recorded = ported + unreconstructible for every source. Decision 0024
-# records no mutation results.
+# The harness checks recorded = ported + unreconstructible for every source. That count covers
+# decisions 0022 and 0023 only. Decision 0024's amendments record Milestone 7's mutation results,
+# but those mutants were defined here, in this table, when they were written (the M7A, M7B and
+# M7 review sections below): they are new mutants, not recovered ones, and are outside
+# [[recorded]].
 #
 # The original runs counted any failing test in the files they ran. The `kills` here name the
 # semantic tests that fail for each mutant, found by running the full offline suite with the
@@ -1553,3 +1556,31 @@ old = '''
 new = '''
         start = self._clock()
         schedule_time = self._clock()'''
+
+# Pre-Milestone-8 hardening: workload timing settings fail closed (decision 0009 settings).
+
+[[mutant]]
+id = "PRE8-W1"
+source = "pre-M8 workload hardening"
+target = "safeops/environment/workload.py"
+guard = "finite-positive timing fields lose their finiteness requirement"
+kills = [
+    "tests/test_workload.py::test_an_infinite_rate_is_rejected_at_its_own_field",
+]
+old = '''
+    if not (math.isfinite(value) and value > 0):'''
+new = '''
+    if not (value > 0):'''
+
+[[mutant]]
+id = "PRE8-W2"
+source = "pre-M8 workload hardening"
+target = "safeops/environment/workload.py"
+guard = "warmup loses its non-negative range requirement"
+kills = [
+    "tests/test_workload.py::test_a_negative_warmup_is_rejected",
+]
+old = '''
+    if not (math.isfinite(value) and value >= 0):'''
+new = '''
+    if not math.isfinite(value):'''

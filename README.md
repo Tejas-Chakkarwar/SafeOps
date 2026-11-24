@@ -10,7 +10,7 @@ The research question is how much autonomous remediation can be safely allowed a
 
 It's an MS Computer Science project at San José State University (CS297, Fall 2026 → CS298, Spring 2027), advised by Prof. Robert Chun.
 
-> **Status:** under active development. Milestones 1–6 of 17 are complete: a reproducible testbed, a verified environment lifecycle, the first fault with symptom-only alerts, a validated, immutable run record, and the agent's bounded read-only tools. The agent, the gate and the verifiers are still to come, so **there are no results yet**. See [Roadmap](#roadmap).
+> **Status:** under active development. Milestones 1–7 of 17 are complete: a reproducible testbed, a verified environment lifecycle, the first fault with symptom-only alerts, a validated, immutable run record, the agent's bounded read-only tools, and the effectiveness and harm verifiers, tested on fabricated inputs. Milestone 8 (parser, feature extractor, gate and executor) is next. The agent and the gate are still to come, so **there are no results yet**. See [Roadmap](#roadmap).
 
 ---
 
@@ -85,7 +85,7 @@ make cluster-down
 
 | Path | Contents |
 |---|---|
-| `safeops/` | The system: CLI, environment lifecycle, snapshots, faults, run records, and later the agent, gate, executor and verifiers |
+| `safeops/` | The system: CLI, environment lifecycle, snapshots, faults, run records, the effectiveness and harm verifiers, and later the agent, gate and executor |
 | `testbed/` | The testbed services and load generator (Python), built into reproducible images |
 | `manifests/`, `kind/` | Kubernetes manifests, Helm values, the kind cluster definition |
 | `config/` | Topology, desired state, workload and cluster configuration; changing these changes the experimental condition |

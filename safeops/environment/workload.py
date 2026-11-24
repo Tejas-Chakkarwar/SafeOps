@@ -43,6 +43,18 @@ class SteadyStateNotReached(SteadyStateError):
     """The window was measured, but too few of its scheduled attempts succeeded."""
 
 
+def _finite_positive(name: str, value: float) -> None:
+    # Positive form on purpose: NaN fails `value > 0` too, so dropping the finiteness
+    # clause by accident would still refuse NaN (only infinity would slip through).
+    if not (math.isfinite(value) and value > 0):
+        raise ValueError(f"{name} must be a finite number > 0, got {value!r}")
+
+
+def _finite_nonnegative(name: str, value: float) -> None:
+    if not (math.isfinite(value) and value >= 0):
+        raise ValueError(f"{name} must be a finite number >= 0, got {value!r}")
+
+
 @dataclass(frozen=True)
 class WorkloadSettings:
     target_path: str
@@ -58,8 +70,23 @@ class WorkloadSettings:
     def __post_init__(self) -> None:
         if not 0 < self.min_successes <= self.window_attempts:
             raise ValueError("min_successes must be in 1..window_attempts")
-        if self.rate_rps <= 0 or self.attempt_deadline_s <= 0 or self.window_attempts <= 0:
-            raise ValueError("rate, deadline and window size must be positive")
+        if self.window_attempts <= 0:
+            raise ValueError("window_attempts must be positive")
+        # Each timing field is checked on its own, before anything is derived from it. A
+        # comparison against NaN is always false, so without these, malformed values failed
+        # open: a NaN rate or attempt deadline made the window duration NaN, which passed
+        # both checks below and let the verifier measure zero windows (effective=false); a
+        # NaN or infinite poll timeout disabled the poll loop's only time-based exit; a NaN
+        # or negative warmup silently skipped the warmup, and an invalid poll interval
+        # failed later, in sleep().
+        for name in (
+            "rate_rps",
+            "attempt_deadline_s",
+            "window_poll_timeout_s",
+            "window_poll_interval_s",
+        ):
+            _finite_positive(name, getattr(self, name))
+        _finite_nonnegative("warmup_s", self.warmup_s)
         closes = self.closes_after_s(self.window_attempts)
         if closes >= self.window_poll_timeout_s:
             # Every steady-state window would time out and every run be discarded (fix list,
