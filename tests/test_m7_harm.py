@@ -887,7 +887,7 @@ def test_the_result_serializes_to_strict_json_accepted_by_version_2_harm_violati
         {
             **record,
             "effective": True,
-            "time_to_recovery_s": None,
+            "time_to_recovery_s": 32.5,  # a valid V2 pair (decision 0024 §6)
             "category": "harmful_but_effective",
         }
     )

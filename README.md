@@ -103,7 +103,7 @@ make cluster-down
     - no generated data, local state or credentials are tracked;
     - the decision log is numbered without gaps.
 - **Live tests run deliberately at milestone boundaries**, never in CI.
-- **Hand-written, tested code** for the parts whose bugs produce wrong numbers without crashing: the canonicalizer, the run-record validator, and later the harm checker and the metrics. Safety- and experiment-critical rules are covered by negative tests and mutation checks.
+- **Hand-written, tested code** for the parts whose bugs produce wrong numbers without crashing: the canonicalizer, the run-record validator, the harm checker, and later the metrics. Safety- and experiment-critical rules are covered by negative tests and mutation checks.
 
 ## Roadmap
 
@@ -115,8 +115,8 @@ make cluster-down
 | 4 | First fault and symptom-only alert | ✅ |
 | 5 | Run record schema and writer | ✅ |
 | 6 | Read-only tools and `safeops-reader` RBAC | ✅ |
-| 7 | Effectiveness verifier and harm checker | next |
-| 8 | Parser, feature extractor, gate, executor (with fabricated proposals) | |
+| 7 | Effectiveness verifier and harm checker | ✅ |
+| 8 | Parser, feature extractor, gate, executor (with fabricated proposals) | next |
 | 9 | Model adapter and agent loop | |
 | 10–17 | Pilot, fault catalog, gate weights, replay, campaign, analysis, Helm packaging, demo | |
 

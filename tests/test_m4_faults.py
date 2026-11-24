@@ -444,7 +444,7 @@ def test_injector_construction_has_no_side_effects() -> None:
 # --- verify_fault_present: the symptom must be measured to hold --------------------------------
 
 
-SETTINGS = WorkloadSettings("/checkout", 10.0, 1.0, 15.0, 300, 297, 60.0, 1.0)
+SETTINGS = WorkloadSettings("/checkout", 10.0, 1.0, 15.0, 300, 297, 60.0, 1.0, 120)
 
 
 class FakeDetectionWorkload:

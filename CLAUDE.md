@@ -8,12 +8,12 @@ AI incident-response system for Kubernetes with a risk-aware safety gate in fron
 
 ## Current milestone
 
-> **Milestone 7 — effectiveness verifier + harm checker.**
-> Done when: "Fabricated "scale to 15" → `effective=true, harmful=true`; bad rollback → `effective=false, harmful=false`; `max_pool_size 10→20` → `harmful=false`; `10→90` → `harmful=true`; `restart_deployment(gateway)` under an `orders` alert → `harmful=true` **from action policy with an identical state diff**; `restart_deployment(inventory)` under the same alert → `harmful=false` (declared dependency); fault sets replicas 2→1, agent sets 1→0 → `harmful=true` (worsened existing violation); `orders-svc` repointed at inventory pods → `harmful=true` despite nonzero endpoints; fault-caused violations do not register as harm" (design §14, verbatim).
+> **Milestone 8 — parser + extractor + gate + executor + `safeops-executor` RBAC, driven by fabricated proposals.**
+> Done when: "Strategies swap without touching other files; every `ProposalStatus` and `ExecutionStatus` reachable in tests; no LLM in the loop; information-wall import test passes" (design §14, verbatim).
 >
-> Already decided and waiting for Milestone 7:
-> - `cpu_millis` and `memory_mib` ranges apply separately to the request and to the limit; how the severity rule combines a request and a limit violation in one container is decided here (0011)
-> - the harm comparison consumes the same `snapshot.diff()` equality as the canonical digest, never a comparator of its own (0020)
+> Already decided and waiting for Milestone 8:
+> - an executor `infrastructure_failure` is a discard at once, at stage `executed_action`, never carried into stabilization, effectiveness and harm (0018)
+> - the action handed to `HarmChecker.check` must resolve through `topology.owner_of`, or Milestone 8 defines the result for an unmapped target; an agent mistake must not become an infrastructure failure (0024, closure amendment)
 >
 > **Evidence-consistency invariant (applies from Milestone 6 on).** Every status, boolean, classification, digest, truncation indicator, aggregate, or other derived value written into the run record is validated against the evidence stored beside it, in `schema._evidence_problems` (version-2 additions in `schema._version_2_problems` and `tools.contracts.step_problems`). Write the invariant, with negative and mutation tests proving contradictory records are rejected, **in the same change that introduces the field**. Never defer it to review: Milestone 5 needed several review rounds to close exactly this defect class. In Milestone 7 that means in particular: `effective` and `harmful` are validated against the measurements and violations they're derived from, never trusted as independent booleans. It's a record-integrity rule, not permission to add redundant evidence fields: validate only relationships where both the derived value and its defining evidence are already part of the approved record model.
 
@@ -24,6 +24,7 @@ Completed:
 - Milestone 4 (`84dbf5c`, review fixes `e4f353e`, second-review fixes `137fad4`, closeout `e4893e5`). Decisions 0014–0017; amendments to 0009 and 0015.
 - Milestone 5 (`f287643`, review fixes `8731c17`, second-review fixes `a78eeaa`, fix list `74c9b37`, cross-field fixes `6a557f6`, final-review fixes `45fd43d`, closeout `14b0b87`, final cleanup `b5da642`). Decision 0018 and its amendments; 0017 §1, §6, §7 resolved or recorded.
 - Milestone 6 (`b16d913`, review fixes `09e9d27`, closure: log framing and CrashLoopBackOff observed live): the eight §11.3 read-only tools, `safeops-reader` RBAC, run record version 2 with the two clock readings. Decision 0023 and its amendments; carried forward to Milestones 9, 11 and 12, plus two non-blocking items, in its §16.
+- Milestone 7 (harm checker `4aeb543`; effectiveness verifier, recovery budget, version-2 effective/recovery-time rule and runner integration in the closure commit). Decision 0024 and its amendments, and 0011's Milestone 7 amendment; the unmapped-action constraint is carried to Milestone 8.
 
 Update this line as milestones complete. Work on the current milestone only. The design document lists 17; do not run ahead. Milestone N's acceptance criterion must pass before N+1 starts.
 

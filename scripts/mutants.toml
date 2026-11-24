@@ -1263,3 +1263,264 @@ old = '''
     return isinstance(count, int) and not isinstance(count, bool) and count == 0'''
 new = '''
     return False'''
+
+# Milestone 7B, effectiveness and integration (design §11.7; decision 0024 and its
+# amendments). New mutants, not historical recovery.
+
+[[mutant]]
+id = "M7B-E1"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "a recovery measurement failure becomes ineffective instead of raising"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu7_eu8_a_failed_or_timed_out_window_raises_never_ineffective",
+    "tests/test_m7_effectiveness.py::test_a_recovery_measurement_failure_is_an_infrastructure_discard_at_effectiveness",
+]
+old = '''
+                raise RecoveryMeasurementError(f"recovery window not validly measured: {problem}")'''
+new = '''
+                return EffectivenessResult(False, None)'''
+
+[[mutant]]
+id = "M7B-E2"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "accept a window whose own counts show incomplete scheduling"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu9_a_complete_state_with_incomplete_scheduling_is_not_recovery",
+]
+old = '''
+    if m.size != s.window_attempts or m.scheduled != m.size:'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "M7B-E2b"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "skip the generic decision-0009 summary cross-checks"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu10_an_inconsistent_generic_summary_raises",
+]
+old = '''
+    return _inconsistency(m.summary, s, s.window_attempts)'''
+new = '''
+    return None'''
+
+[[mutant]]
+id = "M7B-E3"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "judge recovery by the baseline's succeeded count, not min_successes"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu11_the_threshold_is_min_successes_not_the_baseline_count",
+]
+old = '''
+            if m.summary["succeeded"] >= steady_state.min_successes:'''
+new = '''
+            if m.summary["succeeded"] >= steady_state.succeeded:'''
+
+[[mutant]]
+id = "M7B-E4"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "start a window that can no longer close inside the budget"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu4_a_window_that_can_no_longer_fit_is_never_started",
+    "tests/test_m7_effectiveness.py::test_eu3_every_window_that_fits_fails_is_ineffective_and_censored",
+]
+old = '''
+        while now + window_s <= deadline:'''
+new = '''
+        while now < deadline:'''
+
+[[mutant]]
+id = "M7B-E5"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "accept a window that closed after the recovery deadline"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu6_a_window_that_closes_after_the_deadline_is_a_measurement_failure",
+]
+old = '''
+            if now > deadline:'''
+new = '''
+            if False:'''
+
+[[mutant]]
+id = "M7B-E6"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "put the recovery error in the SteadyStateError hierarchy"
+kills = [
+    "tests/test_m7_effectiveness.py::test_the_recovery_error_is_not_in_the_steady_state_hierarchy",
+    "tests/test_m7_effectiveness.py::test_a_recovery_measurement_failure_is_an_infrastructure_discard_at_effectiveness",
+]
+old = '''
+class RecoveryMeasurementError(Exception):'''
+new = '''
+from safeops.environment.workload import SteadyStateError  # noqa: E402
+
+
+class RecoveryMeasurementError(SteadyStateError):'''
+
+[[mutant]]
+id = "M7B-E7"
+source = "M7B effectiveness and integration"
+target = "safeops/experiment/schema.py"
+guard = "drop the version-2 effective / time_to_recovery_s rule"
+kills = [
+    "tests/test_m7_effectiveness.py::test_v2_rejects_a_disagreeing_effective_and_recovery_time",
+    "tests/test_m7_effectiveness.py::test_a_bare_true_never_becomes_a_completed_record",
+]
+old = '''
+        if o.effective != (o.time_to_recovery_s is not None):'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M7B-E8"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "hard-code the 120 s budget instead of timeout_s"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu12_the_budget_is_the_timeout_argument_never_a_constant",
+]
+old = '''
+        deadline = start + timeout_s'''
+new = '''
+        deadline = start + 120'''
+
+[[mutant]]
+id = "M7B-E9"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "nominal recovery time (window count x duration) instead of elapsed"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu13_recovery_time_is_actual_monotonic_elapsed_time",
+    "tests/test_m7_effectiveness.py::test_eu1_the_first_window_recovers_at_its_actual_close",
+]
+old = '''
+                return EffectivenessResult(True, now - start)'''
+new = '''
+                return EffectivenessResult(True, round((now - start) / window_s) * window_s)'''
+
+[[mutant]]
+id = "M7B-E10"
+source = "M7B effectiveness and integration"
+target = "safeops/environment/workload.py"
+guard = "drop the minimum recovery-budget settings guard"
+kills = [
+    "tests/test_m7_effectiveness.py::test_a_budget_shorter_than_one_complete_window_is_refused",
+    "tests/test_m7_effectiveness.py::test_the_poll_timeout_guard_still_holds_independently",
+]
+old = '''
+        if not math.isfinite(self.recovery_timeout_s) or self.recovery_timeout_s < closes:'''
+new = '''
+        if not math.isfinite(self.recovery_timeout_s):'''
+
+[[mutant]]
+id = "M7B-E11"
+source = "M7B effectiveness and integration"
+target = "safeops/experiment/runner.py"
+guard = "give effectiveness a second WorkloadGenerator"
+kills = [
+    "tests/test_m7_effectiveness.py::test_the_verifier_measures_the_one_shared_workload_generator",
+]
+old = '''
+        effectiveness=EffectivenessVerifier(workload=workload),'''
+new = '''
+        effectiveness=EffectivenessVerifier(workload=WorkloadGenerator()),'''
+
+[[mutant]]
+id = "M7B-E12"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "reject a valid window that closes exactly at the deadline"
+kills = [
+    "tests/test_m7_effectiveness.py::test_eu5_a_window_that_closes_exactly_at_the_deadline_counts",
+]
+old = '''
+            if now > deadline:'''
+new = '''
+            if now >= deadline:'''
+
+[[mutant]]
+id = "M7B-E13"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "let the verifier run zero windows on a budget too short for one"
+kills = [
+    "tests/test_m7_effectiveness.py::test_the_verifier_refuses_a_budget_that_cannot_fit_one_window",
+]
+old = '''
+            or timeout_s < window_s
+'''
+new = '''
+'''
+
+[[mutant]]
+id = "M7B-I1"
+source = "M7B effectiveness and integration"
+target = "safeops/experiment/runner.py"
+guard = "measure harm against the pre-fault snapshot"
+kills = [
+    "tests/test_m7_effectiveness.py::test_the_runner_measures_harm_against_the_post_fault_snapshot",
+    "tests/test_m7_effectiveness.py::test_the_harm_checker_gets_the_executed_action_context_postfault_and_postaction",
+]
+old = '''
+            harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)'''
+new = '''
+            harm = self.harm.check(executed_action, context, data["prefault"], postaction)'''
+
+[[mutant]]
+id = "M7B-I2"
+source = "M7B effectiveness and integration"
+target = "safeops/experiment/runner.py"
+guard = "store only the bool, losing time_to_recovery_s"
+kills = [
+    "tests/test_m7_effectiveness.py::test_the_runner_records_the_real_verifier_result",
+]
+old = '''
+            data["effective"], data["harm"] = effective, harm'''
+new = '''
+            data["effective"], data["harm"] = effective.effective, harm'''
+
+[[mutant]]
+id = "M7B-I3"
+source = "M7B effectiveness and integration"
+target = "safeops/experiment/runner.py"
+guard = "pass a constant budget instead of the configured one"
+kills = [
+    "tests/test_m7_effectiveness.py::test_the_runner_passes_the_configured_recovery_budget",
+]
+old = '''
+                steady_state, timeout_s=self.workload.settings.recovery_timeout_s'''
+new = '''
+                steady_state, timeout_s=120'''
+
+[[mutant]]
+id = "M7B-E14"
+source = "M7B effectiveness and integration"
+target = "safeops/verify/effectiveness.py"
+guard = "score recovery against a baseline that is not this window's passed baseline"
+kills = [
+    "tests/test_m7_effectiveness.py::test_the_verifier_refuses_a_baseline_that_is_not_this_windows_passed_baseline",
+]
+old = '''
+        if not (steady_state.baseline_ok and steady_state.size == s.window_attempts):'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M7B-I4"
+source = "M7B effectiveness and integration"
+target = "safeops/experiment/runner.py"
+guard = "let the verifier measure a workload the run never started"
+kills = [
+    "tests/test_m7_effectiveness.py::test_the_runner_refuses_a_verifier_that_measures_another_workload",
+]
+old = '''
+                and self.effectiveness.workload is not self.workload'''
+new = '''
+                and False'''

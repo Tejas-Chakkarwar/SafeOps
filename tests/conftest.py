@@ -9,7 +9,7 @@ import pytest
 
 from safeops.environment.manager import CleanStateResult, SettledSnapshot
 from safeops.environment.snapshot import Snapshot
-from safeops.environment.workload import SteadyState
+from safeops.environment.workload import SteadyState, WindowMeasurement, load_workload_settings
 from safeops.experiment.records import RunRecordWriter
 from safeops.faults.injector import (
     FaultBackendRef,
@@ -18,6 +18,7 @@ from safeops.faults.injector import (
     SymptomObservation,
 )
 from safeops.faults.spec import Symptom, load_fault_spec
+from safeops.verify.effectiveness import EffectivenessVerifier
 
 FIXED_TIME = datetime(2026, 11, 19, 18, 0, 0, tzinfo=UTC)
 
@@ -128,6 +129,8 @@ class FakeEnvironment:
 
 
 class FakeWorkload:
+    settings = load_workload_settings()  # the real config: the runner reads its recovery budget
+
     def start_workload(self) -> None:
         pass
 
@@ -136,6 +139,19 @@ class FakeWorkload:
 
     def stop_workload(self) -> None:
         pass
+
+    def measure_recovery_window(self) -> WindowMeasurement:
+        """A complete, full-size window in which every attempt succeeded."""
+        n = self.settings.window_attempts
+        summary = {
+            "state": "complete",
+            "size": n,
+            "scheduled": n,
+            "succeeded": n,
+            "failed": 0,
+            "deadline_s": self.settings.attempt_deadline_s,
+        }
+        return WindowMeasurement("wr", "complete", n, n, summary)
 
 
 class FakeInjector:
@@ -215,6 +231,8 @@ def offline_runner_factory(tmp_path):
         r = real_build()
         r.environment = FakeEnvironment()
         r.workload = FakeWorkload()
+        # The verifier must measure the runner's workload, never build_runner's real one.
+        r.effectiveness = EffectivenessVerifier(workload=r.workload)
         r.injector = FakeInjector()
         r.alerts._namespace = "testbed"  # no cluster config read in offline tests
         r.records = offline_writer(tmp_path / "runs")  # never the repo's data/runs/

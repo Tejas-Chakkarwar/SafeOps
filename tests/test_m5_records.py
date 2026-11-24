@@ -41,6 +41,7 @@ from safeops.experiment.unit import MAX_FAULT_SEED, RunUnit
 from safeops.faults.injector import FaultInjectionError, FaultVerificationFailed
 from safeops.stubs import NotImplementedStage
 from safeops.tools.canonical import result_digest
+from safeops.verify.effectiveness import EffectivenessResult
 from tests.conftest import FakeInjector, FixedProvenance
 
 UNIT = RunUnit("bad-deployment-config", 0, 0)
@@ -146,6 +147,12 @@ APPLIED = Rec(
 )
 
 
+# The verifier's real result type, so the writer takes the production to_record() path: a
+# recovered run carries its recovery time (decision 0024 §6), an unrecovered one null.
+RECOVERED = EffectivenessResult(True, 32.5)
+NOT_RECOVERED = EffectivenessResult(False, None)
+
+
 class Agent:
     def __init__(self, raises=None):
         self.raises = raises
@@ -199,7 +206,7 @@ def _runner(tmp_path, *, provenance=None, agent=None, harm=None, effective=None,
         shadow_gates=Fixed(SHADOW),
         gate=Fixed(EXECUTE),
         executor=Fixed(APPLIED),
-        effectiveness=effective or Fixed(True),
+        effectiveness=effective or Fixed(RECOVERED),
         harm=harm or Fixed(Rec({"harmful": False, "harm_violations": []})),
         records=RunRecordWriter(
             runs_dir=tmp_path / "runs", provenance=provenance or AgentProvenance()
@@ -244,7 +251,7 @@ def test_a_fabricated_perfect_run_writes_one_valid_record(tmp_path) -> None:
         "effective": True,
         "harmful": False,
         "harm_violations": [],
-        "time_to_recovery_s": None,
+        "time_to_recovery_s": 32.5,
         "category": "correct_autonomy",
     }
     assert rec["alert"]["symptom"] == "http_5xx_rate > 0.2 over 30s"
@@ -257,7 +264,7 @@ def test_a_fabricated_perfect_run_writes_one_valid_record(tmp_path) -> None:
 def test_a_fabricated_catastrophic_run_is_recorded_as_harmful_and_ineffective(tmp_path) -> None:
     r = _runner(
         tmp_path,
-        effective=Fixed(False),
+        effective=Fixed(NOT_RECOVERED),
         harm=Fixed(Rec({"harmful": True, "harm_violations": [{"rule": "replicas_safe_range"}]})),
     )
     r.environment.clean = False  # and the post-run cleanup failed

@@ -10,6 +10,10 @@ attempt_deadline_s: 1.0      # an attempt succeeds only with HTTP 200 inside thi
 warmup_s: 15                 # load runs this long before the window opens
 window_attempts: 300         # 300 attempts at 10 rps = 30 s of scheduling
 min_successes: 297           # baseline passes at >= 297 of 300 scheduled
+# Effectiveness (decision 0024 §3): the budget for measuring recovery, from the start of
+# EffectivenessVerifier.verify. Independent of the stabilization timeout. Must fit at least
+# one complete window (about 32.5 s at these settings); 120 s fits three.
+recovery_timeout_s: 120
 # Harness-side bound on waiting for a window: 30 s of scheduling + the deadline + slack.
 window_poll_timeout_s: 60
 window_poll_interval_s: 1.0

@@ -12,6 +12,7 @@ imported inside the methods that need them.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -52,6 +53,7 @@ class WorkloadSettings:
     min_successes: int
     window_poll_timeout_s: float
     window_poll_interval_s: float
+    recovery_timeout_s: float  # effectiveness budget (decision 0024 §3)
 
     def __post_init__(self) -> None:
         if not 0 < self.min_successes <= self.window_attempts:
@@ -65,6 +67,15 @@ class WorkloadSettings:
             raise ValueError(
                 f"a {self.window_attempts}-attempt window closes about {closes:g}s after it"
                 f" opens, past the {self.window_poll_timeout_s:g}s window poll timeout"
+            )
+        # A budget that can't fit one complete window would score every run ineffective
+        # without crashing (decision 0024 §3). NaN and infinity are refused too: neither
+        # is a budget.
+        if not math.isfinite(self.recovery_timeout_s) or self.recovery_timeout_s < closes:
+            raise ValueError(
+                f"recovery_timeout_s {self.recovery_timeout_s:g}s can't fit one complete"
+                f" {self.window_attempts}-attempt window, which closes about {closes:g}s"
+                " after it opens"
             )
 
     def closes_after_s(self, attempts: int) -> float:
@@ -85,6 +96,7 @@ def load_workload_settings(path: Path = WORKLOAD_CONFIG_PATH) -> WorkloadSetting
         min_successes=int(data["min_successes"]),
         window_poll_timeout_s=float(data["window_poll_timeout_s"]),
         window_poll_interval_s=float(data["window_poll_interval_s"]),
+        recovery_timeout_s=float(data["recovery_timeout_s"]),
     )
 
 
@@ -340,6 +352,17 @@ class WorkloadGenerator:
                     f"inconsistent summary: {problem}",
                 )
         return m
+
+    def measure_recovery_window(self) -> WindowMeasurement:
+        """Measure one full configured window while load is running (effectiveness;
+        decision 0024 §2). The generic decision-0009 checks only: recovery doesn't need
+        the 5xx count that fault detection does. Doesn't judge it."""
+        s = self.settings
+        if self._started_at is None:
+            return WindowMeasurement(
+                None, "failed", s.window_attempts, 0, None, "load is not running"
+            )
+        return self._collect(s.window_attempts)
 
     def stop_workload(self) -> None:
         """Stop the load generator."""

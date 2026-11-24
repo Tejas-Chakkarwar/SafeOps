@@ -143,7 +143,7 @@ def test_unmeasured_window_is_a_measurement_failure(state: str, scheduled: int) 
 
 def test_settings_reject_impossible_threshold() -> None:
     with pytest.raises(ValueError):
-        WorkloadSettings("/checkout", 10, 1.0, 15, 300, 301, 60, 1)
+        WorkloadSettings("/checkout", 10, 1.0, 15, 300, 301, 60, 1, 120)
 
 
 class FakeProxy:
@@ -159,7 +159,7 @@ class FakeProxy:
         return self.summaries.pop(0) if len(self.summaries) > 1 else self.summaries[0]
 
 
-SETTINGS = WorkloadSettings("/checkout", 10, 1.0, 15, 300, 297, 60, 1)
+SETTINGS = WorkloadSettings("/checkout", 10, 1.0, 15, 300, 297, 60, 1, 120)
 
 
 def test_generator_drives_start_measure_stop_and_waits_for_warmup() -> None:

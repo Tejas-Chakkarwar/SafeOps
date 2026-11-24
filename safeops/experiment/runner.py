@@ -229,7 +229,16 @@ class ExperimentRunner:
             stage = RunStage.POSTACTION_SNAPSHOT
             postaction = data["postaction"] = env.capture_snapshot()
             stage = RunStage.EFFECTIVENESS
-            effective = self.effectiveness.verify(steady_state)
+            if (
+                isinstance(self.effectiveness, EffectivenessVerifier)
+                and self.effectiveness.workload is not self.workload
+            ):
+                # The budget comes from self.workload, the windows from the verifier's: they
+                # must be the one generator this run started (decision 0024, closure).
+                raise RuntimeError("the effectiveness verifier measures another workload")
+            effective = self.effectiveness.verify(
+                steady_state, timeout_s=self.workload.settings.recovery_timeout_s
+            )
             stage = RunStage.HARM
             harm = self.harm.check(executed_action, context, postfault.snapshot, postaction)
             data["effective"], data["harm"] = effective, harm
@@ -504,7 +513,9 @@ def build_runner() -> ExperimentRunner:
     """Wire the default components. Constructing them has no side effects."""
     from safeops.faults.spec import FAULTS_DIR
 
-    workload = WorkloadGenerator()  # shared: the injector measures on the running workload
+    # One generator, shared: the injector and the effectiveness verifier both measure on the
+    # load this run started (decisions 0015, 0024).
+    workload = WorkloadGenerator()
     return ExperimentRunner(
         environment=EnvironmentManager(),
         workload=workload,
@@ -516,7 +527,7 @@ def build_runner() -> ExperimentRunner:
         shadow_gates=ShadowGateScorer(),
         gate=AlwaysActGate(),
         executor=ActionExecutor(),
-        effectiveness=EffectivenessVerifier(),
+        effectiveness=EffectivenessVerifier(workload=workload),
         harm=HarmChecker(),
         records=RunRecordWriter(faults_dir=FAULTS_DIR),  # one spec source for both
     )

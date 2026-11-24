@@ -720,6 +720,13 @@ def _clock_problems(r: RunRecordV2) -> list[str]:
 
 def _version_2_problems(r: RunRecordV2) -> list[str]:
     p = _clock_problems(r)
+    # Decision 0024 §6: a measured effectiveness verdict and its recovery time agree. Only
+    # the relation: Outcome's own field types already refuse a negative or non-finite time.
+    # Version 2 only (this function); version 1 keeps its historical semantics.
+    o = r.outcome
+    if o is not None and not r.discarded and o.effective is not None:
+        if o.effective != (o.time_to_recovery_s is not None):
+            p.append("effective must be true exactly when time_to_recovery_s is set (0024 §6)")
     d = r.discard_reason
     if (
         d is not None

@@ -302,6 +302,11 @@ class RunRecordWriter:
             from safeops.experiment.schema import category_for
 
             eff = _plain(f["effective"])
+            # The verifier's EffectivenessResult arrives here as its to_record() dict. A bare
+            # bool is kept only as a legacy form: False is the censored (null-time) verdict;
+            # True carries no recovery time, so a completed record built from it fails the
+            # version-2 rule in finalize() and is kept under rejected/, never written as data
+            # (decision 0024, closure amendment). No time is ever invented for it.
             eff = eff if isinstance(eff, dict) else {"effective": eff, "time_to_recovery_s": None}
             harm = _plain(f["harm"]) or {}
             effective, harmful = eff.get("effective"), harm.get("harmful")

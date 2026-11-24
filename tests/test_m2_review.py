@@ -243,7 +243,7 @@ def test_harness_kubeconfig_is_private_from_creation(tmp_path) -> None:
 
 # --- W1-W6: the harness doesn't trust the generator's summary -------------------------------
 
-SETTINGS = WorkloadSettings("/checkout", 10, 1.0, 15, 300, 297, 60, 1)
+SETTINGS = WorkloadSettings("/checkout", 10, 1.0, 15, 300, 297, 60, 1, 120)
 GOOD = {
     "state": "complete",
     "size": 300,

@@ -42,6 +42,8 @@ class _Recorder:
         class Double:
             def __getattr__(self, method: str):
                 real = getattr(owner, method)  # AttributeError if the method doesn't exist
+                if isinstance(real, property):  # data the runner reads (settings), not a stage
+                    return _Opaque()
 
                 def call(*args, **kwargs):
                     inspect.signature(real).bind(None, *args, **kwargs)  # TypeError on mismatch
