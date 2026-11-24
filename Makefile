@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: sync test lint format cluster-up cluster-down cluster-test bootstrap-scope steady-state desired-state
+.PHONY: sync test lint format mutate cluster-up cluster-down cluster-test bootstrap-scope steady-state desired-state
 
 sync:
 	$(UV) sync
@@ -16,6 +16,11 @@ lint:
 format:
 	$(UV) run ruff format .
 	$(UV) run ruff check --fix .
+
+# Mutation checks (scripts/mutate.py, table in scripts/mutants.toml). Development tooling
+# only. Needs a clean working tree; restores every file it mutates. ONLY="ID ..." for some.
+mutate:
+	$(UV) run python scripts/mutate.py $(if $(ONLY),--only $(ONLY))
 
 # Bootstrap (decision 0006). The only entry points that may use the bootstrap phase.
 cluster-up:

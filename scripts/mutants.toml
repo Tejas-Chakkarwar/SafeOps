@@ -1,0 +1,1011 @@
+# Mutation table for scripts/mutate.py (`make mutate`). Repository-development data only: not
+# an experiment input, not part of any run's provenance.
+#
+# Each [[mutant]] replaces the exact `old` text, which must occur exactly once in `target`,
+# with `new`, and at least one of the pytest nodes in `kills` must then fail on an assertion.
+# `old` and `new` are TOML literal strings ('''...'''; the newline right after the opening
+# quotes isn't part of the value), so the text is byte-for-byte the source text: no escapes.
+#
+# Historical recovery. Decisions 0022 and 0023 recorded mutation results whose definitions
+# were never committed. Every recorded mutant below is ported verbatim from the original
+# definitions, recovered from the session that ran them (the 0023 runner's mutant list, and
+# the 0022 runs' recorded commands), not re-derived from the decisions' prose. Its `source`
+# names the decision entry that recorded it, and [[recorded]] holds that entry's own count.
+# The harness checks recorded = ported + unreconstructible for every source. Decision 0024
+# records no mutation results.
+#
+# The original runs counted any failing test in the files they ran. The `kills` here name the
+# semantic tests that fail for each mutant, found by running the full offline suite with the
+# mutant in place, so each kill is now attributable.
+#
+# A mutant added later names a source outside [[recorded]] (for example "0025 ...") and isn't
+# counted as historical recovery. An entry that can't be ported faithfully goes in
+# [[unreconstructible]] with its reason, never as a substitute mutant.
+
+[[recorded]]
+source = "0022 §1 reset lifecycle"  # decision 0022 §1, "Mutation checks: 6, all killed"
+count = 6
+
+[[recorded]]
+source = "0022 §2 ownership"  # decision 0022 §2, "Mutation checks: 11, all killed"
+count = 11
+
+[[recorded]]
+source = "0023 §15"  # decision 0023 §15, "Mutation checks: 34, all killed"
+count = 34
+
+[[recorded]]
+source = "0023 review amendment"  # decision 0023 amendment after b16d913, "plus 8 for these fixes"
+count = 8
+
+[[recorded]]
+source = "0023 closure amendment"  # decision 0023 closure amendment, "4 new"
+count = 4
+
+[[recorded]]
+source = "0023 second closure amendment"  # decision 0023 second closure amendment, SA-SD
+count = 4
+
+[[mutant]]
+id = "0023-1"
+source = "0023 §15"
+target = "safeops/tools/reader.py"
+guard = "remove the namespace scope guard"
+kills = [
+    "tests/test_m6_tools.py::test_no_tool_can_mutate_or_escape_under_hostile_arguments",
+]
+old = '''
+        if namespace != self.namespace:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "0023-2"
+source = "0023 §15"
+target = "safeops/tools/contracts.py"
+guard = "name grammar dropped (unrestricted selector input)"
+kills = [
+    "tests/test_m6_tools.py::test_no_tool_can_mutate_or_escape_under_hostile_arguments",
+]
+old = '''
+DnsSubdomain = Annotated[str, Field(pattern=rf"^{_LABEL}(\.{_LABEL})*$", max_length=253)]'''
+new = '''
+DnsSubdomain = Annotated[str, Field(max_length=253)]'''
+
+[[mutant]]
+id = "0023-3"
+source = "0023 §15"
+target = "safeops/tools/reader.py"
+guard = "failed read becomes empty success"
+kills = [
+    "tests/test_m6_tools.py::test_a_failed_read_is_never_an_empty_success",
+    "tests/test_m6_tools.py::test_get_logs_a_failed_stream_read_fails_the_call",
+]
+old = '''
+    except CommandError as exc:
+        raise ToolError("command_failed", str(exc)) from exc'''
+new = '''
+    except CommandError as exc:
+        return '{"items": []}''''
+
+[[mutant]]
+id = "0023-4"
+source = "0023 §15"
+target = "safeops/tools/kube.py"
+guard = "remove the event cap of 50"
+kills = [
+    "tests/test_m6_tools.py::test_get_events_keeps_the_50_newest_in_a_stable_order",
+]
+old = '''
+    shown = matched[-c.MAX_EVENTS :]'''
+new = '''
+    shown = matched'''
+
+[[mutant]]
+id = "0023-5"
+source = "0023 §15"
+target = "safeops/tools/contracts.py"
+guard = "remove the log hard cap of 200"
+kills = [
+    "tests/test_m6_tools.py::test_get_logs_rejects_max_lines_outside_1_to_200_before_any_read",
+]
+old = '''
+MaxLines = Annotated[int, Field(ge=1, le=MAX_LOG_LINES)]'''
+new = '''
+MaxLines = Annotated[int, Field(ge=1, le=100000)]'''
+
+[[mutant]]
+id = "0023-6"
+source = "0023 §15"
+target = "safeops/tools/kube.py"
+guard = "max_lines > 200 clamped instead of rejected"
+kills = [
+    "tests/test_m6_tools.py::test_get_logs_rejects_max_lines_outside_1_to_200_before_any_read",
+]
+old = '''
+            "max_lines": max_lines,'''
+new = '''
+            "max_lines": min(max_lines, 200) if type(max_lines) is int else max_lines,'''
+
+[[mutant]]
+id = "0023-7"
+source = "0023 §15"
+target = "safeops/tools/metrics.py"
+guard = "remove the metric-point cap of 60"
+kills = [
+    "tests/test_m6_tools.py::test_get_metrics_plan_never_exceeds_60_points",
+]
+old = '''
+    step_s = max(c.METRIC_MIN_STEP_S, math.ceil(max(end - start, 0) / (c.MAX_METRIC_POINTS - 1)))'''
+new = '''
+    step_s = max(c.METRIC_MIN_STEP_S, math.ceil(max(end - start, 0) / 119))'''
+
+[[mutant]]
+id = "0023-8a"
+source = "0023 §15"
+target = "safeops/tools/kube.py"
+guard = "flip truncation metadata (tool)"
+kills = [
+    "tests/test_m6_tools.py::test_get_events_keeps_the_50_newest_in_a_stable_order",
+]
+old = '''
+        truncated=len(matched) > len(shown),'''
+new = '''
+        truncated=False,'''
+
+[[mutant]]
+id = "0023-8b"
+source = "0023 §15"
+target = "safeops/tools/contracts.py"
+guard = "truncation flag never validated"
+kills = [
+    "tests/test_m6_tools.py::test_dropping_events_while_claiming_none_were_dropped_is_detected",
+    "tests/test_m6_tools.py::test_derived_fields_must_agree_with_the_stored_result",
+]
+old = '''
+    if truncated != (total > listed):'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "0023-9"
+source = "0023 §15"
+target = "safeops/tools/canonical.py"
+guard = "digest over a non-canonical representation"
+kills = [
+    "tests/test_m6_tools.py::test_canonical_json_is_strict_and_order_independent",
+]
+old = '''
+value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False'''
+new = '''
+value, sort_keys=False, separators=(",", ":"), ensure_ascii=True, allow_nan=False'''
+
+[[mutant]]
+id = "0023-10"
+source = "0023 §15"
+target = "safeops/tools/contracts.py"
+guard = "digest/result agreement disabled"
+kills = [
+    "tests/test_m6_tools.py::test_a_wrong_digest_beside_an_unchanged_result_is_detected",
+]
+old = '''
+    if digest != expected:'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "0023-11"
+source = "0023 §15"
+target = "safeops/tools/metrics.py"
+guard = "NaN escapes"
+kills = [
+    "tests/test_m6_tools.py::test_get_metrics_normalizes_non_finite_samples_and_keeps_zero",
+]
+old = '''
+    return value if math.isfinite(value) else non_finite(value)'''
+new = '''
+    return value'''
+
+[[mutant]]
+id = "0023-12"
+source = "0023 §15"
+target = "safeops/tools/metrics.py"
+guard = "NaN normalized to zero"
+kills = [
+    "tests/test_m6_tools.py::test_get_metrics_normalizes_non_finite_samples_and_keeps_zero",
+]
+old = '''
+    return value if math.isfinite(value) else non_finite(value)'''
+new = '''
+    return value if math.isfinite(value) else 0.0'''
+
+[[mutant]]
+id = "0023-13"
+source = "0023 §15"
+target = "safeops/tools/kube.py"
+guard = "no deterministic order before bounding"
+kills = [
+    "tests/test_m6_tools.py::test_get_events_keeps_the_50_newest_in_a_stable_order",
+]
+old = '''
+        return sorted((e for e in events if e.last_seen >= since), key=c.event_order)'''
+new = '''
+        return [e for e in events if e.last_seen >= since]'''
+
+[[mutant]]
+id = "0023-14"
+source = "0023 §15"
+target = "safeops/tools/kube.py"
+guard = "returned count disagrees with output"
+kills = [
+    "tests/test_m6_tools.py::test_get_pods_caps_at_its_bound_honestly",
+]
+old = '''
+        pod_count=len(shown),'''
+new = '''
+        pod_count=len(pods),'''
+
+[[mutant]]
+id = "0023-15"
+source = "0023 §15"
+target = "safeops/tools/kube.py"
+guard = "harness metadata leaks into events"
+kills = [
+    "tests/test_m6_tools.py::test_get_events_window_floor_and_harness_filter",
+]
+old = '''
+        events = [c.Event(**_event(e, since)) for e in listed if not is_harness_event(e)]'''
+new = '''
+        events = [c.Event(**_event(e, since)) for e in listed]'''
+
+[[mutant]]
+id = "0023-16"
+source = "0023 §15"
+target = "safeops/tools/reader.py"
+guard = "forbidden import from safeops.tools"
+kills = [
+    "tests/test_information_wall.py::test_the_real_tools_reach_the_reader_client_and_nothing_forbidden",
+]
+old = '''
+from safeops.topology import ServiceTopology'''
+new = '''
+from safeops.topology import ServiceTopology
+from safeops.environment import clock  # noqa: F401'''
+
+[[mutant]]
+id = "0023-17"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "V1 accepts a V2 clock field"
+kills = [
+    "tests/test_m6_records.py::test_v1_refuses_every_v2_clock_field",
+]
+old = '''
+    discard_reason: DiscardReason | None
+    in_cohort_g: bool
+'''
+new = '''
+    discard_reason: DiscardReason | None
+    in_cohort_g: bool
+    clock_before_load: ClockReading | None = None
+'''
+
+[[mutant]]
+id = "0023-18"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "V2 bypasses a version-1 cross-field validator"
+kills = [
+    "tests/test_m6_records.py::test_version_1_rules_fire_on_version_2",
+]
+old = '''
+    p.extend(_evidence_problems(r))
+'''
+new = '''
+    if r.schema_version == 1:
+        p.extend(_evidence_problems(r))
+'''
+
+[[mutant]]
+id = "0023-19"
+source = "0023 §15"
+target = "safeops/experiment/records.py"
+guard = "new records still emitted as V1"
+kills = [
+    "tests/test_m6_records.py::test_runner_records_carry_exactly_the_readings_their_stage_produced",
+]
+old = '''
+            "schema_version": 2,'''
+new = '''
+            "schema_version": 1,'''
+
+[[mutant]]
+id = "0023-20"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "one clock reading's offset unvalidated"
+kills = [
+    "tests/test_m6_records.py::test_clock_derived_values_must_agree_with_the_readings",
+]
+old = '''
+        if reading.offset_s != clock.offset_us(*stamps) / 1_000_000:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "0023-21"
+source = "0023 §15"
+target = "safeops/environment/clock.py"
+guard = "clock change disagrees with the readings"
+kills = [
+    "tests/test_m6_records.py::test_the_change_and_its_interpretation_are_computed_by_hand",
+]
+old = '''
+    return offset_us(*after) - offset_us(*before)'''
+new = '''
+    return offset_us(*after) + offset_us(*before)'''
+
+[[mutant]]
+id = "0023-22"
+source = "0023 §15"
+target = "safeops/environment/clock.py"
+guard = "interpretation disagrees with the change"
+kills = [
+    "tests/test_m6_records.py::test_a_slow_request_widens_the_uncertainty",
+    "tests/test_m6_records.py::test_the_change_and_its_interpretation_are_computed_by_hand",
+]
+old = '''
+    if lo2 - hi1 >= 0 or hi2 - lo1 <= 0:'''
+new = '''
+    if lo2 - hi1 >= 1_000_000 or hi2 - lo1 <= -1_000_000:'''
+
+[[mutant]]
+id = "0023-23"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "a discard may carry its own stage's reading"
+kills = [
+    "tests/test_m6_records.py::test_a_reading_its_stage_could_not_have_produced_is_rejected",
+]
+old = '''
+    for later in order[i:]:'''
+new = '''
+    for later in order[i + 1 :]:'''
+
+[[mutant]]
+id = "0023-24"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "a later stage may omit an earlier reading"
+kills = [
+    "tests/test_m6_records.py::test_a_reading_already_produced_must_not_disappear",
+]
+old = '''
+    for earlier in order[:i]:'''
+new = '''
+    for earlier in order[:i]:
+        if earlier in CLOCK_STAGES:
+            continue'''
+
+[[mutant]]
+id = "0023-25"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "a first-only record may carry a change"
+kills = [
+    "tests/test_m6_records.py::test_a_one_reading_record_cannot_carry_a_two_reading_change",
+]
+old = '''
+    if change is not None and len(readings) != 2:'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "0023-26"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "reading 1 attributed to START_WORKLOAD"
+kills = [
+    "tests/test_m6_records.py::test_each_reading_is_produced_by_its_own_stage",
+]
+old = '''
+    _S.CLOCK_BEFORE_LOAD: ("clock_before_load",),'''
+new = '''
+    _S.CLOCK_BEFORE_LOAD: (),
+    _S.START_WORKLOAD: ("clock_before_load",),'''
+
+[[mutant]]
+id = "0023-27"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "reading 2 attributed to HARM"
+kills = [
+    "tests/test_m6_records.py::test_each_reading_is_produced_by_its_own_stage",
+    "tests/test_m6_records.py::test_a_second_probe_failure_is_attributed_to_its_own_stage",
+]
+old = '''
+    _S.CLOCK_AFTER_MEASUREMENTS: ("clock_after_measurements", "clock_change"),'''
+new = '''
+    _S.CLOCK_AFTER_MEASUREMENTS: (),
+    _S.HARM: ("clock_after_measurements", "clock_change"),'''
+
+[[mutant]]
+id = "0023-28"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "first probe stage not pre-agent"
+kills = [
+    "tests/test_m6_records.py::test_the_clock_stages_are_placed_and_partitioned_exactly",
+]
+old = '''
+    _S.PRE_RUN_CLEAN_STATE,
+    _S.CLOCK_BEFORE_LOAD,
+'''
+new = '''
+    _S.PRE_RUN_CLEAN_STATE,
+'''
+
+[[mutant]]
+id = "0023-29"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "second probe stage not post-agent"
+kills = [
+    "tests/test_m6_records.py::test_the_clock_stages_are_placed_and_partitioned_exactly",
+]
+old = '''
+    _S.HARM,
+    _S.CLOCK_AFTER_MEASUREMENTS,
+)'''
+new = '''
+    _S.HARM,
+)'''
+
+[[mutant]]
+id = "0023-30"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "stage_phase misclassifies a probe stage"
+kills = [
+    "tests/test_m6_records.py::test_the_clock_stages_are_placed_and_partitioned_exactly",
+    "tests/test_m6_records.py::test_a_first_probe_failure_is_attributed_to_its_own_stage",
+]
+old = '''
+    if stage in POST_AGENT_STAGES:'''
+new = '''
+    if stage in POST_AGENT_STAGES or stage == RunStage.CLOCK_BEFORE_LOAD:'''
+
+[[mutant]]
+id = "0023-31"
+source = "0023 §15"
+target = "safeops/experiment/schema.py"
+guard = "no explicit cause/stage rule for probes"
+kills = [
+    "tests/test_m6_records.py::test_cause_and_clock_stage_must_agree",
+]
+old = '''
+        and d.stage in CLOCK_STAGE_CAUSES
+'''
+new = '''
+        and False
+'''
+
+[[mutant]]
+id = "0023-32a"
+source = "0023 §15"
+target = "safeops/experiment/runner.py"
+guard = "stage set only after probe 1 succeeds"
+kills = [
+    "tests/test_m6_records.py::test_a_first_probe_failure_is_attributed_to_its_own_stage",
+]
+old = '''
+        stage = RunStage.CLOCK_BEFORE_LOAD
+        load_requested = False
+        try:
+            data["clock_before_load"] = env.read_clock()
+'''
+new = '''
+        stage = RunStage.PRE_RUN_CLEAN_STATE
+        load_requested = False
+        try:
+            data["clock_before_load"] = env.read_clock()
+            stage = RunStage.CLOCK_BEFORE_LOAD
+'''
+
+[[mutant]]
+id = "0023-R1"
+source = "0023 review amendment"
+target = "safeops/tools/metrics.py"
+guard = "error_rate without `or vector(0)`"
+kills = [
+    "tests/test_m6_tools.py::test_get_metrics_queries_are_fixed_templates",
+]
+old = '''
+ or vector(0))''''
+new = '''
+))''''
+
+[[mutant]]
+id = "0023-R2a"
+source = "0023 review amendment"
+target = "safeops/tools/kube.py"
+guard = "a restart's previous instance never read"
+kills = [
+    "tests/test_m6_tools.py::test_get_logs_reads_the_instance_before_a_restart_inside_the_window",
+]
+old = '''
+            current is not None and last is not None and (finished is None or finished >= since)'''
+new = '''
+            False'''
+
+[[mutant]]
+id = "0023-R2b"
+source = "0023 review amendment"
+target = "safeops/tools/kube.py"
+guard = "an unreadable older instance not admitted"
+kills = [
+    "tests/test_m6_tools.py::test_get_logs_admits_instances_it_can_no_longer_read",
+]
+old = '''
+            scan_limited = scan_limited or stream["older_unread"]'''
+new = '''
+            pass'''
+
+[[mutant]]
+id = "0023-R2c"
+source = "0023 review amendment"
+target = "safeops/tools/kube.py"
+guard = "older instances judged from one restart, not two"
+kills = [
+    "tests/test_m6_tools.py::test_get_logs_admits_instances_it_can_no_longer_read",
+]
+old = '''
+            older, boundary = restarts >= 2, _stamp(last.get("startedAt"))'''
+new = '''
+            older, boundary = restarts >= 99, _stamp(last.get("startedAt"))'''
+
+[[mutant]]
+id = "0023-R2d"
+source = "0023 review amendment"
+target = "safeops/tools/kube.py"
+guard = "a discarded previous instance fails the call (re-pointed)"
+kills = [
+    "tests/test_m6_tools.py::test_get_logs_admits_instances_it_can_no_longer_read",
+]
+old = '''
+                        and _NO_PREVIOUS.search(exc.message)
+'''
+new = '''
+                        and False
+'''
+
+[[mutant]]
+id = "0023-CA"
+source = "0023 closure amendment"
+target = "safeops/tools/kube.py"
+guard = "framing on splitlines() again"
+kills = [
+    "tests/test_m6_tools.py::test_only_a_literal_newline_ends_a_log_record",
+]
+old = '''
+    parts = out.split("\n")
+'''
+new = '''
+    parts = out.splitlines() + ['']
+'''
+
+[[mutant]]
+id = "0023-CB"
+source = "0023 closure amendment"
+target = "safeops/tools/kube.py"
+guard = "the synthetic trailing element counted as a record"
+kills = [
+    "tests/test_m6_tools.py::test_the_scan_cap_boundary_holds_across_the_real_subprocess",
+]
+old = '''
+    if parts and parts[-1] == "":
+        parts.pop()
+'''
+new = '''
+    pass
+'''
+
+[[mutant]]
+id = "0023-CC"
+source = "0023 closure amendment"
+target = "safeops/tools/kube.py"
+guard = "a trailing CR stripped"
+kills = [
+    "tests/test_m6_tools.py::test_a_carriage_return_before_the_newline_is_kept_as_text",
+]
+old = '''
+    parts = out.split("\n")
+'''
+new = '''
+    parts = out.replace("\r\n", "\n").split("\n")
+'''
+
+[[mutant]]
+id = "0023-CE"
+source = "0023 closure amendment"
+target = "safeops/tools/kube.py"
+guard = "any --previous command failure treated as history unavailable"
+kills = [
+    "tests/test_m6_tools.py::test_only_the_observed_no_previous_answer_is_history_unavailable",
+    "tests/test_m6_tools.py::test_no_previous_with_trailing_context_is_still_a_failure",
+]
+old = '''
+                        and _NO_PREVIOUS.search(exc.message)
+'''
+new = ""
+
+[[mutant]]
+id = "0023-R3"
+source = "0023 review amendment"
+target = "safeops/experiment/runner.py"
+guard = "load stopped though this run never asked for it"
+kills = [
+    "tests/test_m6_records.py::test_a_failure_before_the_load_was_requested_stops_nothing",
+]
+old = '''
+            if load_requested and not isinstance(exc, WorkloadGeneratorBusy):'''
+new = '''
+            if not isinstance(exc, WorkloadGeneratorBusy):'''
+
+[[mutant]]
+id = "0023-R4a"
+source = "0023 review amendment"
+target = "safeops/tools/kube.py"
+guard = "events never flagged as beginning before since"
+kills = [
+    "tests/test_m6_tools.py::test_events_that_began_before_the_window_are_flagged",
+]
+old = '''
+        "began_before_since": first_seen is not None and first_seen < since,'''
+new = '''
+        "began_before_since": False,'''
+
+[[mutant]]
+id = "0023-R4b"
+source = "0023 review amendment"
+target = "safeops/tools/contracts.py"
+guard = "the flag not checked against first_seen"
+kills = [
+    "tests/test_m6_tools.py::test_events_that_began_before_the_window_are_flagged",
+]
+old = '''
+            if e.began_before_since != (e.first_seen is not None and e.first_seen < self.since):'''
+new = '''
+            if False:'''
+
+[[mutant]]
+id = "0023-SA"
+source = "0023 second closure amendment"
+target = "safeops/cluster.py"
+guard = "logs read back in subprocess text mode"
+kills = [
+    "tests/test_m6_tools.py::test_a_bare_carriage_return_crosses_the_boundary_as_data",
+    "tests/test_m6_tools.py::test_every_separator_survives_the_real_subprocess_boundary",
+]
+old = '''
+            text=not raw,
+'''
+new = '''
+            text=True,
+'''
+
+[[mutant]]
+id = "0023-SB"
+source = "0023 second closure amendment"
+target = "safeops/cluster.py"
+guard = "undecodable bytes kept as surrogates"
+kills = [
+    "tests/test_m6_tools.py::test_invalid_utf8_is_replaced_deterministically_never_raised",
+    "tests/test_m6_tools.py::test_decode_raw_policy",
+]
+old = '''
+    return bytes(data).decode("utf-8", errors="replace")'''
+new = '''
+    return bytes(data).decode("utf-8", errors="surrogateescape")'''
+
+[[mutant]]
+id = "0023-SC"
+source = "0023 second closure amendment"
+target = "safeops/tools/kube.py"
+guard = "_NO_PREVIOUS loses its end anchor"
+kills = [
+    "tests/test_m6_tools.py::test_no_previous_with_trailing_context_is_still_a_failure",
+]
+old = '''
+    r'"[^"]*" in pod "[^"]*" not found\Z''''
+new = '''
+    r'"[^"]*" in pod "[^"]*" not found''''
+
+[[mutant]]
+id = "0023-SD"
+source = "0023 second closure amendment"
+target = "safeops/cluster.py"
+guard = "the raw read skips the read-only guard"
+kills = [
+    "tests/test_m6_tools.py::test_the_raw_read_is_behind_the_same_guard",
+]
+old = '''
+        self._check_read(args)
+        return self._exec(list(args), timeout=timeout, raw=True)'''
+new = '''
+        return self._exec(list(args), timeout=timeout, raw=True)'''
+
+[[mutant]]
+id = "0023-32b"
+source = "0023 §15"
+target = "safeops/experiment/runner.py"
+guard = "stage set only after probe 2 succeeds"
+kills = [
+    "tests/test_m6_records.py::test_a_second_probe_failure_is_attributed_to_its_own_stage",
+]
+old = '''
+            stage = RunStage.CLOCK_AFTER_MEASUREMENTS
+            data["clock_after_measurements"] = env.read_clock()
+'''
+new = '''
+            data["clock_after_measurements"] = env.read_clock()
+            stage = RunStage.CLOCK_AFTER_MEASUREMENTS
+'''
+
+[[mutant]]
+id = "0022-R1"
+source = "0022 §1 reset lifecycle"
+target = "safeops/environment/manager.py"
+guard = "remove mutation wrapper"
+kills = [
+    "tests/test_reset_boundary.py::test_any_ordinary_failure_after_the_first_mutation_is_a_reset_mutation_error",
+    "tests/test_reset_boundary.py::test_the_first_mutation_failing_is_already_past_the_boundary",
+]
+old = '''
+            raise ResetMutationError(progress.step, exc) from exc'''
+new = '''
+            raise'''
+
+[[mutant]]
+id = "0022-R2"
+source = "0022 §1 reset lifecycle"
+target = "safeops/experiment/runner.py"
+guard = "bypass _finalize_then_recover (own handler)"
+kills = [
+    "tests/test_reset_boundary.py::test_no_second_record_or_recovery_handler_exists",
+    "tests/test_reset_boundary.py::test_every_pre_run_failure_takes_the_one_canonical_path",
+]
+old = '''
+        except ResetMutationError as exc:  # its message is already bounded
+            return CleanStateResult(False, (f"pre-run reset failed: {exc}",))'''
+new = '''
+        except ResetMutationError as exc:  # its message is already bounded
+            self.environment.quarantine_and_rebuild(reason=str(exc))
+            raise PreRunDiscard(str(exc)) from exc'''
+
+[[mutant]]
+id = "0022-R3"
+source = "0022 §1 reset lifecycle"
+target = "safeops/experiment/runner.py"
+guard = "no quarantine after pre-run discard"
+kills = [
+    "tests/test_m3_review.py::test_pre_run_reset_failure_quarantines_and_discards",
+    "tests/test_reset_boundary.py::test_every_pre_run_failure_takes_the_one_canonical_path",
+]
+old = '''
+                recover=lambda: self._quarantine('''
+new = '''
+                recover=lambda: None and self._quarantine('''
+
+[[mutant]]
+id = "0022-R4a"
+source = "0022 §1 reset lifecycle"
+target = "safeops/experiment/runner.py"
+guard = "classify as infrastructure_failure"
+kills = [
+    "tests/test_m5_records.py::test_a_pre_run_reset_failure_is_a_dirty_discard_record",
+]
+old = '''
+Discard(RunStage.PRE_RUN_CLEAN_STATE, "pre_run_dirty", str(exc))'''
+new = '''
+Discard(RunStage.PRE_RUN_CLEAN_STATE, "infrastructure_failure", str(exc))'''
+
+[[mutant]]
+id = "0022-R4b"
+source = "0022 §1 reset lifecycle"
+target = "safeops/experiment/runner.py"
+guard = "ResetMutationError propagates raw"
+kills = [
+    "tests/test_reset_boundary.py::test_every_pre_run_failure_takes_the_one_canonical_path",
+    "tests/test_reset_boundary.py::test_a_partial_reset_end_to_end_is_recorded_then_quarantined",
+]
+old = '''
+        except ResetMutationError as exc:  # its message is already bounded
+            return CleanStateResult(False, (f"pre-run reset failed: {exc}",))'''
+new = ""
+
+[[mutant]]
+id = "0022-R5"
+source = "0022 §1 reset lifecycle"
+target = "safeops/experiment/runner.py"
+guard = "verify failure propagates without record"
+kills = [
+    "tests/test_reset_boundary.py::test_every_pre_run_failure_takes_the_one_canonical_path",
+]
+old = '''
+        except Exception as exc:  # reset has mutated'''
+new = '''
+        except CommandError as exc:  # reset has mutated'''
+
+[[mutant]]
+id = "0022-O1"
+source = "0022 §2 ownership"
+target = "safeops/kind_identity.py"
+guard = "no container-ID comparison"
+kills = [
+    "tests/test_cluster_ownership.py::test_correct_labels_but_another_container_id_is_refused",
+]
+old = '''
+    if persisted != current:'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "0022-O2"
+source = "0022 §2 ownership"
+target = "safeops/kind_identity.py"
+guard = "unprovable identity falls back to labels"
+kills = [
+    "tests/test_cluster_ownership.py::test_a_missing_record_is_refused_with_the_legacy_migration_guidance",
+    "tests/test_cluster_ownership.py::test_a_malformed_stale_or_incomplete_record_is_refused",
+]
+old = '''
+    except OwnershipError as exc:
+        raise OwnershipError('''
+new = '''
+    except OwnershipError as exc:
+        return container
+        raise OwnershipError('''
+
+[[mutant]]
+id = "0022-O3a"
+source = "0022 §2 ownership"
+target = "safeops/bootstrap.py"
+guard = "cluster-up adopts an existing cluster"
+kills = [
+    "tests/test_cluster_ownership.py::test_cluster_up_never_adopts_an_existing_same_name_cluster",
+]
+old = '''
+    if cfg.cluster_name in _tool(["kind", "get", "clusters"]).split():
+        raise CommandError('''
+new = '''
+    if cfg.cluster_name in _tool(["kind", "get", "clusters"]).split():
+        from safeops.kind_identity import record_identity
+
+        record_identity(cfg.state_dir, cfg.cluster_name)
+        raise CommandError('''
+
+[[mutant]]
+id = "0022-O3b"
+source = "0022 §2 ownership"
+target = "safeops/kind_identity.py"
+guard = "teardown adopts a same-name cluster"
+kills = [
+    "tests/test_cluster_ownership.py::test_a_missing_record_is_refused_with_the_legacy_migration_guidance",
+]
+old = '''
+    try:
+        persisted = _read_identity(path, cluster_name)'''
+new = '''
+    if not path.exists():
+        _durable_write(path, json.dumps({"schema_version": 1, "cluster_name": cluster_name, "control_plane_container": container, "container_id": current}))
+    try:
+        persisted = _read_identity(path, cluster_name)'''
+
+[[mutant]]
+id = "0022-O4"
+source = "0022 §2 ownership"
+target = "safeops/environment/manager.py"
+guard = "rebuild passes the override"
+kills = [
+    "tests/test_cluster_ownership.py::test_default_rebuild_never_passes_the_override_and_surfaces_the_refusal",
+]
+old = '''
+[sys.executable, "-m", "safeops.bootstrap", command],'''
+new = '''
+[sys.executable, "-m", "safeops.bootstrap", command, "--force-unverified-ownership"],'''
+
+[[mutant]]
+id = "0022-O5"
+source = "0022 §2 ownership"
+target = "safeops/bootstrap.py"
+guard = "environment-variable bypass"
+kills = [
+    "tests/test_cluster_ownership.py::test_the_environment_cannot_enable_the_override",
+]
+old = '''
+    force = argv == ["down", FORCE_FLAG]'''
+new = '''
+    force = argv == ["down", FORCE_FLAG] or bool(__import__("os").environ.get("SAFEOPS_FORCE_UNVERIFIED_OWNERSHIP"))'''
+
+[[mutant]]
+id = "0022-O6"
+source = "0022 §2 ownership"
+target = "safeops/bootstrap.py"
+guard = "identity removed before delete"
+kills = [
+    "tests/test_cluster_ownership.py::test_the_record_is_removed_only_after_the_post_delete_check",
+    "tests/test_cluster_ownership.py::test_a_failed_delete_keeps_the_ownership_record",
+]
+old = '''
+        tool(args)  # raises on failure: the ownership record is kept'''
+new = '''
+        record.unlink(missing_ok=True)
+        tool(args)  # raises on failure: the ownership record is kept'''
+
+[[mutant]]
+id = "0022-O7"
+source = "0022 §2 ownership"
+target = "safeops/bootstrap.py"
+guard = "cluster-up never pins"
+kills = [
+    "tests/test_cluster_ownership.py::test_cluster_up_pins_identity_right_after_kind_create",
+]
+old = '''
+        record_identity(cfg.state_dir, cfg.cluster_name)
+    except (KindIdentityError, OSError) as exc:'''
+new = '''
+        pass
+    except (KindIdentityError, OSError) as exc:'''
+
+[[mutant]]
+id = "0022-O8"
+source = "0022 §2 ownership"
+target = "safeops/bootstrap.py"
+guard = "no post-delete confirmation"
+kills = [
+    "tests/test_cluster_ownership.py::test_a_delete_that_leaves_the_cluster_listed_keeps_the_record",
+]
+old = '''
+        if cfg.cluster_name in tool(["kind", "get", "clusters"]).split():
+            raise CommandError(
+                f"kind delete reported success'''
+new = '''
+        if False:
+            raise CommandError(
+                f"kind delete reported success'''
+
+[[mutant]]
+id = "0022-O9"
+source = "0022 §2 ownership"
+target = "safeops/kind_identity.py"
+guard = "override always on"
+kills = [
+    "tests/test_cluster_ownership.py::test_normal_argv_never_enables_the_override",
+    "tests/test_cluster_ownership.py::test_correct_labels_but_another_container_id_is_refused",
+]
+old = '''
+    if force_unverified_ownership:
+        return container'''
+new = '''
+    if True:
+        return container'''
+
+[[mutant]]
+id = "0022-O10"
+source = "0022 §2 ownership"
+target = "safeops/kind_identity.py"
+guard = "override skips the labels"
+kills = [
+    "tests/test_cluster_ownership.py::test_without_standard_kind_identity_teardown_refuses",
+    "tests/test_cluster_ownership.py::test_the_override_skips_only_the_id_match",
+]
+old = '''
+    try:
+        container, current = _inspect(cluster_name, runner)
+    except KindIdentityError as exc:
+        raise KindIdentityError(f"{exc} (ownership record: {path})") from exc
+    if force_unverified_ownership:'''
+new = '''
+    container, current = "safeops-control-plane", "a" * 64
+    if force_unverified_ownership:'''
