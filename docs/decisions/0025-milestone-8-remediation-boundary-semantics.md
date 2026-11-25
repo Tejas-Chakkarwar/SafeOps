@@ -811,7 +811,7 @@ Steps describe what execution actually attempted. No step is manufactured to mak
 ### 11.6 Ambiguous writes: bounded reconciliation
 
 - **The normal path:** a bounded write as `safeops-executor`, a definite response, a classification from that response.
-  - There is no pre-write read except rollback's history read, which its envelope requires.
+  - The only pre-write reads are the two the envelope requires: rollback's history read, and the resources existing-container check (D§11.2, D§11.7).
   - Pre-write metadata such as `resourceVersion` or `generation` is not a global requirement. M8B may capture it only where one action's truthful reconciliation needs it, and must record that here.
 - **Reconciliation:**
   - read through `safeops-reader` (`kubectl get <kind> <name> -n <testbed> -o json`);
@@ -1022,7 +1022,7 @@ The producer emits the shapes in D§11.5, and the schema keeps accepting what it
 
 No question is left open for Milestone 8. Items this decision deliberately hands to later milestones carry their obligations where they are stated:
 - Milestone 9 may relax the parser's strict output form (D§3.3);
-- Milestones 10/12 carry the blast-radius strata, the `postgres-svc` analysis and the redundancy question (D§5.3, D§5.5);
+- Milestones 10/12 carry the blast-radius strata, the `postgres-svc` analysis and the redundancy question (D§5.3, D§5.5), plus the evidence-requirement satisfiability report and the `revision_healthy` / `failure_correlated_with_current_revision` limitations (D§7.3);
 - Milestone 12 owns the final weights, evidence requirements and conflict rules, and any minimal engine extension (D§7, D§7.2);
 - M8B must prove patch-only live, or amend this decision before widening RBAC (D§14).
 
