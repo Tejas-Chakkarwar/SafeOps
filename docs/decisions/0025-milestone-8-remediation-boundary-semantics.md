@@ -753,8 +753,29 @@ The first failing check's bounded reason becomes `execution.error`, and nothing 
 | **definite success** | `kubectl` exits 0, the returned object parses, and it satisfies the requested postcondition (D§11.6) | the requested state was confirmed. No extra read. |
 | **definite semantic rejection** | API status 422 (`Invalid`) | Kubernetes refused the content. Nothing was written. |
 | **definite non-success** | any other API error status the server returned for the request (400, 401, 403, 404, 409, 429, …) | not applied, and not the agent's semantics. A 400 means the executor composed a bad body: a harness bug. |
-| **not attempted** | SafeOps refused before invoking `kubectl` (an expired or missing credential detected locally, a guard refusal, a failed audit "before" entry) | no request was sent |
+| **not attempted** | before invoking `kubectl`, the environment couldn't serve a request the executor was entitled to make: a missing or expired credential detected locally, or a failed audit "before" entry (D§11.8) | no request was sent. A classified outcome (the dividing test below). |
 | **ambiguous** | anything else after the request may have been sent: subprocess timeout, connection error, 5xx or server timeout, unparseable output, or exit 0 with a returned object that lacks the postcondition | the write may or may not have landed. Reconcile (D§11.6). |
+
+**Refusals before a request is sent: the dividing test.**
+- **Did the executor ask for something it must never ask for?** That is a harness bug. The executor **raises**, giving `execution: null`, `action_attempted: true`, and a discard at stage `execute` (decision 0018, review item 1).
+- **Could the environment not serve a request the executor was entitled to make?** That is a classified outcome, an `ExecutionResult`. With nothing applied it is `INFRASTRUCTURE_FAILURE`, discarded at stage `executed_action`. After composite step 1 it is `skipped` → `PARTIALLY_APPLIED`.
+
+| Cause, detected before any request is sent | Classification | Stage |
+|---|---|---|
+| the executor's own client phase refuses a verb D§14 forbids: a read beyond identity verification, create, apply, replace, delete, a raw call, a subresource | harness bug: raise | `execute` |
+| the context guard refuses because the resolved context or namespace is outside the phase's scope | harness bug: raise | `execute` |
+| a missing or expired credential detected locally | classified: `INFRASTRUCTURE_FAILURE` (or `skipped` at composite step 2) | `executed_action` |
+| a failed audit "before" entry (D§11.8) | classified: `INFRASTRUCTURE_FAILURE` (or `skipped` at composite step 2) | `executed_action` |
+
+**Why a context-guard refusal is a harness bug, not an environmental outcome.**
+- The executor never chooses its context or namespace. The context comes only from `config/cluster.yaml` (CLAUDE.md's context guard; decision 0006). Every target has already passed E2, the testbed namespace, before any request is built.
+- So a context-guard refusal means the configuration, the credential, or the request the executor composed disagrees with the scope it is required to stay in.
+- Decision 0006 and CLAUDE.md treat that as a stop-and-report condition ("If the context or the target is outside the phase's scope, stop and tell me"), never as a routine result to classify and carry on with.
+- Raising makes it a loud post-agent discard (exit 8) that names the failure. Classifying it quietly would make a safety-boundary violation look like an ordinary infrastructure outage.
+
+**No raise after a known write.**
+- Every request the action will send is built and checked against the client phase and the context guard before the first write. For the composite, that includes step 2's restart.
+- So both raise-class refusals can only occur before anything is written. A raise can't erase a known applied step 1, the same invariant as the owner's-unique-Deployment check in D§11.2.
 
 ### 11.4 Execution-step meanings (frozen for M8B)
 
@@ -840,13 +861,16 @@ Steps describe what execution actually attempted. No step is manufactured to mak
   | ambiguous + confirmed | `applied` → `APPLIED`, audit only | `applied`, continue | `applied` → `APPLIED` |
   | ambiguous + absent | `failed` → `INFRASTRUCTURE_FAILURE` | `failed` → `INFRASTRUCTURE_FAILURE` | `failed` → `PARTIALLY_APPLIED` |
   | ambiguous + unavailable | `failed` → `INFRASTRUCTURE_FAILURE`, audit "unresolved" | `failed` → `INFRASTRUCTURE_FAILURE`, audit "unresolved" | `failed` → `PARTIALLY_APPLIED`, audit "unresolved" |
-  | not attempted | `[]` → `INFRASTRUCTURE_FAILURE` | `[]` → `INFRASTRUCTURE_FAILURE` | `skipped` → `PARTIALLY_APPLIED` |
+  | not attempted (classified causes only, D§11.3) | `[]` → `INFRASTRUCTURE_FAILURE` | `[]` → `INFRASTRUCTURE_FAILURE` | `skipped` → `PARTIALLY_APPLIED` |
 
 - **An ambiguous response never becomes proof of no mutation.**
   - `INFRASTRUCTURE_FAILURE` asserts only that success couldn't be confirmed.
   - Such a run is discarded at `executed_action` and excluded from outcome metrics.
   - Any hidden residue is removed by the ordinary post-run `safeops reset` and checked by `safeops verify`. The post-run cleanup always runs after the agent started (decision 0017 §1 R2).
-- **The executor never raises for an API or transport outcome.** It classifies every one into an `ExecutionResult`. It raises only for harness bugs and interrupts, and both keep their existing meaning: `execution: null`, `action_attempted: true`, and a discard at `execute` (decision 0018, review item 1).
+- **The executor never raises for an API or transport outcome, or for a classified not-attempted cause.** It classifies every one into an `ExecutionResult`.
+  - It raises only for harness bugs and interrupts. Harness bugs include a refusal by its own client phase of a verb D§14 forbids, and a context-guard refusal (D§11.3).
+  - Both keep their existing meaning: `execution: null`, `action_attempted: true`, and a discard at `execute` (decision 0018, review item 1).
+  - By D§11.3, neither can happen after a known write.
 
 ### 11.7 The `safeops-reader` route
 
@@ -973,6 +997,26 @@ Steps describe what execution actually attempted. No step is manufactured to mak
 - an executor `infrastructure_failure` is discarded at stage `executed_action`.
 
 All three restate the producer's exact semantics (D§11.5, D§13). None invalidates a currently accepted non-mutating rejection or failure prefix.
+
+**Accepted `infrastructure_failure` shapes, pinned in the same change.**
+- M8B is the first producer of execution status `infrastructure_failure`. Under the CLAUDE.md evidence-consistency invariant, it owns the accepted shapes, the negative rule and their mutants **in one change**.
+- So beside the negative rule, M8B adds positive record tests that accept exactly D§11.5's shapes:
+
+  | Steps | When |
+  |---|---|
+  | `[]` | no write attempted, including a failed pre-write read (rollback history, the resources container check) |
+  | `[<step>: failed]` | a single-step write attempted without confirmation |
+  | `[patch_configmap: failed]` | a composite whose first write was not confirmed |
+
+- **Today only `[]` has an accepted counterpart:** `tests/test_m5_fixlist.py::test_executor_infrastructure_failure_must_be_a_discard`, discarded at `executed_action`. No `GOOD_EXECUTIONS` row in `tests/test_m5_crossfield.py` has execution status `infrastructure_failure`.
+  - So an over-restrictive rule (for example "`infrastructure_failure` requires `steps == []`") would pass `make test` unnoticed.
+  - The two failed-step shapes must therefore be pinned as accepted, alongside rejected shapes that carry an applied step.
+- **`rejected_invalid_action` needs no equivalent addition.** Three `GOOD_EXECUTIONS` rows already pin its accepted shapes:
+  - `[rollback_deployment: failed]` ("rejected by Kubernetes");
+  - `[]` ("rejected with no step (permissive)");
+  - `[patch_configmap: failed]` ("composite rejected at its first write").
+
+  Its new negative rule is already bounded by accepted cases. The asymmetry is deliberate.
 
 **Rules deliberately not added:**
 - any rule requiring a later composite step on a rejection (a `skipped` restart);
