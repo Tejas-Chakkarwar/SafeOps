@@ -1,0 +1,19 @@
+# SafeOps risk-score weights (design §11.5; decision 0025 D§6, D§7, D§7.1).
+#
+# pre-v1: provisional. Equal weights are the least informative explicit choice; Milestone 12
+# sets v1 (gate_feature_version: 1). Every value is a quoted decimal string, parsed exactly;
+# they must be non-negative and sum exactly to 1. The record carries gate_feature_version,
+# not a hash of this file: tests/test_m8_policy.py pins each version to its exact weights,
+# so changing a weight without bumping the version fails `make test`.
+
+status: pre-v1
+gate_feature_version: 0
+weights:
+  irreversibility: "0.125"
+  blast_radius: "0.125"
+  persistence_risk: "0.125"
+  scope_outside_target: "0.125"
+  confidence_deficit: "0.125"
+  evidence_insufficiency: "0.125"
+  prerequisites_unverified: "0.125"
+  telemetry_conflict: "0.125"

@@ -20,7 +20,7 @@ from safeops.experiment.runner import ExperimentRunner
 from safeops.faults.alerts import AlertGenerator
 from safeops.faults.injector import FaultInjector
 from safeops.features.extractor import RiskFeatureExtractor
-from safeops.gate.always_act import AlwaysActGate
+from safeops.gate.protocol import Gate
 from safeops.gate.shadow import ShadowGateScorer
 from safeops.stubs import stub_milestone
 from safeops.verify.effectiveness import EffectivenessVerifier
@@ -68,7 +68,7 @@ RUN_SEQUENCE: tuple[Stage, ...] = (
     Stage("route on proposal_status", ExperimentRunner, "_gate_eligible_action"),
     Stage("extract frozen feature vector", RiskFeatureExtractor, "extract", VALID_ONLY),
     Stage("score shadow gates", ShadowGateScorer, "score", VALID_ONLY),
-    Stage("gate decides", AlwaysActGate, "decide", VALID_ONLY),
+    Stage("gate decides", Gate, "decide", VALID_ONLY),  # the injected live gate (0025 D§6)
     Stage("route on gate decision", ExperimentRunner, "_should_execute", VALID_ONLY),
     Stage("execute action", ActionExecutor, "apply", EXECUTE_ONLY),
     Stage("determine executed action", ExperimentRunner, "_executed_action", EXECUTE_ONLY),

@@ -34,6 +34,7 @@ from safeops.environment.workload import (
     check_steady_state,
 )
 from safeops.executor.executor import ActionExecutor
+from safeops.experiment.consistency import ReadPathCheck
 from safeops.experiment.records import RECORD_FIELDS, Discard, RunRecordWriter
 from safeops.experiment.unit import RunUnit
 from safeops.faults.alerts import AlertGenerator
@@ -44,7 +45,9 @@ from safeops.faults.injector import (
     FaultVerificationFailed,
 )
 from safeops.features.extractor import RiskFeatureExtractor
+from safeops.features.policy import load_policy
 from safeops.gate.always_act import AlwaysActGate
+from safeops.gate.protocol import Gate, GateDecision
 from safeops.gate.shadow import ShadowGateScorer
 from safeops.stubs import NotImplementedStage, stub
 from safeops.verify.effectiveness import EffectivenessVerifier
@@ -97,7 +100,7 @@ class ExperimentRunner:
         parser: ProposalParser,
         extractor: RiskFeatureExtractor,
         shadow_gates: ShadowGateScorer,
-        gate: AlwaysActGate,
+        gate: Gate,
         executor: ActionExecutor,
         effectiveness: EffectivenessVerifier,
         harm: HarmChecker,
@@ -220,7 +223,7 @@ class ExperimentRunner:
             stage = RunStage.ALERT
             alert = data["alert"] = self.alerts.build_alert(verification)
             stage = RunStage.RUNTIME_CONTEXT
-            context = self._runtime_context(alert)
+            context = data["_runtime_context"] = self._runtime_context(alert)
             stage = RunStage.AGENT
             raw_output, trajectory = self.agent.investigate(context)
             data["trajectory"] = trajectory  # from here on, R2: a record however it ends
@@ -242,7 +245,11 @@ class ExperimentRunner:
             action = self._gate_eligible_action(proposal)
             if action is not None:
                 stage = RunStage.EXTRACT
-                features = data["features"] = self.extractor.extract(proposal, trajectory, context)
+                # The extractor takes the neutral domain Proposal (decision 0025 D§5). The real
+                # _gate_eligible_action admits only a ParsedProposal, so production always
+                # unwraps; a recording double's fixed proposal is passed through unchanged.
+                domain = proposal.proposal if isinstance(proposal, ParsedProposal) else proposal
+                features = data["features"] = self.extractor.extract(domain, trajectory, context)
                 stage = RunStage.SHADOW_GATES
                 data["shadow_scores"] = self.shadow_gates.score(features, run_id=run_id)
                 stage = RunStage.GATE
@@ -387,7 +394,11 @@ class ExperimentRunner:
         # Elapsed real time from the monotonic clock: immune to wall-clock steps, and the
         # raw samples stay here (closeout item 1b).
         fields["wall_seconds"] = self._monotonic() - data["_monotonic_start"]
-        return self.records.finalize(**fields, discard=discard)
+        # Harness-internal, never a record field: the context extraction used, so the writer
+        # can recompute the derived read-path values against it (decision 0025 D§16).
+        return self.records.finalize(
+            **fields, discard=discard, runtime_context=data.get("_runtime_context")
+        )
 
     @staticmethod
     def _note_record(exc: BaseException, path) -> None:
@@ -507,9 +518,14 @@ class ExperimentRunner:
             return action
         return None
 
-    @stub(milestone=8)
     def _should_execute(self, decision) -> bool:
-        """True if the live gate's decision is execute."""
+        """True exactly when the live gate's decision is execute (decision 0025 D§4).
+
+        Only the GateDecision routes: never a shadow scalar, a string or a dict, which are
+        harness bugs here."""
+        if not isinstance(decision, GateDecision):
+            raise TypeError(f"route_gate takes a GateDecision, not {type(decision)}")
+        return decision.decision == "execute"
 
     @stub(milestone=8)
     def _executed_action(self, action, execution):
@@ -563,6 +579,11 @@ def build_runner() -> ExperimentRunner:
     # One generator, shared: the injector and the effectiveness verifier both measure on the
     # load this run started (decisions 0015, 0024).
     workload = WorkloadGenerator()
+    # One policy condition, loaded once: the extractor, the shadow scorer and the record
+    # writer (provenance and write-time checks) share these exact objects (decision 0025 D§7.1).
+    policy = load_policy()
+    extractor = RiskFeatureExtractor(policy)
+    shadow_gates = ShadowGateScorer(policy)
     return ExperimentRunner(
         environment=EnvironmentManager(),
         workload=workload,
@@ -570,11 +591,13 @@ def build_runner() -> ExperimentRunner:
         alerts=AlertGenerator(),
         agent=Agent(),
         parser=ProposalParser(),
-        extractor=RiskFeatureExtractor(),
-        shadow_gates=ShadowGateScorer(),
+        extractor=extractor,
+        shadow_gates=shadow_gates,
         gate=AlwaysActGate(),
         executor=ActionExecutor(),
         effectiveness=EffectivenessVerifier(workload=workload),
         harm=HarmChecker(),
-        records=RunRecordWriter(faults_dir=FAULTS_DIR),  # one spec source for both
+        records=RunRecordWriter(  # one spec source for both
+            faults_dir=FAULTS_DIR, read_path=ReadPathCheck(extractor, shadow_gates)
+        ),
     )

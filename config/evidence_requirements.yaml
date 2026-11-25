@@ -1,0 +1,28 @@
+# Evidence requirements and the prerequisite vocabulary (design §11.5; decision 0025 D§7.3).
+#
+# pre-v1: provisional; Milestone 12 owns the v1 sets. Corroboration, not coverage: each id
+# names a deterministic semantic predicate defined in code (safeops/features/evidence.py)
+# over the structured tool results in the trajectory. A tool call alone earns nothing.
+# Ids only: no expressions, field paths or instructions belong in this file.
+#
+# failure_correlated_with_current_revision has no faithful predicate over the current tool
+# contract and is never satisfied in pre-v1 (D§7.3): every rollback scores at least 1/3.
+
+status: pre-v1
+requirements:
+  rollback_deployment:
+    - rollout_history_retrieved
+    - prior_revision_health_observed
+    - failure_correlated_with_current_revision
+  restart_deployment:
+    - target_deployment_state_observed
+  scale_deployment:
+    - current_replicas_observed
+  patch_configmap:
+    - target_keys_observed
+  patch_service:
+    - target_service_state_observed
+  patch_deployment_resources:
+    - target_container_resources_observed
+prerequisites:
+  - prior_revision_healthy

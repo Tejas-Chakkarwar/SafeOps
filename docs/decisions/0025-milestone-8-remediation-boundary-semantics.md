@@ -1153,3 +1153,167 @@ This records the implementation choices D§3 and D§4 delegated to M8A. Nothing 
   - `tests/test_m5_records.py::test_review_a_crash_at_every_post_agent_stage_writes_a_valid_record[harm]` finds the discard stage `parse` instead of `harm`;
   - `tests/test_m5_fixlist.py::test_each_parser_status_then_a_later_failure_writes_a_valid_record[no_action]` finds `proposal_status` null instead of `no_action`, because the fixed parser never ran.
 - **Result:** killed, 0 survived, 0 harness errors. The M8A-1 family is now 16 mutants, and the table holds 124.
+
+## Amendment, 2026-11-25: Milestone 8A-2 implementation (features, gate, shadow scoring, provenance, record consistency)
+
+This records the choices D§5–D§7.3, D§15 and D§16 delegated to M8A. Nothing above is changed, and the M8A-1 amendment's semantics are untouched. M8B (the executor, its identity, RBAC, envelope, writes, reconciliation, audit trail, `ExecutionStatus` producers and `_executed_action`) is not part of it.
+
+**Where things live:**
+
+| Item | Module |
+|---|---|
+| Strict single-read loading (`read_policy_file`, `PolicyError`), exact decimals, and the action-semantics table (`ActionSemantics`, `load_action_semantics`) | `safeops/policy.py`: neutral, protected; M8B's executor reuses it |
+| Gate weights, evidence requirements, conflict rules, the `PolicyBundle` and `load_policy` | `safeops/features/policy.py` |
+| Guarded stored-evidence reads, the latest-observation helper, the requirement and prerequisite predicate registries | `safeops/features/evidence.py` |
+| The blast-radius formula and evidence classifier | `safeops/features/blast.py` |
+| The conflict-rule field table and evaluator | `safeops/features/conflict.py` |
+| `RiskFeatureExtractor` | `safeops/features/extractor.py` |
+| `Gate` (protocol) and `GateDecision` | `safeops/gate/protocol.py` |
+| `AlwaysActGate`, `ShadowGateScorer` (and the pure `risk_score`, `confidence`, `random_draw`) | `safeops/gate/always_act.py`, `safeops/gate/shadow.py` |
+| The write-time read-path check (`ReadPathCheck`) | `safeops/experiment/consistency.py` |
+
+The feature-side loaders sit in `safeops/features/` because D§7 item 5 says Milestone 12's feature-side changes land in `safeops/features/` and `config/` only. Their vocabularies are the predicate registries and field tables of that package, so extending them never touches `safeops/policy.py`.
+
+**Loading: each file read once, its exact bytes hashed.**
+- `read_policy_file(path)` calls `path.read_bytes()` once. The SHA-256 of exactly those bytes is the provenance hash; the same bytes are decoded as strict UTF-8 and parsed.
+- Nothing hashes a reserialized or normalized form, and nothing reopens a file.
+- The YAML loader is a `SafeLoader` subclass that refuses a duplicate key at any depth, a merge key (`<<`) and a non-string key.
+- Missing files, invalid UTF-8, malformed YAML and every contract violation below raise `PolicyError`: a harness failure, never an agent outcome.
+- `build_runner()` loads the bundle once and gives the same object to the extractor, the shadow scorer and the writer's `ReadPathCheck`. There is no hot reload; a changed file is a new condition and needs a new process.
+- The bundle and its parts are frozen dataclasses over `MappingProxyType` and tuples.
+
+**The four files, exactly:**
+
+| File | Top-level keys | Rules |
+|---|---|---|
+| `action_semantics.yaml` | `actions` | each of the six `ActionType`s exactly once, each with exactly `target_kind` (a Kubernetes kind), `reversibility` (a quoted decimal string, in `[0, 1]`) and `steps` (`[patch_configmap, restart_deployment]` for `patch_configmap`, `[<itself>]` for every other) |
+| `gate_weights.yaml` | `status`, `gate_feature_version`, `weights` | `status: pre-v1`; the version an exact integer `>= 0` (a bool is refused); exactly the eight features, each a quoted decimal string, non-negative, summing exactly to 1 |
+| `evidence_requirements.yaml` | `status`, `requirements`, `prerequisites` | `status: pre-v1`; a non-empty, duplicate-free list of ids for each of the six types, each id registered under that type; prerequisites a non-empty, duplicate-free list of registered ids |
+| `conflict_rules.yaml` | `status`, `rules` | `status: pre-v1`; `rules` a list of rules (below), ids unique |
+
+- A quoted decimal matches `[0-9]+(\.[0-9]+)?` and is parsed with `Fraction`. A YAML number, an exponent and a sign are all refused.
+- Production values:
+  - reversibilities `"1.0"`, `"0.8"`, `"0.7"`, `"0.5"`, `"0.6"`, `"0.4"`;
+  - target kinds Deployment ×4, ConfigMap, Service;
+  - `gate_feature_version: 0` with eight × `"0.125"`;
+  - the D§7.3 requirement sets and `prior_revision_healthy`;
+  - `rules: []`.
+- Hashes: `action_semantics_hash` `sha256:1066910809b6ed9adf3de6a361facda3b491a04fad5259c7de98f227ceada550`, `evidence_requirements_hash` `sha256:9ea9b160fee2d665a9127dd7616c4054f8fba1fe049190b58a36f4a84e673468`, `conflict_rules_hash` `sha256:022723db185acc719f2fad6519df3b2ef8eb2823eb9c77a7e36b13d093a820b4`. There is no gate-weights hash.
+- `tests/test_m8_policy.py` holds the D§7.1 regression: a hand-written `{0: eight × "0.125"}`. Changing a weight under version 0 fails, and so does an unknown version.
+
+**The conflict-rule seam (D§7.2).**
+- A rule is exactly `{id, tool, field, operator, value}`:
+  - `id`: a lowercase name;
+  - `tool`: one of `get_deployment`, `get_rollout_history`, `get_configmap`, `get_service`;
+  - `field`: a top-level scalar of that tool's result, from a closed table;
+  - `operator`: one of `eq`, `ne`, `lt`, `le`, `gt`, `ge`; the four ordering operators apply to integer fields only;
+  - `value`: a literal of the field's exact type (an integer is never a bool).
+- The closed table (`safeops.features.conflict.FIELDS`) was written by hand from the frozen contracts:
+  - `get_deployment`: `found`, `current_revision`, `replicas`, `container_count`;
+  - `get_rollout_history`: `revision_count`, `total_revisions`, `truncated`;
+  - `get_configmap`: `found`, `entry_count`, `total_keys`, `truncated`;
+  - `get_service`: `found`, `ready_endpoint_count`, `endpoint_count`.
+
+  A test pins each entry to the contract model's field and type.
+- **Evaluation.** A rule reads the latest successful observation of its tool for `(alert namespace, action target name)`. It fires only if the field is present with exactly its declared type and the comparison holds; a stored null or a wrongly typed value never fires.
+- **Aggregation.** `telemetry_conflict` is any-fire: 1.0 if any rule fires.
+- **Not built:** joins, nested paths, expressions, binding, tri-state, `eval` and LLMs.
+
+**Stored evidence and the no-tools rule.**
+- **What the extractor reads.** The trajectory it consumes is `list[safeops.domain.TrajectoryStep]` whose `args` and `result` are the JSON-safe values the record stores. A result is the decision-0023 envelope, `{"status": "ok", "data": {...}}` or the error form.
+- **Guarded reads.** The guarded helpers are `as_dict`, `nonneg_int` and `ok_data`, each checking `type(...) is dict` and `type(...) is int`. A missing key, a wrong type, a non-ok envelope or a malformed element establishes nothing and never raises.
+- **No revalidation.** No tool-contract model is imported or revalidated.
+- **No `safeops.tools` import on the read path.** Importing any module under `safeops.tools` runs `safeops/tools/__init__`, which imports the kubectl-backed tools and so `safeops.cluster`. So the parser, `safeops.features`, `safeops.gate` and `safeops.policy` import no `safeops.tools` module at all.
+- **The latest observation** (`evidence.latest`) is the matching step with the greatest `TrajectoryStep.step`. Matching means:
+  - the exact tool;
+  - `args == {"namespace": ns, "name": name}` exactly;
+  - an ok envelope whose `data` is an object.
+
+**Features**, exactly as D§5–D§7.3, with these implementation facts:
+- **Resolvable target.** `resolvable()` is the explicit three-part check (namespace, the configured target kind, topology membership); no `TopologyError` is ever caught.
+- **Blast classifier.** `classify_blast` returns a frozen `BlastEvidence(replica: ReplicaEvidence, topology: TopologyEvidence, workload, replicas, dependents, dependents_max)`:
+  - `ReplicaEvidence` and `TopologyEvidence` are `StrEnum`s with the frozen D§5.3 values;
+  - the classifier is exposed as `RiskFeatureExtractor.blast_evidence(...)` for Milestones 10/12;
+  - it is not persisted;
+  - `hard_replica_max` is 20, and `D_max` is computed from the topology.
+- **Non-unique workload.** For `patch_configmap` and `patch_service`, zero or several Deployments owned by the target's owner give `no_deployment_workload` and replica component 1. The extractor returns normally.
+  - That asymmetry with M8B is deliberate: where the executor needs one restart target, a non-unique owner is a configuration defect, and it raises (D§11.2). That is M8B's to implement.
+- **Predicates.** The eight requirement predicates and `prior_revision_healthy` are code (`evidence.REQUIREMENTS`, `evidence.PREREQUISITES`); the YAML only names them.
+  - `failure_correlated_with_current_revision` returns false, so every rollback has `evidence_insufficiency >= 1/3`.
+  - `target_keys_observed` also requires `data.found` true (D§7.3).
+- **Extractor input contract.** The extractor takes the domain `Proposal`. A non-`Proposal`, a proposal without an action, or a structurally invalid action (by `safeops.actions`) is a programmer error (`TypeError` or `ValueError`). So is a trajectory that isn't a list of `TrajectoryStep`, or a context that isn't an `IncidentRuntimeContext`.
+
+**Gate and shadow scoring (D§4, D§6).**
+- `GateDecision(strategy, decision, score)` is frozen:
+  - `decision` is `execute` or `escalate`;
+  - `score` is `None` or a finite float;
+  - its `to_record()` is the record's gate.
+- `AlwaysActGate.decide` type-checks a `FeatureVector`, reads no value, and returns `("always-act", "execute", None)`. No other production gate exists.
+- The runner's constructor types `gate` as the `Gate` protocol.
+  - `_should_execute` refuses anything but a `GateDecision` (`TypeError`) and returns `decision.decision == "execute"`.
+  - The dry-run sequence row "gate decides" names the protocol.
+- **Shadow scalars:**
+  - `risk_score` multiplies the weights by `Fraction(f)` of each stored float, sums exactly, and converts once;
+  - `confidence` is `1.0 - confidence_deficit`;
+  - `random_draw(run_id)` refuses anything but a lowercase hyphenated UUID4 string.
+- The runner passes the extractor `parsed.proposal` when it holds a `ParsedProposal`. The real `_gate_eligible_action` admits only that type, so production always unwraps. A legacy recording double's fixed proposal passes through unchanged, as in M8A-1's guard carve-out.
+
+**Write-time consistency (D§16): a plumbing check, not an oracle.**
+- **How the writer gets its runtime context.** `RunRecordWriter(read_path=ReadPathCheck(extractor, scorer))` takes the runner's very extractor and scorer instances, which share one policy (`ReadPathCheck` refuses otherwise).
+  - `capture_provenance` merges `read_path.provenance()`, the four values of the loaded bundle; it never re-reads configuration.
+  - The runner keeps its `IncidentRuntimeContext` under a harness-internal key and passes it as `finalize(runtime_context=...)`.
+  - It is never a record field: `RECORD_FIELDS`, the record and the schema are unchanged.
+- **What `finalize` checks.** After the schema validates the serialized JSON, `finalize` re-derives the values from the validated record:
+  - the eight features, from the stored proposal, the stored trajectory (its JSON-safe dicts), the stored alert and the runtime topology;
+  - the risk score, confidence and draw, from the stored vector and `run_id`;
+  - the four provenance values, against the loaded policy.
+
+  It compares exactly. Any mismatch is a `RecordValidationError`: the record is kept under `rejected/`, never in the dataset, and nothing is rewritten.
+- **Reuse, not restatement.** The recomputation calls the same extractor and scorer; there is no second formula engine. So it catches:
+  - clobbered values;
+  - evidence or provenance that differs from what produced them;
+  - a draw tied to another run;
+  - a different runtime topology.
+
+  It cannot catch a wrong formula, which would agree with itself. Formula correctness is pinned by literal tests and mutants where the formulas live.
+- **Writers without a check.** A writer without `read_path` (offline and legacy test writers) applies the schema only.
+- **Offline validation stays configuration-free.** `schema.record_problems` opens no policy file and imports no policy, feature or gate module (a fresh-interpreter test checks this). A record never becomes invalid because configuration changed later.
+  - Its only new rule is configuration-free: a feature vector requires `action_semantics_hash`.
+  - The existing confidence rules are unchanged.
+  - Version 1 is unaffected.
+- **Record form of domain models.** The writer's `_plain` now gives a neutral domain model (`FeatureVector`, `ShadowGates`, `TrajectoryStep`) its JSON-mode dump.
+
+**Information wall (D§15).**
+- `safeops.policy` joins `PROTECTED`.
+- **Dynamic imports.** An AST check refuses `importlib` imports, and any reference to `__import__`, `exec` or `eval`, by name or as an attribute, in every protected module; strings and comments don't count. Ten negative probes prove each form is caught.
+- **The no-cluster-read check.** It walks transitively from `safeops.agent.parser`, `safeops.features`, `safeops.gate` and `safeops.policy`, including their parent packages. It refuses any reach of `safeops.cluster` or of any `safeops.tools` module.
+  - Negative probes use a miniature package whose `safeops/tools/__init__` imports the kubectl-backed tools.
+  - They show it catching a direct `safeops.cluster` import, `safeops.tools.contracts`, `safeops.tools.canonical`, a relative lazy import, and each root's own import.
+  - Every tools probe also reaches `safeops.cluster` through the package's `__init__`.
+- The forbidden-root wall is unchanged and passes.
+
+**Unchanged:**
+- `_gate_eligible_action` (M8A-1);
+- `_executed_action` and `ActionExecutor.apply` remain Milestone 8 stubs (M8B);
+- `Agent.investigate` remains the first stub (Milestone 9);
+- schema version 2;
+- manifests, bootstrap, the executor, and Milestone 7's effectiveness and harm semantics.
+
+**Tests:** `tests/test_m8_policy.py` 77, `tests/test_m8_features.py` 229, `tests/test_m8_gate.py` 40, `tests/test_m8_integration.py` 28, and `tests/test_information_wall.py` 40 (was 19). `tests/m8_fixtures.py` builds stored evidence; each fixture shape passes the real `contracts.step_problems`. `tests/test_m8_routing.py::test_valid_action_routes_on_to_the_extract_seam` now stops the run at a spy extractor and asserts it received the domain `Proposal`; its name is kept for `M8A1-R5`.
+
+**Mutants:** 46, source "0025 M8A-2 read path".
+
+| Family | Mutants | What they cover |
+|---|---|---|
+| Policy | `M8A2-L1`–`L8` | reserialized hash; duplicate keys accepted; a bool version; under-sum weights; numeric decimals; a requirement under the wrong action; unchecked steps; the schema rule moved to executions |
+| Blast | `M8A2-B1`–`B11` | dependencies for dependents; raw D; a hard-coded D_max; whole-feature fail-closed; a requested count used alone; requested instead of max; the categories collapsed; a non-unique workload raising; the first one selected; the namespace check dropped; the kind check dropped |
+| Persistence and scope | `M8A2-S1`, `S2` | |
+| Evidence | `M8A2-E1`–`E10` | |
+| Conflict | `M8A2-C1`, `C2` | |
+| Gate and shadow | `M8A2-G1`–`G8` | always-act reading a feature; inverted routing; shadow routing; an omitted feature; decimal provenance; the confidence shadow; the draw's domain string; the draw's bit shift |
+| Runner | `M8A2-R1` | |
+| Write-time check | `M8A2-W1`–`W4` | |
+
+- Each was proven in a scratch copy of the uncommitted tree: 46 killed, 0 survived, 0 harness errors.
+- The table holds 170.
+- Full mutation run (every historical, Milestone 7, pre-Milestone-8, M8A-1 and M8A-2 mutant), on a clean git-initialized copy of exactly this change: 170 killed, 0 survived, 0 harness errors, tree restored. Decision 0025 still requires another full run at Milestone 8 closure.

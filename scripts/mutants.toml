@@ -1852,3 +1852,653 @@ old = '''
             if isinstance(raw_output, AgentOutput) and raw_output.trajectory_steps != len('''
 new = '''
             if raw_output.trajectory_steps != len('''
+
+[[mutant]]
+id = "M8A2-L1"
+source = "0025 M8A-2 read path"
+target = "safeops/policy.py"
+guard = "the provenance hash is over the exact bytes read, never a reserialized form"
+kills = [
+    "tests/test_m8_policy.py::test_each_hash_is_the_sha256_of_the_files_exact_bytes",
+    "tests/test_m8_policy.py::test_a_comment_changes_the_hash_but_not_the_values",
+]
+old = '''
+    return PolicyFile(name=path.name, sha256=sha256_of(raw), data=data)'''
+new = '''
+    return PolicyFile(name=path.name, sha256=sha256_of(repr(data).encode()), data=data)'''
+
+[[mutant]]
+id = "M8A2-L2"
+source = "0025 M8A-2 read path"
+target = "safeops/policy.py"
+guard = "a duplicate YAML key is refused at any depth, never last-key-wins"
+kills = [
+    "tests/test_m8_policy.py::test_a_duplicate_key_at_any_depth_is_refused",
+]
+old = '''
+        if key in mapping:
+            raise PolicyError('''
+new = '''
+        if key in mapping and False:
+            raise PolicyError('''
+
+[[mutant]]
+id = "M8A2-L3"
+source = "0025 M8A-2 read path"
+target = "safeops/features/policy.py"
+guard = "gate_feature_version is an exact integer: a bool is refused"
+kills = [
+    "tests/test_m8_policy.py::test_gate_weight_refusals[version-bool]",
+]
+old = '''
+    if type(version) is not int or version < 0:'''
+new = '''
+    if not isinstance(version, int) or version < 0:'''
+
+[[mutant]]
+id = "M8A2-L4"
+source = "0025 M8A-2 read path"
+target = "safeops/features/policy.py"
+guard = "weights must sum exactly to 1, from below too"
+kills = [
+    "tests/test_m8_policy.py::test_gate_weight_refusals[sum-below-one]",
+]
+old = '''
+    if sum(weights.values()) != 1:'''
+new = '''
+    if sum(weights.values()) > 1:'''
+
+[[mutant]]
+id = "M8A2-L5"
+source = "0025 M8A-2 read path"
+target = "safeops/policy.py"
+guard = "reversibilities and weights are quoted decimal strings; a YAML number is refused"
+kills = [
+    "tests/test_m8_policy.py::test_action_semantics_refusals[numeric-reversibility]",
+    "tests/test_m8_policy.py::test_gate_weight_refusals[numeric-weight]",
+]
+old = '''
+    if type(value) is not str or _DECIMAL.fullmatch(value) is None:'''
+new = '''
+    if _DECIMAL.fullmatch(str(value)) is None:'''
+
+[[mutant]]
+id = "M8A2-L6"
+source = "0025 M8A-2 read path"
+target = "safeops/features/policy.py"
+guard = "a requirement id is accepted only under its own action type"
+kills = [
+    "tests/test_m8_policy.py::test_evidence_requirement_refusals[id-under-wrong-action]",
+]
+old = '''
+            if owner is None or owner[0] is not action:'''
+new = '''
+            if owner is None:'''
+
+[[mutant]]
+id = "M8A2-L7"
+source = "0025 M8A-2 read path"
+target = "safeops/policy.py"
+guard = "each action's step operations are exactly §9.2's (the composite included)"
+kills = [
+    "tests/test_m8_policy.py::test_action_semantics_refusals[composite-one-step]",
+    "tests/test_m8_policy.py::test_action_semantics_refusals[wrong-single-step]",
+]
+old = '''
+        if steps != expected_steps(action):'''
+new = '''
+        if not steps:'''
+
+[[mutant]]
+id = "M8A2-L8"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/schema.py"
+guard = "a feature vector requires action_semantics_hash"
+kills = [
+    "tests/test_m8_integration.py::test_a_feature_vector_requires_action_semantics_hash",
+]
+old = '''
+    if r.feature_vector is not None and pv.action_semantics_hash is None:
+        # irreversibility'''
+new = '''
+    if r.execution is not None and pv.action_semantics_hash is None:
+        # irreversibility'''
+
+[[mutant]]
+id = "M8A2-B1"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "the dependent component counts dependents (callers), not dependencies"
+kills = [
+    "tests/test_m8_features.py::test_the_blast_radius_matrix[orders-2]",
+    "tests/test_m8_features.py::test_the_blast_radius_matrix[inventory-2]",
+]
+old = '''
+    dependents = len(topology.dependents(owner))'''
+new = '''
+    dependents = len(topology.dependencies(owner))'''
+
+[[mutant]]
+id = "M8A2-B2"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "the dependent component is D / D_max, never raw D"
+kills = [
+    "tests/test_m8_features.py::test_the_blast_radius_matrix[orders-2]",
+    "tests/test_m8_features.py::test_the_blast_radius_matrix[orders-missing]",
+]
+old = '''
+        dependent_component = Fraction(evidence.dependents, evidence.dependents_max)'''
+new = '''
+        dependent_component = Fraction(evidence.dependents)'''
+
+[[mutant]]
+id = "M8A2-B3"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "D_max is derived from the topology, never hard-coded"
+kills = [
+    "tests/test_m8_features.py::test_d_max_comes_from_the_topology",
+]
+old = '''
+    d_max = max((len(topology.dependents(s)) for s in topology.services), default=0)'''
+new = '''
+    d_max = 2'''
+
+[[mutant]]
+id = "M8A2-B4"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "missing replica evidence fails closed in that component only"
+kills = [
+    "tests/test_m8_features.py::test_the_blast_radius_matrix[gateway-missing]",
+    "tests/test_m8_features.py::test_missing_replica_evidence_keeps_the_known_topology_component",
+]
+old = '''
+    else:
+        replica_component = Fraction(1)'''
+new = '''
+    else:
+        return 1.0'''
+
+[[mutant]]
+id = "M8A2-B5"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "a scale with no observed current count never uses the requested count alone"
+kills = [
+    "tests/test_m8_features.py::test_scale_never_uses_the_requested_count_alone",
+]
+old = '''
+    else:
+        replica_component = Fraction(1)'''
+new = '''
+    elif action.type is ActionType.SCALE_DEPLOYMENT:
+        requested = action.params["replicas"]
+        replica_component = Fraction(min(max(requested, 0), HARD_REPLICA_MAX), HARD_REPLICA_MAX)
+    else:
+        replica_component = Fraction(1)'''
+
+[[mutant]]
+id = "M8A2-B6"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "scale uses max(current, requested), never the requested count"
+kills = [
+    "tests/test_m8_features.py::test_the_blast_radius_matrix[scale-inventory-20-to-0]",
+    "tests/test_m8_features.py::test_scale_uses_the_larger_of_current_and_requested",
+]
+old = '''
+            r = max(r, action.params["replicas"])'''
+new = '''
+            r = action.params["replicas"]'''
+
+[[mutant]]
+id = "M8A2-B7"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "structural unobservability (no_deployment_workload) is not collapsed into missing evidence"
+kills = [
+    "tests/test_m8_features.py::test_the_blast_radius_matrix[postgres-svc]",
+    "tests/test_m8_features.py::test_a_non_unique_owned_deployment_is_classified_not_raised",
+]
+old = '''
+        replica, count = ReplicaEvidence.NO_DEPLOYMENT_WORKLOAD, None'''
+new = '''
+        replica, count = ReplicaEvidence.NO_REPLICA_EVIDENCE, None'''
+
+[[mutant]]
+id = "M8A2-B8"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "zero or several owned Deployments are classified, never raised"
+kills = [
+    "tests/test_m8_features.py::test_a_non_unique_owned_deployment_is_classified_not_raised",
+]
+old = '''
+    return owned[0] if len(owned) == 1 else None'''
+new = '''
+    (only,) = owned
+    return only'''
+
+[[mutant]]
+id = "M8A2-B9"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "several owned Deployments never select the first"
+kills = [
+    "tests/test_m8_features.py::test_a_non_unique_owned_deployment_is_classified_not_raised[two-owned]",
+]
+old = '''
+    return owned[0] if len(owned) == 1 else None'''
+new = '''
+    return owned[0] if owned else None'''
+
+[[mutant]]
+id = "M8A2-B10"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "a target outside the alert's namespace is unresolvable"
+kills = [
+    "tests/test_m8_features.py::test_an_unresolvable_target_fails_closed_without_topology_error",
+]
+old = '''
+        target.ns == context.alert.namespace
+        and target.kind == semantics'''
+new = '''
+        target.kind == semantics'''
+
+[[mutant]]
+id = "M8A2-B11"
+source = "0025 M8A-2 read path"
+target = "safeops/features/blast.py"
+guard = "a target of the wrong kind for its action is unresolvable"
+kills = [
+    "tests/test_m8_features.py::test_an_unresolvable_target_fails_closed_without_topology_error",
+]
+old = '''
+        and target.kind == semantics[action.type].target_kind
+        and context.topology'''
+new = '''
+        and context.topology'''
+
+[[mutant]]
+id = "M8A2-S1"
+source = "0025 M8A-2 read path"
+target = "safeops/features/extractor.py"
+guard = "scope_outside_target uses incident_scope (dependencies), the harm predicate's direction"
+kills = [
+    "tests/test_m8_features.py::test_scope_is_the_harm_predicate_direction",
+]
+old = '''
+    return 0.0 if owner in topology.incident_scope(context.alert.target_service) else 1.0'''
+new = '''
+    return 0.0 if owner in topology.blast_radius_set(context.alert.target_service) else 1.0'''
+
+[[mutant]]
+id = "M8A2-S2"
+source = "0025 M8A-2 read path"
+target = "safeops/features/extractor.py"
+guard = "an unresolvable patch_configmap has persistence_risk 1"
+kills = [
+    "tests/test_m8_features.py::test_persistence_risk_is_narrow",
+    "tests/test_m8_features.py::test_a_catastrophic_proposal_scores_the_maximum_where_it_should",
+]
+old = '''
+        return 1.0  # unknown whether persistence-affecting (D§5.1)'''
+new = '''
+        return 0.0  # unknown whether persistence-affecting (D§5.1)'''
+
+[[mutant]]
+id = "M8A2-E1"
+source = "0025 M8A-2 read path"
+target = "safeops/features/evidence.py"
+guard = "a successful call earns no support without its content (found)"
+kills = [
+    "tests/test_m8_features.py::test_single_requirement_predicates[restart-not-found]",
+]
+old = '''
+    return data is not None and data.get("found") is True'''
+new = '''
+    return data is not None'''
+
+[[mutant]]
+id = "M8A2-E2"
+source = "0025 M8A-2 read path"
+target = "safeops/features/evidence.py"
+guard = "the latest observation is the greatest step"
+kills = [
+    "tests/test_m8_features.py::test_the_latest_observation_is_the_greatest_step_not_list_position",
+    "tests/test_m8_features.py::test_a_later_not_found_overrides_an_earlier_count",
+]
+old = '''
+        if best is None or step.step > best.step:'''
+new = '''
+        if best is None or step.step < best.step:'''
+
+[[mutant]]
+id = "M8A2-E3"
+source = "0025 M8A-2 read path"
+target = "safeops/features/evidence.py"
+guard = "a revision's existence is not its health"
+kills = [
+    "tests/test_m8_features.py::test_revision_health_is_replicas_positive_and_all_ready[partly-ready]",
+    "tests/test_m8_features.py::test_revision_health_is_replicas_positive_and_all_ready[scaled-to-zero]",
+]
+old = '''
+        if replicas is not None and ready is not None and replicas > 0 and ready == replicas:'''
+new = '''
+        if replicas is not None:'''
+
+[[mutant]]
+id = "M8A2-E4"
+source = "0025 M8A-2 read path"
+target = "safeops/features/evidence.py"
+guard = "health needs every replica ready, not ready_replicas > 0"
+kills = [
+    "tests/test_m8_features.py::test_revision_health_is_replicas_positive_and_all_ready[partly-ready]",
+    "tests/test_m8_features.py::test_prerequisites",
+]
+old = '''
+        if replicas is not None and ready is not None and replicas > 0 and ready == replicas:'''
+new = '''
+        if replicas is not None and ready is not None and replicas > 0 and ready > 0:'''
+
+[[mutant]]
+id = "M8A2-E5"
+source = "0025 M8A-2 read path"
+target = "safeops/features/evidence.py"
+guard = "failure_correlated_with_current_revision is never satisfied in pre-v1"
+kills = [
+    "tests/test_m8_features.py::test_rollback_never_goes_below_its_pre_v1_floor",
+    "tests/test_m8_features.py::test_rollback_evidence_counts_semantic_support",
+]
+old = '''
+pre-v1."""
+    return False'''
+new = '''
+pre-v1."""
+    return True'''
+
+[[mutant]]
+id = "M8A2-E6"
+source = "0025 M8A-2 read path"
+target = "safeops/features/extractor.py"
+guard = "a prerequisite outside the vocabulary is unsupported"
+kills = [
+    "tests/test_m8_features.py::test_prerequisites",
+    "tests/test_m8_features.py::test_a_prerequisite_outside_the_loaded_vocabulary_is_unsupported",
+]
+old = '''
+            if claim not in vocabulary
+            or not evidence.PREREQUISITES[claim](action, steps, namespace)'''
+new = '''
+            if claim in vocabulary
+            and not evidence.PREREQUISITES[claim](action, steps, namespace)'''
+
+[[mutant]]
+id = "M8A2-E7"
+source = "0025 M8A-2 read path"
+target = "safeops/features/extractor.py"
+guard = "no claims gives prerequisites_unverified 0"
+kills = [
+    "tests/test_m8_features.py::test_prerequisites",
+    "tests/test_m8_features.py::test_a_fully_observed_restart_is_low_risk_and_exact",
+]
+old = '''
+            return 0.0  # nothing unsupported was claimed (D§5.2)'''
+new = '''
+            return 1.0  # nothing unsupported was claimed (D§5.2)'''
+
+[[mutant]]
+id = "M8A2-E8"
+source = "0025 M8A-2 read path"
+target = "safeops/features/evidence.py"
+guard = "a ConfigMap key missing from the (truncated) entries earns nothing"
+kills = [
+    "tests/test_m8_features.py::test_single_requirement_predicates[configmap-one-key-missing]",
+    "tests/test_m8_features.py::test_single_requirement_predicates[configmap-truncated-missing]",
+]
+old = '''
+        if (
+            entry is None
+            or entry.get("redacted") is not False
+            or type(entry.get("value")) is not str
+        ):'''
+new = '''
+        if entry is not None and (
+            entry.get("redacted") is not False or type(entry.get("value")) is not str
+        ):'''
+
+[[mutant]]
+id = "M8A2-E9"
+source = "0025 M8A-2 read path"
+target = "safeops/features/evidence.py"
+guard = "container_count never implies a container the bounded list doesn't show"
+kills = [
+    "tests/test_m8_features.py::test_single_requirement_predicates[resources-hidden-by-bound]",
+]
+old = '''
+    return any(as_dict(c) is not None and c.get("name") == wanted for c in containers)'''
+new = '''
+    return any(as_dict(c) is not None and c.get("name") == wanted for c in containers) or (
+        (nonneg_int(data.get("container_count")) or 0) > len(containers)
+    )'''
+
+[[mutant]]
+id = "M8A2-E10"
+source = "0025 M8A-2 read path"
+target = "safeops/features/evidence.py"
+guard = "a bool is not a stored integer: wrong types are unsupported"
+kills = [
+    "tests/test_m8_features.py::test_malformed_predicate_fields_establish_nothing[scale-replicas-bool]",
+]
+old = '''
+    return value if type(value) is int and value >= 0 else None'''
+new = '''
+    return value if isinstance(value, int) and value >= 0 else None'''
+
+[[mutant]]
+id = "M8A2-C1"
+source = "0025 M8A-2 read path"
+target = "safeops/features/conflict.py"
+guard = "telemetry_conflict comes from evaluating the rules, never a constant"
+kills = [
+    "tests/test_m8_features.py::test_production_rules_give_zero_through_the_evaluator",
+    "tests/test_m8_features.py::test_one_test_rule[satisfied]",
+    "tests/test_m8_features.py::test_any_rule_firing_is_a_conflict",
+]
+old = '''
+    return 1.0 if any(fires(r, action, trajectory, namespace) for r in rules) else 0.0'''
+new = '''
+    return 0.0'''
+
+[[mutant]]
+id = "M8A2-C2"
+source = "0025 M8A-2 read path"
+target = "safeops/features/conflict.py"
+guard = "a stored value of the wrong type never satisfies a rule"
+kills = [
+    "tests/test_m8_features.py::test_one_test_rule[bool]",
+]
+old = '''
+    if type(observed) is not FIELDS[rule.tool][rule.field]:'''
+new = '''
+    if observed is None:'''
+
+[[mutant]]
+id = "M8A2-G1"
+source = "0025 M8A-2 read path"
+target = "safeops/gate/always_act.py"
+guard = "always-act reads no feature value"
+kills = [
+    "tests/test_m8_gate.py::test_always_act_executes_whatever_the_features",
+    "tests/test_m8_gate.py::test_always_act_reads_no_feature_value",
+]
+old = '''
+        return GateDecision(strategy=self.name, decision=EXECUTE, score=None)'''
+new = '''
+        decision = EXECUTE if features.blast_radius < 1.0 else "escalate"
+        return GateDecision(strategy=self.name, decision=decision, score=None)'''
+
+[[mutant]]
+id = "M8A2-G2"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/runner.py"
+guard = "_should_execute is true exactly for execute"
+kills = [
+    "tests/test_m8_gate.py::test_should_execute_routes_on_the_gate_decision",
+    "tests/test_m8_integration.py::test_a_test_local_gate_swaps_in_and_the_executor_is_never_called",
+]
+old = '''
+        return decision.decision == "execute"'''
+new = '''
+        return decision.decision != "execute"'''
+
+[[mutant]]
+id = "M8A2-G3"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/runner.py"
+guard = "no shadow scalar routes execution; only the GateDecision does"
+kills = [
+    "tests/test_m8_integration.py::test_shadow_values_do_not_change_the_routing",
+    "tests/test_m8_integration.py::test_should_execute_is_passed_only_the_gate_decision",
+]
+old = '''
+                if self._should_execute(decision):'''
+new = '''
+                if data["shadow_scores"].safeops.risk_score <= 0.5:'''
+
+[[mutant]]
+id = "M8A2-G4"
+source = "0025 M8A-2 read path"
+target = "safeops/gate/shadow.py"
+guard = "the risk score sums every feature"
+kills = [
+    "tests/test_m8_gate.py::test_risk_score_literals",
+    "tests/test_m8_gate.py::test_risk_score_uses_every_feature_with_its_own_weight",
+]
+old = '''
+Fraction(getattr(features, name)) for name in FEATURE_NAMES),'''
+new = '''
+Fraction(getattr(features, name)) for name in FEATURE_NAMES[:-1]),'''
+
+[[mutant]]
+id = "M8A2-G5"
+source = "0025 M8A-2 read path"
+target = "safeops/gate/shadow.py"
+guard = "a feature float enters as its exact binary value, never a reconstructed decimal"
+kills = [
+    "tests/test_m8_gate.py::test_risk_score_literals",
+]
+old = '''
+Fraction(getattr(features, name)) for name in FEATURE_NAMES),'''
+new = '''
+Fraction(str(getattr(features, name))) for name in FEATURE_NAMES),'''
+
+[[mutant]]
+id = "M8A2-G6"
+source = "0025 M8A-2 read path"
+target = "safeops/gate/shadow.py"
+guard = "the confidence shadow is 1 - confidence_deficit"
+kills = [
+    "tests/test_m8_gate.py::test_confidence_shadow_is_one_minus_the_deficit",
+]
+old = '''
+    return 1.0 - features.confidence_deficit'''
+new = '''
+    return features.confidence_deficit'''
+
+[[mutant]]
+id = "M8A2-G7"
+source = "0025 M8A-2 read path"
+target = "safeops/gate/shadow.py"
+guard = "the random draw's domain string is safeops/random-p/v1:"
+kills = [
+    "tests/test_m8_gate.py::test_random_draw_literals",
+]
+old = '''
+RANDOM_DOMAIN = b"safeops/random-p/v1:"'''
+new = '''
+RANDOM_DOMAIN = b"safeops/random-p/v2:"'''
+
+[[mutant]]
+id = "M8A2-G8"
+source = "0025 M8A-2 read path"
+target = "safeops/gate/shadow.py"
+guard = "the draw is the top 53 bits of the first 8 digest bytes"
+kills = [
+    "tests/test_m8_gate.py::test_random_draw_literals",
+]
+old = '''
+    return (int.from_bytes(digest[:8], "big") >> 11) / 2**53'''
+new = '''
+    return (int.from_bytes(digest[:8], "big") >> 12) / 2**53'''
+
+[[mutant]]
+id = "M8A2-R1"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/runner.py"
+guard = "the extractor receives the domain Proposal, never the ParsedProposal"
+kills = [
+    "tests/test_m8_routing.py::test_valid_action_routes_on_to_the_extract_seam",
+    "tests/test_m8_integration.py::test_a_valid_action_runs_the_whole_read_path_and_stops_at_the_executor",
+]
+old = '''
+                domain = proposal.proposal if isinstance(proposal, ParsedProposal) else proposal'''
+new = '''
+                domain = proposal'''
+
+[[mutant]]
+id = "M8A2-W1"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/consistency.py"
+guard = "write time: each stored feature is compared with its recomputation from stored evidence"
+kills = [
+    "tests/test_m8_integration.py::test_a_clobbered_value_or_mismatched_evidence_is_refused[blast-radius]",
+    "tests/test_m8_integration.py::test_a_clobbered_value_or_mismatched_evidence_is_refused[stored-trajectory]",
+]
+old = '''
+            if getattr(fv, name) != getattr(recomputed, name):'''
+new = '''
+            if getattr(fv, name) != getattr(fv, name):'''
+
+[[mutant]]
+id = "M8A2-W2"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/consistency.py"
+guard = "write time: the stored draw is recomputed from run_id"
+kills = [
+    "tests/test_m8_integration.py::test_a_clobbered_value_or_mismatched_evidence_is_refused[draw]",
+]
+old = '''
+                ("random.draw", sg.random.draw, expected.random.draw),'''
+new = '''
+                ("random.draw", sg.random.draw, sg.random.draw),'''
+
+[[mutant]]
+id = "M8A2-W3"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/consistency.py"
+guard = "write time: the record's policy provenance equals the loaded policy's"
+kills = [
+    "tests/test_m8_integration.py::test_a_clobbered_value_or_mismatched_evidence_is_refused[conflict-rules-hash]",
+    "tests/test_m8_integration.py::test_a_clobbered_value_or_mismatched_evidence_is_refused[gate-feature-version]",
+]
+old = '''
+            if getattr(record.provenance, key) != value'''
+new = '''
+            if getattr(record.provenance, key) is None'''
+
+[[mutant]]
+id = "M8A2-W4"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/records.py"
+guard = "the writer's policy provenance comes from the loaded policy object"
+kills = [
+    "tests/test_m8_integration.py::test_the_writers_provenance_comes_from_the_loaded_policy",
+]
+old = '''
+            provenance.update(self.read_path.provenance())'''
+new = '''
+            pass'''

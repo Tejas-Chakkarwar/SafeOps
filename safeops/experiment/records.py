@@ -84,12 +84,17 @@ def _known_total(steps: list[dict] | None, key: str) -> int | None:
 
 
 def _plain(obj):
-    """A later milestone's object in record form."""
+    """A later milestone's object in record form. A neutral domain model (FeatureVector,
+    ShadowGates, TrajectoryStep) is its JSON-mode dump: the schema reuses those classes."""
     if obj is None or isinstance(obj, dict | list | str | int | float | bool):
         return obj
     to_record = getattr(obj, "to_record", None)
     if callable(to_record):
         return to_record()
+    from safeops.domain import StrictModel
+
+    if isinstance(obj, StrictModel):
+        return obj.model_dump(mode="json")
     raise TypeError(f"{type(obj).__name__} has no record form (to_record())")
 
 
@@ -224,6 +229,7 @@ class RunRecordWriter:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         phase: str = "A",
         faults_dir: Path | None = None,
+        read_path=None,
     ) -> None:
         self.runs_dir = Path(RUNS_DIR if runs_dir is None else runs_dir)
         # The same spec source as the injector (build_runner wires both), so a run that
@@ -232,6 +238,11 @@ class RunRecordWriter:
         self._provenance = provenance
         self._clock = clock
         self.phase = phase
+        # Runtime-only, never persisted (decision 0025 D§16): a ReadPathCheck holding the very
+        # extractor and shadow scorer the runner uses, so the policy provenance merged into
+        # each record and the write-time recomputation come from the one loaded policy. None
+        # (offline and legacy writers): the schema's configuration-free rules only.
+        self.read_path = read_path
 
     @property
     def provenance(self) -> ProvenanceSource:
@@ -248,6 +259,9 @@ class RunRecordWriter:
         path = fault_path(unit.fault_id, self.faults_dir or FAULTS_DIR)
         if path.is_file():
             provenance["fault_definition_hash"] = _sha256_file(path)
+        if self.read_path is not None:
+            # From the loaded policy objects, never by re-reading config (D§7.1).
+            provenance.update(self.read_path.provenance())
         return provenance
 
     def build(self, **fields) -> dict:
@@ -425,8 +439,12 @@ class RunRecordWriter:
             "in_cohort_g": in_g,
         }
 
-    def finalize(self, **fields) -> Path:
+    def finalize(self, runtime_context=None, **fields) -> Path:
         """Validate the run record against its schema version and write it once.
+
+        With a read-path check, the validated record's derived read-path values are also
+        recomputed from its own stored evidence, against `runtime_context` (the
+        IncidentRuntimeContext the run extracted under; harness-internal, never written).
 
         Finalized records are immutable. Returns the record's path.
         """
@@ -436,7 +454,11 @@ class RunRecordWriter:
         try:
             # allow_nan=False: NaN and Infinity aren't JSON; refuse them (review finding 6).
             text = json.dumps(record, sort_keys=True, indent=2, allow_nan=False) + "\n"
-            validate_record_json(text)
+            validated = validate_record_json(text)
+            if self.read_path is not None:
+                problems = self.read_path.problems(validated, runtime_context)
+                if problems:
+                    raise RecordValidationError("; ".join(problems))
         except (ValueError, RecordValidationError) as exc:
             text = json.dumps(record, sort_keys=True, indent=2) + "\n"
             kept = self._write_once(self.runs_dir / "rejected", record["run_id"], text)

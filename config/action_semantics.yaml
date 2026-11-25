@@ -1,0 +1,34 @@
+# Frozen action semantics (design §9.2; decision 0025 D§7). Not pre-v1: this is §9.2's
+# table. Read by the feature extractor (irreversibility, target resolution; M8A) and by the
+# executor (envelope E1, step operations; M8B). Its bytes are hashed into every run record
+# as provenance.action_semantics_hash.
+#
+# reversibility is a quoted decimal string: it is parsed exactly (decision 0025 D§5), so a
+# YAML float here is refused. steps are the Kubernetes write operations, in order:
+# patch_configmap is the bounded composite (§9.2), every other action is one write.
+
+actions:
+  rollback_deployment:
+    target_kind: Deployment
+    reversibility: "1.0"
+    steps: [rollback_deployment]
+  restart_deployment:
+    target_kind: Deployment
+    reversibility: "0.8"
+    steps: [restart_deployment]
+  scale_deployment:
+    target_kind: Deployment
+    reversibility: "0.7"
+    steps: [scale_deployment]
+  patch_configmap:
+    target_kind: ConfigMap
+    reversibility: "0.5"
+    steps: [patch_configmap, restart_deployment]
+  patch_service:
+    target_kind: Service
+    reversibility: "0.6"
+    steps: [patch_service]
+  patch_deployment_resources:
+    target_kind: Deployment
+    reversibility: "0.4"
+    steps: [patch_deployment_resources]

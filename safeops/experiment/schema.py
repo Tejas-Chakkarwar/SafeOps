@@ -862,6 +862,9 @@ def record_problems(r: RunRecordV1) -> list[str]:
         pv.conflict_rules_hash,
     ):
         p.append("a feature vector exists but the gate's provenance is incomplete")
+    if r.feature_vector is not None and pv.action_semantics_hash is None:
+        # irreversibility and target resolution read action_semantics.yaml (decision 0025 D§16)
+        p.append("a feature vector exists but action_semantics_hash is missing")
     if r.execution is not None and pv.action_semantics_hash is None:
         p.append("an execution exists but action_semantics_hash is missing")
 

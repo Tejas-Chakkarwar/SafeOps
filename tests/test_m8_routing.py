@@ -2,9 +2,8 @@
 D§3.1, D§4; decision 0018).
 
 The real ProposalParser and the real _gate_eligible_action, fed fabricated AgentOutput
-envelopes (Rule 17). The harness around them is the offline fakes. The read path past
-routing (extractor, gates) is still Milestone 8A-2's stub, so a valid_action run stops at
-that seam, recorded; nothing downstream is faked to finish it.
+envelopes (Rule 17). The harness around them is the offline fakes. A valid_action run is stopped
+at the extract seam by a spy; the read path past it is tests/test_m8_integration.py's.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import pytest
 
 from safeops.agent.output import AgentOutput, Termination
 from safeops.agent.parser import ParsedProposal, ProposalParser
+from safeops.domain import Proposal
 from safeops.enums import ProposalStatus
 from safeops.experiment.records import RunRecordWriter
 from safeops.experiment.runner import (
@@ -24,7 +24,6 @@ from safeops.experiment.runner import (
     _cause,
 )
 from safeops.faults.alerts import AlertGenerator
-from safeops.stubs import NotImplementedStage
 from tests.conftest import FakeEnvironment, FakeInjector, FakeWorkload
 from tests.test_m5_records import (
     RECOVERED,
@@ -169,22 +168,31 @@ def test_provider_failure_is_a_discard_at_route_proposal(tmp_path) -> None:
 
 
 def test_valid_action_routes_on_to_the_extract_seam(tmp_path) -> None:
-    r = _runner(tmp_path, OUTPUTS[S.VALID_ACTION], extractor=_StubExtractor())
-    with pytest.raises(NotImplementedStage):
+    """valid_action goes past route_proposal into extract, which receives the domain
+    Proposal (decision 0025 D§5), never the parser's ParsedProposal. The spy stops the run
+    there, so nothing further down the read path is faked."""
+    extractor = _SpyExtractor()
+    r = _runner(tmp_path, OUTPUTS[S.VALID_ACTION], extractor=extractor)
+    with pytest.raises(PostAgentDiscard):
         r.run(UNIT)
+    (proposal, trajectory) = extractor.seen
+    assert type(proposal) is Proposal and proposal.recommended_action.model_dump(mode="json") == (
+        ACTION
+    )
+    assert len(trajectory) == 1
     (rec,) = _records(tmp_path)
     assert rec["proposal_status"] == "valid_action"
     assert rec["discard_reason"]["stage"] == "extract"  # past route_proposal
-    assert rec["discard_reason"]["cause"] == "not_implemented"
+    assert "extract reached" in rec["discard_reason"]["error"]
 
 
-class _StubExtractor:
-    """The real extractor, still Milestone 8A-2's stub."""
+class _SpyExtractor:
+    def __init__(self) -> None:
+        self.seen = None
 
     def extract(self, proposal, trajectory, context):
-        from safeops.features.extractor import RiskFeatureExtractor
-
-        return RiskFeatureExtractor().extract(proposal, trajectory, context)
+        self.seen = (proposal, trajectory)
+        raise RuntimeError("extract reached")
 
 
 @pytest.mark.parametrize(

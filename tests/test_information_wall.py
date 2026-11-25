@@ -14,7 +14,15 @@ set protected code may use (decision 0021). safeops.tools is protected before th
 real tool lands: tools are the agent's senses.
 
 The check is transitive, follows relative imports, and sees imports inside function bodies.
-Dynamic imports (importlib) are not caught, so don't use them in those packages.
+Dynamic imports (importlib, __import__, exec, eval) would escape it, so a separate static
+check refuses them anywhere in the protected set (decision 0025 D§15).
+
+safeops.cluster and safeops.tools are protected, not forbidden, so the wall alone doesn't
+stop protected code reaching the Kubernetes client. The Milestone 8 read path (parser,
+features, gate and shadow scoring, policy) must not: a third check refuses any import of
+safeops.cluster or of any safeops.tools module from it, transitively. Every safeops.tools
+module counts, contracts and canonical included: importing one runs safeops/tools/__init__,
+which imports the kubectl-backed tools (decision 0025, M8A-2 amendment).
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ PROTECTED = (
     "safeops.topology",
     "safeops.cluster",  # the guarded client the tools read through (Milestone 6)
     "safeops.actions",  # structural action contracts: parser now, executor at M8B (0025 D§3.4)
+    "safeops.policy",  # strict policy loading + action semantics: features now, executor at M8B
 )
 FORBIDDEN = (
     "safeops.faults",
@@ -290,3 +299,170 @@ def test_a_tool_reaching_evaluator_state_through_a_neutral_helper_is_caught(
         },
     )
     assert pkg in _leaks(reachable_modules(root, "safeops", ("safeops.tools",)), FORBIDDEN)
+
+
+# --- dynamic imports (decision 0025 D§15) --------------------------------------------------------
+
+DYNAMIC = frozenset({"__import__", "exec", "eval"})
+
+
+def dynamic_imports(path: Path) -> list[str]:
+    """Uses of importlib, __import__, exec or eval in a module's code (not its strings or
+    comments): imports of importlib, and any reference to the three builtins by name or as
+    an attribute (builtins.exec)."""
+    found = []
+    for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        if isinstance(node, ast.Import):
+            found += [a.name for a in node.names if a.name.split(".")[0] == "importlib"]
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "importlib":
+            found.append(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            found += [a.name for a in node.names if a.name in DYNAMIC]
+        elif isinstance(node, ast.Name) and node.id in DYNAMIC:
+            found.append(node.id)
+        elif isinstance(node, ast.Attribute) and node.attr in DYNAMIC:
+            found.append(node.attr)
+    return [f"{path.name}:{name}" for name in found]
+
+
+def _protected_modules(root: Path) -> dict[str, Path]:
+    index = _module_index(root, "safeops")
+    return {
+        m: p for m, p in index.items() if any(m == r or m.startswith(r + ".") for r in PROTECTED)
+    }
+
+
+def test_the_protected_set_uses_no_dynamic_import() -> None:
+    modules = _protected_modules(REPO_ROOT)
+    assert {"safeops.policy", "safeops.features.extractor", "safeops.gate.shadow"} <= set(modules)
+    found = [hit for path in modules.values() for hit in dynamic_imports(path)]
+    assert found == [], f"dynamic imports in protected code: {found}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import importlib\n",
+        "import importlib.util\n",
+        "from importlib import import_module\n",
+        "def f():\n    from importlib import import_module\n",
+        "m = __import__('safeops.faults.spec')\n",
+        "eval('1')\n",
+        "exec('x = 1')\n",
+        "import builtins\nbuiltins.exec('x = 1')\n",
+        "run = eval\n",
+        "from builtins import __import__\n",
+    ],
+)
+def test_the_dynamic_import_check_catches_each_form(tmp_path: Path, source: str) -> None:
+    path = tmp_path / "probe.py"
+    path.write_text(source)
+    assert dynamic_imports(path)
+
+
+def test_the_dynamic_import_check_ignores_strings_and_comments(tmp_path: Path) -> None:
+    path = tmp_path / "probe.py"
+    path.write_text("# eval(x), importlib\nTEXT = 'exec(1) __import__ importlib'\nevaluate = 1\n")
+    assert dynamic_imports(path) == []
+
+
+# --- the M8 read path never reaches the Kubernetes client (decision 0025, M8A-2) -----------------
+
+READ_PATH = ("safeops.agent.parser", "safeops.features", "safeops.gate", "safeops.policy")
+NO_CLUSTER = ("safeops.cluster", "safeops.tools")
+
+
+def read_path_reach(root: Path) -> set[str]:
+    """Every module the read-path roots import, transitively, starting from the roots and
+    their parent packages (importing safeops.agent.parser runs safeops/agent/__init__)."""
+    index = _module_index(root, "safeops")
+    todo = [m for m in index if any(m == r or m.startswith(r + ".") for r in READ_PATH)]
+    for r in READ_PATH:
+        parts = r.split(".")
+        todo += [".".join(parts[:i]) for i in range(1, len(parts))]
+    seen: set[str] = set()
+    while todo:
+        mod = todo.pop()
+        if mod in seen:
+            continue
+        seen.add(mod)
+        if mod in index:
+            todo.extend(_imports(mod, index[mod], "safeops") - seen)
+    return seen
+
+
+def test_the_read_path_reaches_neither_the_cluster_nor_any_tool() -> None:
+    reach = read_path_reach(REPO_ROOT)
+    assert {
+        "safeops.agent.parser",
+        "safeops.features.extractor",
+        "safeops.features.evidence",
+        "safeops.features.blast",
+        "safeops.features.conflict",
+        "safeops.features.policy",
+        "safeops.gate.always_act",
+        "safeops.gate.protocol",
+        "safeops.gate.shadow",
+        "safeops.policy",
+        "safeops.actions",
+        "safeops.topology",
+    } <= reach  # the traversal really walks the read path
+    assert not _leaks(reach, NO_CLUSTER), sorted(_leaks(reach, NO_CLUSTER))
+
+
+def _read_path_tree(tmp_path: Path, files: dict[str, str]) -> Path:
+    """A miniature package whose safeops.tools initializes the kubectl-backed tools, as the
+    real one does: tools/__init__ -> tools.kube -> tools.reader -> safeops.cluster."""
+    base = {
+        "cluster.py": "class Kubectl: ...\n",
+        "tools/__init__.py": "from safeops.tools.kube import get_deployment\n",
+        "tools/kube.py": "from safeops.tools.reader import read\ndef get_deployment(): ...\n",
+        "tools/reader.py": "from safeops.cluster import Kubectl\ndef read(): ...\n",
+        "tools/contracts.py": "class DeploymentData: ...\n",
+        "tools/canonical.py": "def result_digest(x): ...\n",
+        "policy.py": "import hashlib\n",
+        "agent/parser.py": "import json\n",
+        "gate/shadow.py": "import hashlib\n",
+        "features/extractor.py": "from safeops.features import helper\n",
+        "features/helper.py": "X = 1\n",
+    }
+    base.update(files)
+    return _fake_tree(tmp_path, base)
+
+
+def test_the_clean_miniature_read_path_passes(tmp_path: Path) -> None:
+    root = _read_path_tree(tmp_path, {})
+    assert not _leaks(read_path_reach(root), NO_CLUSTER)
+
+
+@pytest.mark.parametrize(
+    ("where", "source", "leak"),
+    [
+        ("features/helper.py", "from safeops.cluster import Kubectl\n", "safeops.cluster"),
+        (
+            "features/helper.py",
+            "from safeops.tools.contracts import DeploymentData\n",
+            "safeops.tools",
+        ),
+        ("features/helper.py", "import safeops.tools.canonical\n", "safeops.tools"),
+        ("features/helper.py", "def f():\n    from ..tools import canonical\n", "safeops.tools"),
+        ("gate/shadow.py", "from safeops.tools.canonical import result_digest\n", "safeops.tools"),
+        ("policy.py", "import safeops.cluster\n", "safeops.cluster"),
+        ("agent/parser.py", "from safeops.tools import contracts\n", "safeops.tools"),
+    ],
+    ids=[
+        "cluster",
+        "tools-contracts",
+        "tools-canonical",
+        "relative-lazy",
+        "gate",
+        "policy",
+        "parser",
+    ],
+)
+def test_the_read_path_check_catches_each_reach(tmp_path: Path, where, source, leak) -> None:
+    root = _read_path_tree(tmp_path, {where: source})
+    leaked = _leaks(read_path_reach(root), NO_CLUSTER)
+    assert leak in leaked
+    if leak == "safeops.tools":  # and, through the package's own __init__, the client
+        assert "safeops.cluster" in leaked

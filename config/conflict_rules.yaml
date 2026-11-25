@@ -1,0 +1,17 @@
+# Telemetry-conflict rules (design §11.5, Rule 19; decision 0025 D§7.2).
+#
+# pre-v1: the provisional rule set is empty, so telemetry_conflict is 0 for every run. That
+# is definitional, not evidence that the feature is useless; Milestone 12 decides the rules.
+# The loader and evaluator are real (safeops/policy.py, safeops/features/conflict.py). A
+# rule has exactly:
+#   id:       a lowercase name, unique in the file
+#   tool:     get_deployment | get_rollout_history | get_configmap | get_service
+#   field:    one top-level scalar field of that tool's structured result (closed table)
+#   operator: eq | ne | lt | le | gt | ge   (ordering operators on integer fields only)
+#   value:    a literal of the field's type (an integer, not a boolean, for integer fields)
+# It fires when the latest successful observation of that tool for the action's target
+# (namespace = the alert's, name = the target's) has the field and the comparison holds.
+# telemetry_conflict is 1 if any rule fires.
+
+status: pre-v1
+rules: []
