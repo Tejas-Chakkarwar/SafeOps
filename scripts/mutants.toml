@@ -1838,3 +1838,17 @@ old = '''
 new = '''
             return None
         return None'''
+
+[[mutant]]
+id = "M8A1-R6"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/experiment/runner.py"
+guard = "the count guard applies only to real AgentOutput envelopes; doubles reach their parser"
+kills = [
+    "tests/test_m5_records.py::test_review_a_crash_at_every_post_agent_stage_writes_a_valid_record[harm]",
+    "tests/test_m5_fixlist.py::test_each_parser_status_then_a_later_failure_writes_a_valid_record[no_action]",
+]
+old = '''
+            if isinstance(raw_output, AgentOutput) and raw_output.trajectory_steps != len('''
+new = '''
+            if raw_output.trajectory_steps != len('''

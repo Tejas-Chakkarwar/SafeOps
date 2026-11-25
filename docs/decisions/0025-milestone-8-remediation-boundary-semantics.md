@@ -1145,3 +1145,11 @@ This records the implementation choices D§3 and D§4 delegated to M8A. Nothing 
 **Carried to M8A-2** (D§15, unchanged; recorded so they aren't lost):
 1. A static test refusing `importlib`, `__import__`, `exec` and `eval` across the complete protected read-path runtime.
 2. A direct import or static assertion that the parser, the extractor, the gate runtime and the shadow scorer never import or reach Kubernetes client machinery. `safeops.cluster` is in the protected set, not the forbidden set, so the ordinary information-wall test alone doesn't prevent protected code from reaching `Kubectl`. A constructor-signature test is not a substitute.
+
+**Review fix: the count guard's envelope carve-out is pinned (`M8A1-R6`).**
+- **What was unpinned.** `M8A1-R3` pins that the guard exists, and `M8A1-R4` pins its placement at stage `parse`. Neither pinned its scope: the check applies only when `isinstance(raw_output, AgentOutput)`.
+- **The mutant.** `M8A1-R6` drops that condition, so the guard runs unconditionally. It then dereferences `trajectory_steps` on a legacy recording double's plain-string output, which production deliberately passes through to the double's fixed parser. The run becomes an `infrastructure_failure` discard at `parse`, where it should have reached its fixed parser.
+- **The kill.** Two existing legacy tests, with no new test needed, fail on record assertions (not a bare `AttributeError`):
+  - `tests/test_m5_records.py::test_review_a_crash_at_every_post_agent_stage_writes_a_valid_record[harm]` finds the discard stage `parse` instead of `harm`;
+  - `tests/test_m5_fixlist.py::test_each_parser_status_then_a_later_failure_writes_a_valid_record[no_action]` finds `proposal_status` null instead of `no_action`, because the fixed parser never ran.
+- **Result:** killed, 0 survived, 0 harness errors. The M8A-1 family is now 16 mutants, and the table holds 124.
