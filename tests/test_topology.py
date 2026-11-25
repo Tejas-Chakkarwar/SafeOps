@@ -385,3 +385,72 @@ def test_valid_shapes_still_load(tmp_path) -> None:
     assert dict(off.resources["orders-config"].approved_keys["log_level"]) == {
         "enum": ("debug", "info", "warn", "error")
     }
+
+
+# --- optional mappings: absent, present mapping, present non-mapping (strict-loader fix) ---------
+
+import yaml  # noqa: E402
+
+FALSY_WRONG_TYPES = [[], None, False, 0, ""]
+
+
+def _doc() -> dict:
+    return yaml.safe_load(COMMITTED)
+
+
+def _set(field: str, value) -> dict:
+    data = _doc()
+    if field == "approved_keys":
+        data["resources"]["orders-config"]["approved_keys"] = value  # a ConfigMap
+    else:
+        data[field] = value
+    return data
+
+
+@pytest.mark.parametrize("value", FALSY_WRONG_TYPES, ids=repr)
+@pytest.mark.parametrize("field", ["services", "resources", "approved_keys"])
+def test_a_present_falsy_non_mapping_is_not_an_omitted_field(field, value) -> None:
+    """[] / null / false / 0 / "" are malformed values, never a stand-in for absence."""
+    with pytest.raises(TopologyError, match=f"{field}: expected a mapping"):
+        parse_topology(_set(field, value))
+
+
+def test_resources_as_a_list_fails_the_topology_file(tmp_path) -> None:
+    text = COMMITTED[: COMMITTED.index("resources:")] + "resources: []\n"
+    with pytest.raises(TopologyError, match="topology.yaml: resources: expected a mapping"):
+        load_topology_condition(_write(tmp_path, text))
+
+
+def test_an_explicit_empty_mapping_is_a_mapping() -> None:
+    """Present and a mapping parses as one, even empty: the fix tells a mapping from a
+    malformed value by type, not truthiness (the falsy cases above are refused, {} isn't)."""
+    no_resources = parse_topology(_set("resources", {}))
+    assert set(no_resources.services) == set(TOPO.services) and dict(no_resources.resources) == {}
+    nothing = parse_topology({"services": {}, "resources": {}})
+    assert nothing.services == () and dict(nothing.resources) == {}
+    keyless = parse_topology(_set("approved_keys", {}))
+    assert dict(keyless.resources["orders-config"].approved_keys) == {}
+    assert keyless.resources["orders-config"].kind == "ConfigMap"
+
+
+def test_an_omitted_field_keeps_its_existing_default() -> None:
+    empty = parse_topology({})
+    assert empty.services == () and dict(empty.resources) == {}
+    data = _doc()
+    del data["resources"]
+    assert dict(parse_topology(data).resources) == {}
+    data = _doc()
+    del data["resources"]["orders-config"]["approved_keys"]
+    assert dict(parse_topology(data).resources["orders-config"].approved_keys) == {}
+
+
+def test_an_empty_approved_keys_on_a_non_configmap_is_still_accepted() -> None:
+    """Preserved, deliberately: only non-empty approved_keys are ConfigMap-only (decision
+    0025 D§11.1 E3 asks a ConfigMap target for non-empty keys; nothing forbids an empty
+    mapping elsewhere)."""
+    data = _doc()
+    data["resources"]["gateway"]["approved_keys"] = {}
+    assert dict(parse_topology(data).resources["gateway"].approved_keys) == {}
+    data["resources"]["gateway"]["approved_keys"] = {"k": {"enum": ["a"]}}
+    with pytest.raises(TopologyError, match="approved_keys only apply to ConfigMaps"):
+        parse_topology(data)

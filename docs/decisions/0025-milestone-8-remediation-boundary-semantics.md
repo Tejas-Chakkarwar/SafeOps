@@ -1427,3 +1427,38 @@ This corrects the M8A-2 review-fix entry above. That entry said the topology beh
 All six were killed in a scratch copy of the candidate, with 0 survived and 0 harness errors. The table holds 178. The full mutation results on the committed tree are in the commit report. Duplicate-key refusal is the shared loader site already pinned by `M8A2-L2`; the topology duplicate case is a focused test.
 
 **Unchanged:** the dynamic-import-obfuscation limitation recorded above; the stored-form extraction and the `PolicyError` CLI mapping from `bb6d0aa`; schema version 2 and `RECORD_FIELDS`; the executor and everything else that is M8B's.
+
+## Amendment, 2026-11-25: Milestone 8A-2 strict-loader fix (optional topology mappings)
+
+**The defect.** A final strict-loader review found that `services`, `resources` and `approved_keys` used a truthiness fallback (`value or {}`) before the mapping check. A present value that is falsy and the wrong type (`[]`, `null`, `false`, `0`, `""`) therefore passed for an omitted field. All 15 combinations were accepted at `760348b`.
+
+**Why `resources` mattered most.** For `resources`, this was a silent Milestone 8 correctness failure in a single run:
+- `resources: []` loaded as a topology with its services and no resources at all;
+- feature extraction carried on, with every target unresolvable and fail-closed. A fully observed `restart_deployment(orders)` scored `blast_radius` 1.0 and `scope_outside_target` 1.0, instead of 0.3 and 0.0;
+- the record's `topology_hash` truthfully named the malformed bytes. The configuration should have been refused instead.
+
+**The fix: three states, in one helper.** `safeops.topology._optional_mapping(parent, key, where)` now handles `services`, `resources` and `approved_keys`, the only three truthiness mapping defaults in the module:
+
+| State | Result |
+|---|---|
+| field absent | the existing empty default |
+| present and a mapping, `{}` included | parsed normally |
+| present and not a mapping | `TopologyError` |
+
+**`approved_keys: {}` on a non-ConfigMap is deliberately preserved.**
+- The guard stays `if approved and kind != "ConfigMap"`: only non-empty `approved_keys` are ConfigMap-only.
+- D§11.1 E3 requires a ConfigMap target to have non-empty `approved_keys`. Nothing in this decision or the topology format forbids an empty mapping on another kind, which declares no keys.
+- This pass fixes mapping type validation only.
+
+**Tests:**
+- `tests/test_topology.py`:
+  - the 15-case falsy-wrong-type matrix;
+  - `resources: []` refused at the file level;
+  - explicit `{}` accepted for all three;
+  - omission keeps its default;
+  - an empty `approved_keys` on a Deployment still accepted.
+- `tests/test_m8_integration.py::test_malformed_resources_stop_the_run_before_any_extraction_or_record`: `build_runner()` raises `TopologyError`, and `safeops run` exits 2 with `topology configuration: …`, before any extraction or record.
+
+**Mutant:** `M8A2-T7`, the helper's `parent.get(key) or {}`. Its kills include the end-to-end `resources: []` test. It was killed in a scratch copy of the candidate (1 of 1, 0 harness errors); the table holds 179.
+
+**Unchanged:** the `760348b` topology-provenance architecture (`TopologyCondition`, the bound hash, the `ReadPathCheck` placement, runtime identity); every earlier strictness rule; `config/topology.yaml`; the topology-consumer audit carry-forward.

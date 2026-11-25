@@ -114,6 +114,16 @@ def _mapping(raw: object, where: str) -> dict:
     return raw
 
 
+def _optional_mapping(parent: dict, key: str, where: str) -> dict:
+    """An optional mapping field, in three states: absent is the empty default; present and
+    a mapping (`{}` included) is that mapping; present and anything else ([], null, false, 0,
+    "") is a TopologyError. Never `parent.get(key) or {}`: that lets a malformed value pass
+    for an omitted one (decision 0025, M8A-2 strict-loader amendment)."""
+    if key not in parent:
+        return {}
+    return _mapping(parent[key], where)
+
+
 def _flag(raw: dict, key: str, where: str) -> bool:
     """An optional boolean: absent is false; present must be a real YAML boolean. A quoted
     "false" or a 0/1 is refused, never read through truthiness."""
@@ -164,7 +174,7 @@ def parse_topology(data: object) -> ServiceTopology:
     TopologyError: bodies are checked as mappings before they're read, booleans are real
     booleans, and range endpoints are finite non-boolean numbers."""
     data = _mapping(data, "topology")
-    services = _mapping(data.get("services") or {}, "services")
+    services = _optional_mapping(data, "services", "services")
     depends_on: dict[str, tuple[str, ...]] = {}
     stateful: set[str] = set()
     for name, spec in services.items():
@@ -181,7 +191,7 @@ def parse_topology(data: object) -> ServiceTopology:
                 raise TopologyError(f"service {name} depends on unknown service {callee}")
 
     resources: dict[str, ResourceSpec] = {}
-    for name, raw in _mapping(data.get("resources") or {}, "resources").items():
+    for name, raw in _optional_mapping(data, "resources", "resources").items():
         raw = _mapping(raw, f"resource {name}")
         kind, owner = raw.get("kind"), raw.get("owner")
         if type(kind) is not str or kind not in PROJECTED_KINDS:
@@ -191,7 +201,9 @@ def parse_topology(data: object) -> ServiceTopology:
         bounds = {f: _bounds(raw[f], f"{name}.{f}") for f in RANGED_FIELDS if f in raw}
         if kind == "Deployment" and set(bounds) != set(RANGED_FIELDS):
             raise TopologyError(f"Deployment {name} needs bounds for {', '.join(RANGED_FIELDS)}")
-        approved = _mapping(raw.get("approved_keys") or {}, f"resource {name}.approved_keys")
+        approved = _optional_mapping(raw, "approved_keys", f"resource {name}.approved_keys")
+        # Unchanged: only non-empty approved_keys are ConfigMap-only; an explicit `{}` on
+        # another kind declares no keys and stays accepted (M8A-2 strict-loader amendment).
         if approved and kind != "ConfigMap":
             raise TopologyError(f"resource {name}: approved_keys only apply to ConfigMaps")
         for key, rule in approved.items():

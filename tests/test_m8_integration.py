@@ -749,3 +749,33 @@ def test_a_broken_topology_is_a_topology_error_not_a_policy_error(tmp_path, monk
     assert "topology configuration: topology.yaml" in result.stderr
     assert "policy configuration" not in result.stderr
     assert "Traceback" not in result.output + result.stderr
+
+
+def test_malformed_resources_stop_the_run_before_any_extraction_or_record(
+    tmp_path, monkeypatch
+) -> None:
+    """`resources: []` once loaded as no resources at all, and a run went on to score every
+    target unresolvable (blast_radius 1.0, scope_outside_target 1.0) in a valid-looking
+    record. Now the topology load itself refuses it, while the runner is built."""
+    from typer.testing import CliRunner
+
+    import safeops.topology
+    from safeops import cli
+    from safeops.topology import TopologyError
+
+    text = TOPOLOGY_PATH.read_text()
+    bad = tmp_path / "topology.yaml"
+    bad.write_text(text[: text.index("resources:")] + "resources: []\n")
+    monkeypatch.setattr(safeops.topology, "TOPOLOGY_PATH", bad)
+    with pytest.raises(TopologyError, match="resources: expected a mapping"):
+        runner_module.build_runner()
+
+    reached: list[str] = []
+    monkeypatch.setattr(RiskFeatureExtractor, "extract", lambda *a, **k: reached.append("extract"))
+    monkeypatch.setattr(RunRecordWriter, "finalize", lambda *a, **k: reached.append("finalize"))
+    result = CliRunner().invoke(
+        cli.app, ["run", "--fault", "bad-deployment-config", "--seed", "0", "--trial", "0"]
+    )
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "topology configuration: topology.yaml: resources: expected a mapping" in result.stderr
+    assert reached == []  # never extracted, never recorded

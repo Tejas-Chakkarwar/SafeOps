@@ -2613,3 +2613,21 @@ old = '''
             if runtime_context.topology is not self.condition.topology:'''
 new = '''
             if runtime_context.topology != self.condition.topology:'''
+
+[[mutant]]
+id = "M8A2-T7"
+source = "0025 M8A-2 read path"
+target = "safeops/topology.py"
+guard = "a present falsy non-mapping (resources: [], ...) is a TopologyError, never an omitted field"
+kills = [
+    "tests/test_m8_integration.py::test_malformed_resources_stop_the_run_before_any_extraction_or_record",
+    "tests/test_topology.py::test_resources_as_a_list_fails_the_topology_file",
+    "tests/test_topology.py::test_a_present_falsy_non_mapping_is_not_an_omitted_field[approved_keys-[]]",
+    "tests/test_topology.py::test_a_present_falsy_non_mapping_is_not_an_omitted_field[services-None]",
+]
+old = '''
+    if key not in parent:
+        return {}
+    return _mapping(parent[key], where)'''
+new = '''
+    return _mapping(parent.get(key) or {}, where)'''
