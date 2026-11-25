@@ -31,12 +31,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from safeops.domain import MAX_DISCARD_ERROR  # bounds the error text kept in a discard reason
 from safeops.enums import RunStage
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RUNS_DIR = REPO_ROOT / "data" / "runs"
 MAX_LAST_CHANGES = 50  # bound the settledness diff kept in a record
-MAX_DISCARD_ERROR = 2000  # bound the error text kept in a discard reason
 
 
 class RecordWriteError(Exception):

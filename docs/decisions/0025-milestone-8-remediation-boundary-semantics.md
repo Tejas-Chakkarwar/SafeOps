@@ -1462,3 +1462,188 @@ All six were killed in a scratch copy of the candidate, with 0 survived and 0 ha
 **Mutant:** `M8A2-T7`, the helper's `parent.get(key) or {}`. Its kills include the end-to-end `resources: []` test. It was killed in a scratch copy of the candidate (1 of 1, 0 harness errors); the table holds 179.
 
 **Unchanged:** the `760348b` topology-provenance architecture (`TopologyCondition`, the bound hash, the `ReadPathCheck` placement, runtime identity); every earlier strictness rule; `config/topology.yaml`; the topology-consumer audit carry-forward.
+
+## Amendment, 2026-11-25: Milestone 8B-1 implementation (the offline executor semantic core)
+
+This records the choices D§10–D§13 and D§15–D§16 left to M8B, for the part M8B-1 implements. Nothing above is changed except the one tightening named under **Schema**, and the M8A amendments' semantics are untouched.
+
+**The split.** M8B is delivered in two parts:
+- **M8B-1 (this amendment): the offline semantic core.** Given a structurally valid action, the loaded action semantics, the bound topology, the configured namespace, reader observations and semantic write outcomes: what is permitted, what is written, and what `ExecutionResult` follows.
+- **M8B-2 (not started): the concrete Kubernetes, security and audit boundary.** The `safeops-executor` ServiceAccount, its client phase, bootstrap token and `config/cluster.yaml` credential paths; the patch-only Role (D§14); the real writer adapter and the executor's `safeops-reader` adapter; the durable append-only audit trail (D§11.8); live writes, live reconciliation, the live 422 reproducer (D§12), the patch-only and update/delete-denial proofs (D§14), and live cleanup, reset and verify.
+
+M8B-2 supplies concrete transports to the same constructor. `ActionExecutor.apply(action)` keeps its signature.
+
+**Where things live:**
+
+| Item | Module |
+|---|---|
+| `ActionExecutor`, the envelope, the six planners, postconditions, `ExecutorConfigurationError` | `safeops/executor/executor.py` |
+| `ExecutionResult`, `ExecutionStepResult` (neutral, frozen, `to_record()`) | `safeops/executor/result.py` |
+| `PreparedWrite`, `Postcondition`, `PatchType`, `WriteClass`/`WriteReply`, `ReadOutcome`/`ReadReply`, the `WriterTransport` and `ReaderTransport` protocols | `safeops/executor/transport.py` |
+| Exact CPU and memory quantities | `safeops/executor/quantity.py` |
+| The transitional `UnwiredWriter` and `UnwiredReader` | `safeops/executor/unwired.py` |
+| `ExecutionInfrastructureFailure` and `_executed_action` | `safeops/experiment/runner.py` |
+| `MAX_DISCARD_ERROR` (2000), the one definition | `safeops/domain.py` (moved from `safeops/experiment/records.py`; records, schema and the executor import it) |
+
+**Constructor.** `ActionExecutor(*, semantics, topology, namespace, reader, writer, clock, sleep)`, all type-checked. `build_runner()` passes `policy.action_semantics` (the bundle the extractor and shadow scorer share), `condition.topology` (the bound `TopologyCondition`), and `load_cluster_config().namespace`, which is a file parse with no Kubernetes call. The executor reads no configuration file itself.
+
+**Structural re-validation, before E1.** `apply()` first requires a `RecommendedAction` (else `TypeError`). It then applies `safeops.actions.target_problem(action.target.model_dump())` and `params_problem(action.type, action.params)`, the same contract and call pattern as the parser and extractor, with no second validator. A structurally invalid action raises `ValueError("apply takes a structurally valid action: …")`: a harness or programmer error, never `refused_by_envelope`, `rejected_invalid_action` or `infrastructure_failure`. It is raised before E1–E3, before any reader call, before any request is built and before preflight. Tests pin this even for an action that would also fail E1, E2, E3 or a hard range.
+
+**The common envelope, then the per-action envelope.**
+- **E1 → E2 → E3**, as D§11.1; the first failure's bounded reason (`"E1: …"`, `"E2: …"`, `"E3: …"`) is `execution.error`, with `steps = []` and no read or write. E1 compares against the loaded `ActionSemantics[type].target_kind`. E2 compares against the injected namespace, never a literal. E3 is `topology.resource(kind, name)`, plus non-empty `approved_keys` for a ConfigMap.
+- **Scale:** `replicas` within `bounds["replicas"].hard` (0–20).
+- **ConfigMap:** every key in `approved_keys`. An `enum` key needs a string in its enum. A numeric key needs a JSON number (`int` or finite `float`; a numeric string is refused) within `hard_range`. Keys are checked in params order, and one failing key refuses the whole action.
+- **The owner Deployment** is resolved after the key checks and before any request is built: the topology resources of kind Deployment whose owner is the ConfigMap's owner. Anything but exactly one raises `ExecutorConfigurationError` (a `ValueError`); it never picks the first.
+- **Resources:** each given request and limit field against its dimension's hard range, independently, in a fixed order. Then, and only then, the container read. No request ≤ limit rule, no safe range.
+- **Never consulted:** safe ranges, harm rules, incident scope, health, probes, selector sanity, minimum safe replicas.
+
+**Pre-write reads** (rollback history, the resources container check). Same bound as reconciliation (below). A reader exception before any write propagates (nothing was sent).
+
+| Read result | Rollback | Resources |
+|---|---|---|
+| unavailable after 3 attempts | `INFRASTRUCTURE_FAILURE`, `[]` | `INFRASTRUCTURE_FAILURE`, `[]` |
+| Deployment absent | `REFUSED_BY_ENVELOPE` (no history) | `REFUSED_BY_ENVELOPE` (no container) |
+| object read but unusable (no uid, no container list, no `items`, no template) | `INFRASTRUCTURE_FAILURE`, `[]` (can't establish) | `INFRASTRUCTURE_FAILURE`, `[]` |
+| revision / container not present | `REFUSED_BY_ENVELOPE`, `[]` | `REFUSED_BY_ENVELOPE`, `[]` |
+| two or more ReplicaSets claim the revision | `INFRASTRUCTURE_FAILURE`, `[]` (ambiguous history; never the first) | — |
+
+- **Revision R exists** iff a listed ReplicaSet has an `ownerReferences` entry with `controller: true`, `kind: Deployment`, the target's name **and the read Deployment's `metadata.uid`**, and its `deployment.kubernetes.io/revision` annotation equals `str(R)`. The uid binding is an M8B-1 choice: it keeps a ReplicaSet left behind by an earlier Deployment of the same name out of the history. The current revision is permitted.
+- An absent Deployment is a refusal rather than an infrastructure failure, because the reader succeeded and proved that the envelope precondition fails.
+
+**Requests.** Every request is a frozen `PreparedWrite`: operation, kind, namespace, name, patch type, the canonical-JSON body, and a postcondition. It holds no fault, harm, safe-range, gate or diagnosis data.
+
+| Action | Patch type | Body |
+|---|---|---|
+| rollback | JSON | `[{"op": "replace", "path": "/spec/template", "value": <template>}]`: a deep copy of the chosen ReplicaSet's `spec.template` minus only `metadata.labels["pod-template-hash"]`; the object as read is never changed |
+| restart | merge | `{"spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": <ts>}}}}}` |
+| scale | merge | `{"spec": {"replicas": n}}` (the Deployment, never `/scale`) |
+| ConfigMap step 1 | merge | `{"data": {k: rendered}}`: string as is, integer `str(i)`, float `repr(f)`; unlisted keys untouched |
+| ConfigMap step 2 | merge | restart of the owner's one Deployment, exactly as restart |
+| service | JSON | `[{"op": "replace", "path": "/spec/selector", "value": <selector>}]`: exact replacement, so no stale key survives |
+| resources | strategic | `{"spec": {"template": {"spec": {"containers": [{"name": c, "resources": {...}}]}}}}` with only the given fields, rendered `<n>m` and `<n>Mi` |
+
+- **Restart values** come from the injected clock, which must return an aware `datetime`; a naive reading is a harness error before any write. The value is UTC, formatted `%Y-%m-%dT%H:%M:%S.%fZ`. A repeated or earlier reading advances the executor's last value by one microsecond, so no two restarts share a value. There is no randomness.
+- **The composite's restart value is generated while planning**, before step 1 is sent, and its postcondition expects that same value.
+- **The planned operations must equal the loaded semantics' `steps`**; otherwise `ExecutorConfigurationError` is raised, before preflight.
+
+**Preflight.** After the envelope and the required reads, every request is built and passed to `writer.preflight(requests)` once, the composite's two together, before the first write. A preflight raise propagates: no `ExecutionResult`, and nothing written. The runner records `action_attempted: true`, `execution: null`, and a discard at `execute` (D§11.3). M8B-2's writer enforces phase, verb, namespace, request shape and credentials there.
+
+**The semantic write-reply seam.** `writer.write(request)` returns a `WriteReply(semantic_class, returned_object, diagnostic)`:
+- `returned_object` is detached JSON;
+- `diagnostic` is cut to `MAX_DISCARD_ERROR`.
+
+The classes are closed:
+
+| `WriteClass` | Meaning | Executor |
+|---|---|---|
+| `SUCCESS` | the adapter believes the request completed | confirmed only if the returned object satisfies the postcondition; otherwise ambiguous, and reconciled |
+| `INVALID_ACTION` | Kubernetes' semantic 422 Invalid | `failed` → `REJECTED_INVALID_ACTION` |
+| `DEFINITE_FAILURE` | 400, 401, 403, 404, 409, 429 and other definite non-success | `failed` → `INFRASTRUCTURE_FAILURE` |
+| `NOT_ATTEMPTED` | never sent (credential detected expired, audit-before failure) | no step → `INFRASTRUCTURE_FAILURE`; `skipped` at composite step 2 |
+| `AMBIGUOUS` | may have applied: timeout, connection lost after send, 5xx, unparseable | reconciled |
+
+- **Raw kubectl or API parsing belongs to the M8B-2 adapter.** The executor core parses no stdout, stderr or status text, and imports neither `safeops.cluster` nor `safeops.tools`.
+- **After a possible send, nothing raises.** A writer exception (other than an interrupt), or a return value that isn't a `WriteReply`, is treated as `AMBIGUOUS` and reconciled.
+- The reader returns `ReadReply(outcome, obj, diagnostic)` with `FOUND`, `ABSENT` or `UNAVAILABLE`, and the executor owns its interpretation.
+
+**Reconciliation and read bounds.**
+- **Bounds:** `READ_ATTEMPTS = 3`, `READ_TIMEOUT_S = 10` (passed to the reader on every attempt) and `READ_RETRY_SLEEP_S = 2`, using the injected sleep, between unavailable attempts only. The first `FOUND` or `ABSENT` decides. There is no fourth read and no write retry.
+- **Reconciliation outcomes:** `FOUND` with the postcondition is confirmed; `FOUND` without it, or `ABSENT`, is absent; three unavailable attempts is unavailable, and the step's error says "unresolved".
+- **Reader exceptions after a write** count as unavailable attempts.
+
+**Postconditions** (D§11.6), each total (malformed data means "not shown", never a crash):
+
+| Action | Postcondition |
+|---|---|
+| scale | `spec.replicas` is that integer |
+| restart, and step 2 | the annotation equals the generated value |
+| ConfigMap | every patched key equals its rendered string |
+| service | `spec.selector` equals the requested map exactly |
+| resources | the one container of that name has every written field equal by exact quantity |
+| rollback | see below |
+
+**Rollback: the provisional B1 contract.**
+- The rollback postcondition is the frozen comparison: canonical JSON (sorted keys, no whitespace) of `Deployment.spec.template` equals the chosen ReplicaSet's template minus `pod-template-hash`. It is pinned by `test_provisional_rollback_template_equality_is_exact` and mutant `M8B1-O7`.
+- **Rollback template equality is the provisional offline B1 contract.** M8B-2 must verify it against real Kubernetes server defaulting. If live API canonicalization or defaulting means the frozen comparison can't truthfully establish the postcondition, M8B-2 must **stop** and amend this decision before narrowing it.
+- A reviewed B2 amendment to this one comparison is planned, and must not be treated as an unexplained regression of B1.
+- No other M8B-1 semantics are provisional.
+
+**Quantity contract** (`safeops/executor/quantity.py`, exact `Fraction` arithmetic):
+- **CPU:** bare decimal cores (`[0-9]+(.[0-9]+)?`, ×1000) and integer millicores (`[0-9]+m`) only.
+- **Memory:** a bare or decimal number of bytes, optionally with a binary suffix `Ki Mi Gi Ti Pi Ei` (2^10 … 2^60) or a decimal suffix `k M G T P E` (10^3 … 10^18). A decimal suffix is never read as binary: **`1G != 1Gi` (10^9 vs 2^30 bytes) and `1M != 1Mi` (10^6 vs 2^20)**. `1024Mi == 1Gi`, `2048Mi == 2Gi` and `1073741824 == 1Gi`.
+- **Anything else** (an exponent, a sign, a memory suffix on CPU, `m` on memory, a fractional millicore, a non-string) returns `None`: the postcondition is not established, which means reconciliation. Nothing crashes.
+- M8B-2 must inspect the CPU and memory forms the real API server returns for these workloads, and expand or amend this contract if it returns another form.
+
+**Producer shapes.** `ExecutionResult` and `ExecutionStepResult` refuse construction outside D§11.5:
+
+| Status | Shape |
+|---|---|
+| `applied` | every step `applied`; errors null |
+| `partially_applied` | exactly `[patch_configmap applied, restart_deployment failed\|skipped]`; bounded error |
+| `refused_by_envelope` | `[]`; bounded reason |
+| `rejected_invalid_action` | exactly the attempted step, `failed` (the composite's first write: `[patch_configmap failed]`, restart omitted) |
+| `infrastructure_failure` | `[]` or exactly one `failed` step |
+
+- **Step error text:** only on `failed` steps, non-empty, at most 2000 characters. Every error the producer composes is cut to that bound.
+- **Precedence:** an earlier applied step dominates, so any later failure is `partially_applied`. A never-sent step 2 is `skipped`; an attempted, unconfirmed one is `failed`. Steps are never manufactured.
+
+**`_executed_action`** (D§13):
+- `applied` and `partially_applied` return the action;
+- `refused_by_envelope` and `rejected_invalid_action` return `None`;
+- `infrastructure_failure` raises `ExecutionInfrastructureFailure`, a plain `Exception`. `_cause` maps it, through its unchanged default, to `infrastructure_failure` at stage `executed_action`, with the execution retained and no stabilization, effectiveness or harm.
+- Anything but an `ExecutionResult` is a `TypeError`. No discard cause was added.
+
+**Schema (version 2, `RECORD_FIELDS` unchanged).**
+- **Bounds:** `Execution.error` and `ExecutionStep.error` are bounded at `MAX_DISCARD_ERROR`.
+- **New rules in `_evidence_problems`:**
+  - `rejected_invalid_action` has no applied step;
+  - `infrastructure_failure` has no applied step;
+  - a `failed` step needs a non-empty error, and an `applied` or `skipped` step carries none.
+- **The infrastructure-failure rule** now also requires the discard stage `executed_action`. It applies only to records whose `execution.status` is `infrastructure_failure`; a `partially_applied` execution discarded later is unaffected.
+- **Accepted infrastructure shapes,** pinned in `tests/test_m5_crossfield.py`: `[]`, `[<step> failed]`, `[patch_configmap failed]`.
+- **Not added:** refused `== []`, skipped composite steps, prefix rules.
+- **One tightening of D§11.5.** D§11.5 noted that the schema *permits* error text on an applied step, though the producer declines it. The step-error rule now refuses that form. No finalized record has an execution, since the executor never ran before M8B-1, so no record is invalidated.
+
+**Information wall.**
+- `safeops.executor` (and `safeops.stubs`, which its unwired transports use) joins `PROTECTED`. It is checked transitively against the forbidden roots, and by the dynamic-import ban.
+- A negative probe (`executor → safeops.experiment.schema`, relative-lazy and `faults` forms) is caught.
+- The M8A no-cluster read-path roots are unchanged; the executor isn't one, because its M8B-2 adapters will reach the guarded client.
+
+**Transitional production wiring.**
+- `build_runner()` builds the real `ActionExecutor` with `UnwiredWriter` and `UnwiredReader`. They hold no credential or client, and each method is a Milestone 8 `@stub`.
+- Any production run that reaches the executor therefore raises `NotImplementedStage` before anything is sent: `UnwiredWriter.preflight` for restart, scale, ConfigMap and service, and `UnwiredReader.get` for rollback and resources. That is recorded as a `not_implemented` discard at `execute`.
+- No Kubernetes mutation is possible, no admin identity is reused, and no `safeops-executor` identity is invented.
+- `ActionExecutor.apply` and `_executed_action` are no longer stubs. `Agent.investigate` remains the first stub in run order.
+
+**Tests:**
+- `tests/test_m8_executor.py`, over the offline fakes in `tests/m8_executor_fakes.py` (a cluster that applies merge, JSON-replace and strategic-by-name patches; a scripted semantic writer; a reader with scripted unavailability):
+  - the structural matrix and its ordering;
+  - E1–E3 and first-failure;
+  - every per-action rule;
+  - the six literal requests;
+  - preflight-before-write;
+  - the single-step and composite classification matrices;
+  - read counts and sleeps;
+  - quantities;
+  - result invariants;
+  - an acceptance test reaching all five `ExecutionStatus` values through the real `apply()`.
+- `tests/test_m8_integration.py`: the five routes through the real runner; the shared policy, topology and namespace; the transitional stubs.
+- `tests/test_m5_crossfield.py` and `tests/test_m5_fixlist.py`: the schema rules and accepted shapes.
+- `tests/test_information_wall.py`: executor protection.
+
+**Mutants:** 60, source "0025 M8B-1 offline executor":
+
+| Family | Mutants | What they pin |
+|---|---|---|
+| `M8B1-S1` | 1 | structural validation skipped |
+| `M8B1-E1`–`E16` | 16 | E1, E2, E3, ConfigMap approved keys, safe-for-hard and hard-maximum for scale, ConfigMap enum and hard bound, safe-for-hard ConfigMap, resource hard and safe bounds, the read-before-ranges order, the missing container accepted or rejected, reader failure as refusal, reader failure continuing |
+| `M8B1-O1`–`O16` | 16 | rollback controller, uid, revision annotation, hash label and copy; duplicate revisions; **`O7` (PROVISIONAL, pending the M8B-2 live server-defaulting proof)**; owner first-of-many; restart uniqueness; integer and float rendering; service merge; CPU and memory units; preflight skipped or partial |
+| `M8B1-Q1`–`Q3` | 3 | a decimal suffix aliased to binary; bare cores not ×1000; a quantity compared as text |
+| `M8B1-W1`–`W7` | 7 | 422 as infrastructure; definite as rejected; ambiguous not reconciled; success trusted without its postcondition; not-attempted given a step; step 2 not-attempted as failed; earlier-applied precedence |
+| `M8B1-C1`–`C8` | 8 | confirmed as failure; absent as applied; unavailable as applied; four attempts; no sleep; continuing after an absent read; the scale comparison inverted; stale selector keys allowed |
+| `M8B1-R1`–`R3` | 3 | infrastructure routed as `None`; partial as `None`; rejected as the action |
+| `M8B1-D1`–`D6` | 6 | infrastructure with an applied step; rejected with an applied step; the stage requirement; a failed step without error; an applied step with error; the error bound |
+
+- In a scratch copy of the candidate, all 60 were killed, with 0 survived and 0 harness errors, and every named kill test fails under its mutant. The table holds 239.
+
+**Unchanged:** the M8A read path (parser, features, gate, shadow scoring, policy, topology binding and its strict loader); `config/*.yaml`; `manifests/`; `safeops/bootstrap.py`; the design document. The Milestone 8 closure carry-forward stands: the cross-subsystem audit of independent `load_topology()` consumers (`environment/manager.py`, `faults/spec.py`, `tools/reader.py`, `environment/desired.py`, `bootstrap.py`). Milestone 8 is not closed: M8B-2 and that audit remain.

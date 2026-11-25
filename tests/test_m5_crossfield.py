@@ -432,7 +432,8 @@ def test_final_no_applied_step_after_an_unapplied_one(good) -> None:
 
 
 def test_final_record_bounds_match_the_writer(good, tmp_path) -> None:
-    from safeops.experiment.records import MAX_DISCARD_ERROR, MAX_LAST_CHANGES
+    from safeops.domain import MAX_DISCARD_ERROR
+    from safeops.experiment.records import MAX_LAST_CHANGES
 
     unsettled = _set(good, ("postfault_settledness", "settled"), False)
     _check(_set(unsettled, ("postfault_settledness", "last_changes"), ["c"] * MAX_LAST_CHANGES))
@@ -467,3 +468,155 @@ def test_final_cli_wording_does_not_deny_an_installed_record(monkeypatch) -> Non
     )
     assert result.exit_code == cli.EXIT_RECORD
     assert "not written" not in result.output and "is installed" in result.output
+
+
+# --- Milestone 8B-1 (decision 0025 D§16): execution rules, accepted shapes, bounds ----------
+
+
+def _infra(good: dict, steps, action=None, stage=RunStage.EXECUTED_ACTION) -> dict:
+    """An executor infrastructure_failure, discarded at `stage` before measurement."""
+    rec = _exec(good, "infrastructure_failure", steps, "the write was not confirmed", action)
+    for k in ("stabilization_timed_out", "postaction_snapshot_hash"):
+        rec = _set(rec, (k,), None)
+    return _as_discard(rec, stage, "infrastructure_failure")
+
+
+INFRA_ACCEPTED = {
+    "nothing-attempted": ([], None),
+    "single-step-unconfirmed": ([_step("rollback_deployment", "failed", "timeout")], None),
+    "composite-first-write-unconfirmed": (
+        [_step("patch_configmap", "failed", "timeout")],
+        PATCH_POOL,
+    ),
+}
+
+
+@pytest.mark.parametrize(("steps", "action"), INFRA_ACCEPTED.values(), ids=INFRA_ACCEPTED.keys())
+def test_the_infrastructure_failure_shapes_are_accepted(good, steps, action) -> None:
+    _check(_infra(good, steps, action))
+
+
+INFRA_REFUSED = {
+    "single-applied": ([_step("rollback_deployment", "applied")], None),
+    "composite-applied-then-failed": (
+        [_step("patch_configmap", "applied"), _step("restart_deployment", "failed", "x")],
+        PATCH_POOL,
+    ),
+}
+
+
+@pytest.mark.parametrize(("steps", "action"), INFRA_REFUSED.values(), ids=INFRA_REFUSED.keys())
+def test_an_infrastructure_failure_has_no_applied_step(good, steps, action) -> None:
+    with pytest.raises(RecordValidationError, match="infrastructure_failure can't have an applied"):
+        _check(_infra(good, steps, action))
+
+
+def test_an_executor_infrastructure_failure_is_discarded_at_executed_action(good) -> None:
+    for stage in (RunStage.EXECUTE, RunStage.STABILIZATION, RunStage.HARM):
+        with pytest.raises(RecordValidationError, match="discarded at stage executed_action"):
+            _check(_infra(good, [], stage=stage))
+
+
+def test_a_partial_execution_may_still_be_discarded_later(good) -> None:
+    """The stage rule applies only to execution.status infrastructure_failure (D§11.5)."""
+    steps = [_step("patch_configmap", "applied"), _step("restart_deployment", "failed", "x")]
+    rec = _exec(good, "partially_applied", steps, "x", PATCH_POOL)
+    _check(_as_discard(rec, RunStage.HARM, "infrastructure_failure"))
+
+
+REJECTED_REFUSED = {
+    "single-applied": ([_step("rollback_deployment", "applied")], None),
+    "composite-applied-then-failed": (
+        [_step("patch_configmap", "applied"), _step("restart_deployment", "failed", "422")],
+        PATCH_POOL,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("steps", "action"), REJECTED_REFUSED.values(), ids=REJECTED_REFUSED.keys()
+)
+def test_a_rejected_action_has_no_applied_step(good, steps, action) -> None:
+    with pytest.raises(
+        RecordValidationError, match="rejected_invalid_action can't have an applied"
+    ):
+        _check(_exec(good, "rejected_invalid_action", steps, "422", action))
+
+
+STEP_ERRORS = {
+    "applied-with-error": (
+        "applied",
+        [_step("rollback_deployment", "applied", "confirmed by read-back")],
+        None,
+        None,
+        "carries an error",
+    ),
+    "skipped-with-error": (
+        "partially_applied",
+        [_step("patch_configmap", "applied"), _step("restart_deployment", "skipped", "x")],
+        "x",
+        PATCH_POOL,
+        "carries an error",
+    ),
+    "failed-without-error": (
+        "rejected_invalid_action",
+        [_step("rollback_deployment", "failed")],
+        "422",
+        None,
+        "needs its error",
+    ),
+    "failed-with-empty-error": (
+        "rejected_invalid_action",
+        [_step("rollback_deployment", "failed", "")],
+        "422",
+        None,
+        "needs its error",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("status", "steps", "error", "action", "problem"), STEP_ERRORS.values(), ids=STEP_ERRORS.keys()
+)
+def test_only_a_failed_step_carries_error_text(good, status, steps, error, action, problem) -> None:
+    with pytest.raises(RecordValidationError, match=problem):
+        _check(_exec(good, status, steps, error, action))
+
+
+def test_execution_and_step_errors_are_bounded(good) -> None:
+    from safeops.domain import MAX_DISCARD_ERROR
+
+    longest, too_long = "x" * MAX_DISCARD_ERROR, "x" * (MAX_DISCARD_ERROR + 1)
+    _check(_exec(good, "refused_by_envelope", [], longest))
+    step = [_step("rollback_deployment", "failed", longest)]
+    _check(_exec(good, "rejected_invalid_action", step, longest))
+    with pytest.raises(RecordValidationError):
+        _check(_exec(good, "refused_by_envelope", [], too_long))
+    with pytest.raises(RecordValidationError):
+        _check(
+            _exec(
+                good,
+                "rejected_invalid_action",
+                [_step("rollback_deployment", "failed", too_long)],
+                "422",
+            )
+        )
+
+
+def test_the_error_bound_has_one_source_of_truth() -> None:
+    from pathlib import Path
+
+    import safeops.domain
+    import safeops.executor.result
+    import safeops.experiment.records
+    import safeops.experiment.schema
+
+    for module in (safeops.experiment.records, safeops.experiment.schema, safeops.executor.result):
+        assert module.MAX_DISCARD_ERROR is safeops.domain.MAX_DISCARD_ERROR
+    root = Path(safeops.domain.__file__).parent
+    definitions = [
+        p.relative_to(root).as_posix()
+        for p in root.rglob("*.py")
+        if "MAX_DISCARD_ERROR =" in p.read_text()
+    ]
+    assert definitions == ["domain.py"]

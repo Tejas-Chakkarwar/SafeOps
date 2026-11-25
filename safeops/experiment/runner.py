@@ -19,7 +19,7 @@ from safeops.agent.loop import Agent
 from safeops.agent.output import AgentOutput
 from safeops.agent.parser import ParsedProposal, ProposalParser
 from safeops.cluster import CommandError
-from safeops.enums import ProposalStatus, RunStage
+from safeops.enums import ExecutionStatus, ProposalStatus, RunStage
 from safeops.environment.manager import (
     MAX_RESET_ERROR,
     CleanStateResult,
@@ -34,6 +34,8 @@ from safeops.environment.workload import (
     check_steady_state,
 )
 from safeops.executor.executor import ActionExecutor
+from safeops.executor.result import ExecutionResult
+from safeops.executor.unwired import UnwiredReader, UnwiredWriter
 from safeops.experiment.consistency import ReadPathCheck
 from safeops.experiment.records import RECORD_FIELDS, Discard, ProvenanceSource, RunRecordWriter
 from safeops.experiment.unit import RunUnit
@@ -49,7 +51,7 @@ from safeops.features.policy import load_policy
 from safeops.gate.always_act import AlwaysActGate
 from safeops.gate.protocol import Gate, GateDecision
 from safeops.gate.shadow import ShadowGateScorer
-from safeops.stubs import NotImplementedStage, stub
+from safeops.stubs import NotImplementedStage
 from safeops.topology import ServiceTopology, load_topology_condition
 from safeops.verify.effectiveness import EffectivenessVerifier
 from safeops.verify.harm import HarmChecker
@@ -72,6 +74,13 @@ class ProviderFailure(Exception):
     takes the no_action path into stabilization, effectiveness and harm."""
 
 
+class ExecutionInfrastructureFailure(Exception):
+    """The executor returned infrastructure_failure: no step is known applied and success
+    couldn't be confirmed. Decision 0018's settled contract: an immediate discard at stage
+    executed_action (cause infrastructure_failure, through _cause's default), never
+    stabilization, effectiveness or harm (decision 0025 D§13)."""
+
+
 class TrajectoryCountMismatch(RuntimeError):
     """The agent's output declares a different number of trajectory steps than the loop
     recorded: a harness inconsistency, an infrastructure_failure at stage parse (decision
@@ -79,6 +88,7 @@ class TrajectoryCountMismatch(RuntimeError):
 
 
 __all__ = [
+    "ExecutionInfrastructureFailure",
     "ExperimentRunner",
     "PostAgentDiscard",
     "PreRunDiscard",
@@ -532,9 +542,23 @@ class ExperimentRunner:
             raise TypeError(f"route_gate takes a GateDecision, not {type(decision)}")
         return decision.decision == "execute"
 
-    @stub(milestone=8)
     def _executed_action(self, action, execution):
-        """Return the action the harm checker should judge, given the execution status."""
+        """The action the harm checker judges, given what execution did (decision 0025 D§13).
+
+        applied and partially_applied hand the action on (partial: eligible to reach harm,
+        not guaranteed); refused_by_envelope and rejected_invalid_action hand on None;
+        infrastructure_failure raises ExecutionInfrastructureFailure, the 0018 discard here
+        at executed_action. Anything but an ExecutionResult is a harness bug."""
+        if not isinstance(execution, ExecutionResult):
+            raise TypeError(f"executed_action takes an ExecutionResult, not {type(execution)}")
+        status = execution.status
+        if status in (ExecutionStatus.APPLIED, ExecutionStatus.PARTIALLY_APPLIED):
+            return action
+        if status in (ExecutionStatus.REFUSED_BY_ENVELOPE, ExecutionStatus.REJECTED_INVALID_ACTION):
+            return None
+        if status is ExecutionStatus.INFRASTRUCTURE_FAILURE:
+            raise ExecutionInfrastructureFailure(execution.error)
+        raise RuntimeError(f"no executed-action route for {status!r}")
 
     def _post_run_clean(self, clean_state) -> bool:
         """Return reset_verified for the record. Pure: no recovery happens here.
@@ -579,6 +603,7 @@ def _cause(exc: BaseException, data: dict, aborted: bool) -> str:
 
 def build_runner() -> ExperimentRunner:
     """Wire the default components. Constructing them has no side effects."""
+    from safeops.cluster import load_cluster_config
     from safeops.faults.spec import FAULTS_DIR
 
     # One generator, shared: the injector and the effectiveness verifier both measure on the
@@ -592,6 +617,17 @@ def build_runner() -> ExperimentRunner:
     # One topology condition, read once: the runtime context's topology, the record's
     # topology_hash and the write-time check all come from these bytes (M8A-2 topology fix).
     condition = load_topology_condition()
+    # The executor shares both: the same loaded action semantics and the same bound topology,
+    # with the configured namespace (a file read, no Kubernetes call). Its transports are
+    # unwired until Milestone 8B-2: no write or read is possible, and reaching one is a loud
+    # Milestone 8 stub (decision 0025, M8B-1 amendment).
+    executor = ActionExecutor(
+        semantics=policy.action_semantics,
+        topology=condition.topology,
+        namespace=load_cluster_config().namespace,
+        reader=UnwiredReader(),
+        writer=UnwiredWriter(),
+    )
     return ExperimentRunner(
         environment=EnvironmentManager(),
         workload=workload,
@@ -602,7 +638,7 @@ def build_runner() -> ExperimentRunner:
         extractor=extractor,
         shadow_gates=shadow_gates,
         gate=AlwaysActGate(),
-        executor=ActionExecutor(),
+        executor=executor,
         effectiveness=EffectivenessVerifier(workload=workload),
         harm=HarmChecker(),
         records=RunRecordWriter(  # one spec source for both

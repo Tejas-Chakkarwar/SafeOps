@@ -2,8 +2,9 @@
 
 The real parser, extractor, shadow scorer and always-act gate, sharing one loaded policy,
 fed a fabricated AgentOutput and stored trajectory (Rule 17); the harness around them is
-the offline fakes. The executor is still Milestone 8B's stub, so an always-act valid action
-stops there, recorded with every read-path value it produced.
+the offline fakes. The executor is the real M8B-1 executor with build_runner's unwired
+transports (decision 0025, M8B-1 amendment), so an always-act valid action stops at the
+writer's preflight, a Milestone 8 stub, recorded with every read-path value it produced.
 """
 
 from __future__ import annotations
@@ -20,11 +21,18 @@ import pytest
 from safeops.agent.output import AgentOutput, Termination
 from safeops.agent.parser import ProposalParser
 from safeops.domain import FeatureVector, ShadowGates
+from safeops.enums import ActionType, ExecutionStatus
 from safeops.executor.executor import ActionExecutor
+from safeops.executor.result import ExecutionResult, ExecutionStepResult
+from safeops.executor.unwired import UnwiredReader, UnwiredWriter
 from safeops.experiment import runner as runner_module
 from safeops.experiment.consistency import ReadPathCheck
 from safeops.experiment.records import RunRecordWriter
-from safeops.experiment.runner import ExperimentRunner, PostAgentDiscard
+from safeops.experiment.runner import (
+    ExecutionInfrastructureFailure,
+    ExperimentRunner,
+    PostAgentDiscard,
+)
 from safeops.experiment.schema import RecordValidationError, validate_record_json
 from safeops.faults.alerts import AlertGenerator
 from safeops.features.extractor import RiskFeatureExtractor
@@ -34,6 +42,7 @@ from safeops.gate.protocol import Gate, GateDecision
 from safeops.gate.shadow import ShadowGateScorer, random_draw
 from safeops.stubs import NotImplementedStage, stub_milestone
 from tests.conftest import FakeEnvironment, FakeInjector, FakeWorkload
+from tests.m8_executor_fakes import Rig
 from tests.m8_fixtures import CONDITION, deployment, ok, step
 from tests.test_m5_records import RECOVERED, SHA, UNIT, AgentProvenance, Fixed, Rec
 
@@ -55,6 +64,17 @@ def _text(action=ACTION, claims=()) -> str:
             "evidence": [1],
             "prerequisites_claimed": list(claims),
         }
+    )
+
+
+def unwired_executor(condition=CONDITION) -> ActionExecutor:
+    """The executor exactly as build_runner wires it before Milestone 8B-2."""
+    return ActionExecutor(
+        semantics=POLICY.action_semantics,
+        topology=condition.topology,
+        namespace="testbed",
+        reader=UnwiredReader(),
+        writer=UnwiredWriter(),
     )
 
 
@@ -157,7 +177,7 @@ def _runner(
         extractor=extractor,
         shadow_gates=scorer or shadow,
         gate=gate or AlwaysActGate(),
-        executor=executor or ActionExecutor(),
+        executor=executor or unwired_executor(condition),
         effectiveness=Fixed(RECOVERED),
         harm=Fixed(Rec({"harmful": False, "harm_violations": []})),
         records=records,
@@ -177,7 +197,7 @@ def test_a_valid_action_runs_the_whole_read_path_and_stops_at_the_executor(tmp_p
     r = _runner(tmp_path)
     with pytest.raises(NotImplementedStage) as exc:
         r.run(UNIT)
-    assert exc.value.stage == "ActionExecutor.apply"
+    assert exc.value.stage == "UnwiredWriter.preflight"
     (rec,) = _written(tmp_path)
     assert rec["discard_reason"]["stage"] == "execute"
     assert rec["discard_reason"]["cause"] == "not_implemented"
@@ -514,9 +534,13 @@ def test_the_writers_provenance_comes_from_the_loaded_policy(tmp_path) -> None:
     assert plain.capture_provenance(UNIT)["gate_feature_version"] == 1  # AgentProvenance's
 
 
-def test_m8b_and_m9_stubs_remain() -> None:
-    assert stub_milestone(ExperimentRunner._executed_action) == 8
-    assert stub_milestone(ActionExecutor.apply) == 8
+def test_m8b1_implements_the_executor_and_m8b2_and_m9_stubs_remain() -> None:
+    assert stub_milestone(ExperimentRunner._executed_action) is None
+    assert stub_milestone(ActionExecutor.apply) is None
+    for transport in (UnwiredWriter.preflight, UnwiredWriter.write):
+        assert stub_milestone(transport) == 8  # the concrete writer is Milestone 8B-2
+    for transport in (UnwiredReader.get, UnwiredReader.list):
+        assert stub_milestone(transport) == 8
     assert stub_milestone(ExperimentRunner._should_execute) is None
     from safeops.agent.loop import Agent
     from safeops.experiment.sequence import first_stub
@@ -779,3 +803,150 @@ def test_malformed_resources_stop_the_run_before_any_extraction_or_record(
     assert result.exit_code == cli.EXIT_USAGE
     assert "topology configuration: topology.yaml: resources: expected a mapping" in result.stderr
     assert reached == []  # never extracted, never recorded
+
+
+# --- M8B-1: execution status routing through the real runner (decision 0025 D§13) -----------
+
+RESTART = ACTION
+POOL = {
+    "type": "patch_configmap",
+    "target": {"kind": "ConfigMap", "ns": "testbed", "name": "db-pool-config"},
+    "params": {"max_pool_size": 20},
+}
+SCALE_500 = {
+    "type": "scale_deployment",
+    "target": {"kind": "Deployment", "ns": "testbed", "name": "orders"},
+    "params": {"replicas": 500},
+}
+ROUTES = {
+    "applied": (RESTART, [], "applied", True),
+    "partially_applied": (POOL, ["success", "invalid"], "partially_applied", True),
+    "refused_by_envelope": (SCALE_500, [], "refused_by_envelope", False),
+    "rejected_invalid_action": (RESTART, ["invalid"], "rejected_invalid_action", False),
+}
+
+
+def _routed_runner(tmp_path, act, script):
+    rig = Rig(script)
+    r = _runner(tmp_path, agent=OutputAgent(_text(act)), executor=rig.executor)
+    r.harm = Spy(Fixed(Rec({"harmful": False, "harm_violations": []})))
+    r.effectiveness = Spy(Fixed(RECOVERED))
+    return r, rig
+
+
+@pytest.mark.parametrize(("act", "script", "status", "to_harm"), ROUTES.values(), ids=ROUTES.keys())
+def test_an_execution_status_routes_into_measurement(tmp_path, act, script, status, to_harm):
+    r, rig = _routed_runner(tmp_path, act, script)
+    r.run(UNIT)
+    (rec,) = _written(tmp_path)
+    assert rec["execution"]["status"] == status and rec["discarded"] is False
+    assert rec["stabilization_timed_out"] is False and rec["postaction_snapshot_hash"]
+    assert [c[0] for c in r.effectiveness.calls] == ["verify"]
+    ((name, args, _),) = r.harm.calls
+    executed = args[0]
+    if to_harm:
+        assert executed is not None and executed.model_dump(mode="json") == act
+    else:
+        assert executed is None
+    assert rec["in_cohort_g"] is (status == "applied")
+
+
+def test_an_executor_infrastructure_failure_is_discarded_at_executed_action(tmp_path) -> None:
+    r, rig = _routed_runner(tmp_path, RESTART, ["definite"])
+    with pytest.raises(PostAgentDiscard) as exc:
+        r.run(UNIT)
+    assert isinstance(exc.value.__cause__, ExecutionInfrastructureFailure)
+    (rec,) = _written(tmp_path)
+    assert rec["discarded"] is True
+    assert rec["discard_reason"]["stage"] == "executed_action"
+    assert rec["discard_reason"]["cause"] == "infrastructure_failure"
+    assert rec["action_attempted"] is True
+    assert rec["execution"]["status"] == "infrastructure_failure"  # retained, never rewritten
+    assert [s["status"] for s in rec["execution"]["steps"]] == ["failed"]
+    assert rec["stabilization_timed_out"] is None and rec["postaction_snapshot_hash"] is None
+    assert rec["outcome"] is None
+    assert r.harm.calls == [] and r.effectiveness.calls == []
+    assert "wait_stabilization_window" not in r.environment.calls
+
+
+def test_a_not_attempted_infrastructure_failure_keeps_its_empty_steps(tmp_path) -> None:
+    r, _ = _routed_runner(tmp_path, RESTART, ["not_attempted"])
+    with pytest.raises(PostAgentDiscard):
+        r.run(UNIT)
+    (rec,) = _written(tmp_path)
+    assert rec["execution"]["steps"] == [] and rec["discard_reason"]["stage"] == "executed_action"
+
+
+def _result(status, error=None, steps=()):
+    return ExecutionResult(status, error, steps)
+
+
+def test_executed_action_routes_every_status(tmp_path) -> None:
+    r = _runner(tmp_path)
+    act = object()
+    S = ExecutionStatus
+    applied = _result(
+        S.APPLIED, None, (ExecutionStepResult(ActionType.SCALE_DEPLOYMENT, "applied"),)
+    )
+    partial = _result(
+        S.PARTIALLY_APPLIED,
+        "x",
+        (
+            ExecutionStepResult(ActionType.PATCH_CONFIGMAP, "applied"),
+            ExecutionStepResult(ActionType.RESTART_DEPLOYMENT, "skipped"),
+        ),
+    )
+    failed = (ExecutionStepResult(ActionType.SCALE_DEPLOYMENT, "failed", "x"),)
+    assert r._executed_action(act, applied) is act
+    assert r._executed_action(act, partial) is act
+    assert r._executed_action(act, _result(S.REFUSED_BY_ENVELOPE, "x")) is None
+    assert r._executed_action(act, _result(S.REJECTED_INVALID_ACTION, "x", failed)) is None
+    with pytest.raises(ExecutionInfrastructureFailure, match="x"):
+        r._executed_action(act, _result(S.INFRASTRUCTURE_FAILURE, "x"))
+    for wrong in (None, "applied", {"status": "applied"}, applied.to_record()):
+        with pytest.raises(TypeError):
+            r._executed_action(act, wrong)
+
+
+def test_build_runner_gives_the_executor_the_shared_conditions() -> None:
+    from safeops.cluster import load_cluster_config
+
+    r = runner_module.build_runner()
+    ex = r.executor
+    assert isinstance(ex, ActionExecutor)
+    assert (
+        ex.semantics
+        is r.extractor.policy.action_semantics
+        is r.shadow_gates.policy.action_semantics
+    )
+    assert ex.topology is r._topology is r.records.read_path.condition.topology
+    assert ex.namespace == load_cluster_config().namespace
+    assert isinstance(ex.reader, UnwiredReader) and isinstance(ex.writer, UnwiredWriter)
+
+
+@pytest.mark.parametrize(
+    "act",
+    [RESTART, SCALE_500 | {"params": {"replicas": 4}}, POOL],
+    ids=["restart", "scale", "configmap"],
+)
+def test_the_transitional_executor_fails_loudly_before_any_write(tmp_path, act) -> None:
+    r = _runner(tmp_path, agent=OutputAgent(_text(act)))
+    with pytest.raises(NotImplementedStage) as exc:
+        r.run(UNIT)
+    assert exc.value.stage == "UnwiredWriter.preflight"
+    (rec,) = _written(tmp_path)
+    assert rec["discard_reason"]["stage"] == "execute"
+    assert rec["discard_reason"]["cause"] == "not_implemented"
+    assert rec["execution"] is None
+
+
+def test_the_transitional_reader_fails_loudly_too(tmp_path) -> None:
+    rollback = {
+        "type": "rollback_deployment",
+        "target": {"kind": "Deployment", "ns": "testbed", "name": "orders"},
+        "params": {"to_revision": 1},
+    }
+    r = _runner(tmp_path, agent=OutputAgent(_text(rollback)))
+    with pytest.raises(NotImplementedStage) as exc:
+        r.run(UNIT)
+    assert exc.value.stage == "UnwiredReader.get"

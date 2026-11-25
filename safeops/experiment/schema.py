@@ -35,6 +35,7 @@ from pydantic import AwareDatetime, Field, ValidationError, model_validator
 # The agent-side types are the neutral runtime domain types (decision 0020): the same
 # classes the agent, parser, extractor and gates use, reused here, never duplicated.
 from safeops.domain import (  # noqa: F401  (re-exported: the record's agent-side fields)
+    MAX_DISCARD_ERROR,
     ActionTarget,
     FeatureVector,
     NonNegInt,
@@ -47,7 +48,7 @@ from safeops.domain import (  # noqa: F401  (re-exported: the record's agent-sid
 )
 from safeops.domain import StrictModel as _Strict
 from safeops.enums import ActionType, ExecutionStatus, ProposalStatus, RunStage
-from safeops.experiment.records import MAX_DISCARD_ERROR, MAX_LAST_CHANGES
+from safeops.experiment.records import MAX_LAST_CHANGES
 from safeops.experiment.unit import FAULT_ID_PATTERN, MAX_FAULT_SEED, MAX_TRIAL_INDEX
 
 SCHEMA_VERSION = 2
@@ -273,15 +274,19 @@ class Gate(_Strict):
     score: None
 
 
+# Execution and step errors share the discard reason's bound (decision 0025 D§16).
+BoundedError = Annotated[str, Field(max_length=MAX_DISCARD_ERROR)]
+
+
 class ExecutionStep(_Strict):
     operation: ActionType  # a composite (patch_configmap) has its two operations as steps
     status: Literal["applied", "failed", "skipped"]
-    error: str | None
+    error: BoundedError | None
 
 
 class Execution(_Strict):
     status: ExecutionStatus
-    error: str | None
+    error: BoundedError | None
     steps: list[ExecutionStep]
 
 
@@ -591,6 +596,18 @@ def _evidence_problems(r: RunRecordV1) -> list[str]:
                 p.append("partially_applied needs at least one applied and one unapplied step")
         elif e.status == ExecutionStatus.REFUSED_BY_ENVELOPE and any(applied):
             p.append("refused_by_envelope can't have an applied step: it never reached the API")
+        # Milestone 8B (decision 0025 D§16): neither names a step known applied. A rejection
+        # wrote nothing; an infrastructure failure confirmed nothing.
+        elif e.status == ExecutionStatus.REJECTED_INVALID_ACTION and any(applied):
+            p.append("rejected_invalid_action can't have an applied step: nothing was written")
+        elif e.status == ExecutionStatus.INFRASTRUCTURE_FAILURE and any(applied):
+            p.append("infrastructure_failure can't have an applied step: none was confirmed")
+        # Step error text (D§11.4): only a failed step says why; applied and skipped don't.
+        for step in e.steps:
+            if step.status == "failed" and not step.error:
+                p.append(f"a failed {step.operation} step needs its error")
+            elif step.status != "failed" and step.error is not None:
+                p.append(f"an {step.status} {step.operation} step carries an error")
         action = r.proposal.recommended_action if r.proposal is not None else None
         if action is not None:
             ops = tuple(step.operation for step in e.steps)
@@ -812,6 +829,7 @@ def record_problems(r: RunRecordV1) -> list[str]:
         p.append("provider_failure must be a discard with cause provider_failure")
     # An executor infrastructure failure is discardable too (§7.1). Envelope refusals,
     # rejected actions and partial application are real outcomes, and are not discarded.
+    # Decision 0018 / 0025 D§13: discarded at once, at executed_action, never measured.
     if r.execution is not None and r.execution.status == ExecutionStatus.INFRASTRUCTURE_FAILURE:
         if (
             not r.discarded
@@ -819,6 +837,8 @@ def record_problems(r: RunRecordV1) -> list[str]:
             or (r.discard_reason.cause != "infrastructure_failure")
         ):
             p.append("an executor infrastructure_failure must be an infrastructure_failure discard")
+        elif r.discard_reason.stage != RunStage.EXECUTED_ACTION:
+            p.append("an executor infrastructure_failure is discarded at stage executed_action")
     # Ordered along the branch (extract -> shadow gates -> gate), since a run can stop
     # between them; all three, or none, only for a completed run.
     if r.shadow_gates is not None and r.feature_vector is None:

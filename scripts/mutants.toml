@@ -2631,3 +2631,872 @@ old = '''
     return _mapping(parent[key], where)'''
 new = '''
     return _mapping(parent.get(key) or {}, where)'''
+
+[[mutant]]
+id = "M8B1-S1"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "apply re-validates the action's structure before E1, so malformed is never a refusal"
+kills = [
+    "tests/test_m8_executor.py::test_structure_is_checked_before_the_envelope[e1]",
+    "tests/test_m8_executor.py::test_a_structurally_invalid_action_is_a_harness_error_before_anything[restart-unexpected-params]",
+]
+old = '''
+        if problem is not None:
+            raise ValueError(f"apply takes a structurally valid action: {problem}")'''
+new = '''
+        if False:
+            raise ValueError(f"apply takes a structurally valid action: {problem}")'''
+
+[[mutant]]
+id = "M8B1-E1"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "E1: the target kind is the action's target kind"
+kills = [
+    "tests/test_m8_executor.py::test_the_common_envelope_refuses_with_its_first_failure[e1-service-for-a-deployment-action]",
+    "tests/test_m8_executor.py::test_the_common_envelope_refuses_with_its_first_failure[e1-statefulset]",
+]
+old = '''
+        if t.kind != kind:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M8B1-E2"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "E2: the target namespace is the configured namespace"
+kills = [
+    "tests/test_m8_executor.py::test_the_common_envelope_refuses_with_its_first_failure[e2-other-namespace]",
+]
+old = '''
+        if t.ns != self.namespace:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M8B1-E3"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "E3: the target is in the ownership map (the whitelist)"
+kills = [
+    "tests/test_m8_executor.py::test_the_common_envelope_refuses_with_its_first_failure[e3-unknown-deployment]",
+]
+old = '''
+        if spec is None:
+            return f"E3: {t.kind}/{t.name} is not in the ownership map"'''
+new = '''
+        if False:
+            return f"E3: {t.kind}/{t.name} is not in the ownership map"'''
+
+[[mutant]]
+id = "M8B1-E4"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "E3: a ConfigMap is whitelisted only with non-empty approved_keys (E3 is the recorded reason)"
+kills = [
+    "tests/test_m8_executor.py::test_a_configmap_without_approved_keys_is_not_whitelisted",
+]
+old = '''
+        if t.kind == "ConfigMap" and not spec.approved_keys:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M8B1-E5"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "scale is bounded by the hard replicas range, never the safe one"
+kills = [
+    "tests/test_m8_executor.py::test_scale_inside_the_hard_range_executes[15]",
+    "tests/test_m8_executor.py::test_scale_inside_the_hard_range_executes[0]",
+]
+old = '''
+        hard = spec.bounds["replicas"].hard'''
+new = '''
+        hard = spec.bounds["replicas"].safe'''
+
+[[mutant]]
+id = "M8B1-E6"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "scale above the hard maximum is refused"
+kills = [
+    "tests/test_m8_executor.py::test_scale_outside_the_hard_range_is_refused[500]",
+    "tests/test_m8_executor.py::test_scale_outside_the_hard_range_is_refused[21]",
+]
+old = '''
+        if not hard.contains(replicas):'''
+new = '''
+        if replicas < hard.lo:'''
+
+[[mutant]]
+id = "M8B1-E7"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "an enum ConfigMap key must be a member of its enum"
+kills = [
+    "tests/test_m8_executor.py::test_an_enum_key_must_be_a_string_in_its_enum[verbose]",
+]
+old = '''
+        if type(value) is not str or value not in rule["enum"]:'''
+new = '''
+        if type(value) is not str:'''
+
+[[mutant]]
+id = "M8B1-E8"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a numeric ConfigMap key must lie within its hard range"
+kills = [
+    "tests/test_m8_executor.py::test_configmap_envelope_refusals[above-hard]",
+    "tests/test_m8_executor.py::test_configmap_envelope_refusals[below-hard]",
+]
+old = '''
+    if not lo <= value <= hi:'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "M8B1-E9"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a numeric ConfigMap key is bounded by hard_range, never safe_range"
+kills = [
+    "tests/test_m8_executor.py::test_configmap_within_the_envelope_executes[safe-only-violation]",
+]
+old = '''
+    lo, hi = rule["hard_range"]'''
+new = '''
+    lo, hi = rule["safe_range"]'''
+
+[[mutant]]
+id = "M8B1-E10"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "each resource request and limit is checked against its hard range"
+kills = [
+    "tests/test_m8_executor.py::test_resource_hard_ranges_are_checked_alone_and_before_any_read[limit-memory-above]",
+    "tests/test_m8_executor.py::test_resource_hard_ranges_are_checked_alone_and_before_any_read[request-cpu-above]",
+]
+old = '''
+            if not hard.contains(value):
+                return _refused(
+                    f"{section}.{field}'''
+new = '''
+            if False:
+                return _refused(
+                    f"{section}.{field}'''
+
+[[mutant]]
+id = "M8B1-E11"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "resource fields are bounded by hard ranges, never safe ranges"
+kills = [
+    "tests/test_m8_executor.py::test_resources_outside_the_safe_range_and_request_above_limit_reach_the_writer",
+]
+old = '''
+            hard = spec.bounds[field].hard'''
+new = '''
+            hard = spec.bounds[field].safe'''
+
+[[mutant]]
+id = "M8B1-E12"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "the read-free resource range checks run before the container read"
+kills = [
+    "tests/test_m8_executor.py::test_resource_hard_ranges_are_checked_alone_and_before_any_read[limit-memory-above]",
+]
+old = '''
+        ranges = _resource_range_refusal(params, spec)
+        if ranges is not None:
+            return ranges
+        checked = self._container_check(spec.name, params["container"])
+        if checked is not None:
+            return checked'''
+new = '''
+        checked = self._container_check(spec.name, params["container"])
+        if checked is not None:
+            return checked
+        ranges = _resource_range_refusal(params, spec)
+        if ranges is not None:
+            return ranges'''
+
+[[mutant]]
+id = "M8B1-E13"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a missing container is refused, never patched (a strategic merge would add it)"
+kills = [
+    "tests/test_m8_executor.py::test_a_missing_container_is_refused_and_no_container_is_added",
+]
+old = '''
+        if not _named(containers, container):'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M8B1-E14"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a missing container is refused_by_envelope, not rejected_invalid_action"
+kills = [
+    "tests/test_m8_executor.py::test_a_missing_container_is_refused_and_no_container_is_added",
+]
+old = '''
+            return _refused(f"container {container} does not exist in Deployment/{deployment}")'''
+new = '''
+            reason = bounded(f"container {container} does not exist in Deployment/{deployment}")
+            step = ExecutionStepResult(ActionType.PATCH_DEPLOYMENT_RESOURCES, FAILED, reason)
+            return ExecutionResult(ExecutionStatus.REJECTED_INVALID_ACTION, reason, (step,))'''
+
+[[mutant]]
+id = "M8B1-E15"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a container-check reader failure is infrastructure_failure, never a refusal"
+kills = [
+    "tests/test_m8_executor.py::test_the_container_check_reader_unavailable_is_an_infrastructure_failure",
+]
+old = '''
+            return _unavailable(
+                f"the container check could not read'''
+new = '''
+            return _refused(
+                f"the container check could not read'''
+
+[[mutant]]
+id = "M8B1-E16"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a container-check reader failure stops the action: no write"
+kills = [
+    "tests/test_m8_executor.py::test_the_container_check_reader_unavailable_is_an_infrastructure_failure",
+]
+old = '''
+        if reply.outcome is ReadOutcome.UNAVAILABLE:
+            return _unavailable(
+                f"the container check could not read Deployment/{deployment}"
+                f" after {READ_ATTEMPTS} attempts: {reply.diagnostic}"
+            )'''
+new = '''
+        if reply.outcome is ReadOutcome.UNAVAILABLE:
+            return None'''
+
+[[mutant]]
+id = "M8B1-O1"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "rollback history counts only ReplicaSets the Deployment controls"
+kills = [
+    "tests/test_m8_executor.py::test_rollback_to_a_revision_not_in_the_targets_history_is_refused[only-on-an-uncontrolled-replicaset]",
+]
+old = '''
+        and ref.get("controller") is True
+'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8B1-O2"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "rollback history counts only that exact Deployment object (by uid)"
+kills = [
+    "tests/test_m8_executor.py::test_rollback_to_a_revision_not_in_the_targets_history_is_refused[only-on-another-uid]",
+]
+old = '''
+        and ref.get("uid") == uid
+'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8B1-O3"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a rollback revision is matched by the deployment.kubernetes.io/revision annotation"
+kills = [
+    "tests/test_m8_executor.py::test_rollback_request_is_the_revision_template_without_its_hash",
+    "tests/test_m8_executor.py::test_rollback_to_a_revision_not_in_the_targets_history_is_refused[not-in-history]",
+]
+old = '''
+            if _controlled_by(rs, name, uid)
+            and _at(rs, "metadata", "annotations", REVISION_ANNOTATION) == str(revision)'''
+new = '''
+            if _controlled_by(rs, name, uid)'''
+
+[[mutant]]
+id = "M8B1-O4"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "the rollback template drops the pod-template-hash label"
+kills = [
+    "tests/test_m8_executor.py::test_rollback_request_is_the_revision_template_without_its_hash",
+]
+old = '''
+            labels.pop(POD_TEMPLATE_HASH, None)'''
+new = '''
+            pass'''
+
+[[mutant]]
+id = "M8B1-O5"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "the rollback template is a copy: the object as read is never changed"
+kills = [
+    "tests/test_m8_executor.py::test_rollback_request_is_the_revision_template_without_its_hash",
+]
+old = '''
+        cleaned = copy.deepcopy(template)  # never change the object as it was read'''
+new = '''
+        cleaned = template  # never change the object as it was read'''
+
+[[mutant]]
+id = "M8B1-O6"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "two ReplicaSets claiming one revision can't establish the template"
+kills = [
+    "tests/test_m8_executor.py::test_rollback_with_two_replicasets_claiming_a_revision_cannot_be_established",
+]
+old = '''
+        if len(matches) > 1:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M8B1-O7"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "PROVISIONAL (M8B-2 live server-defaulting proof): rollback is confirmed only by exact canonical template equality"
+kills = [
+    "tests/test_m8_executor.py::test_provisional_rollback_template_equality_is_exact",
+]
+old = '''
+        return type(template) is dict and canonical_json(template) == canonical_json(expected)'''
+new = '''
+        return type(template) is dict'''
+
+[[mutant]]
+id = "M8B1-O8"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "the ConfigMap owner must have exactly one Deployment, never the first of several"
+kills = [
+    "tests/test_m8_executor.py::test_a_configmap_without_exactly_one_owner_deployment_raises_before_any_write[two-owner-deployments]",
+]
+old = '''
+        if len(owners) != 1:'''
+new = '''
+        if not owners:'''
+
+[[mutant]]
+id = "M8B1-O9"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a repeated or earlier clock reading never repeats a restart value"
+kills = [
+    "tests/test_m8_executor.py::test_restart_values_are_unique_under_a_repeating_or_backward_clock",
+]
+old = '''
+        if self._last_restart is not None and now <= self._last_restart:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M8B1-O10"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "an integer ConfigMap value renders as str(i), never as a float"
+kills = [
+    "tests/test_m8_executor.py::test_configmap_rendering[20-20]",
+    "tests/test_m8_executor.py::test_configmap_request_renders_values_and_keeps_unlisted_keys",
+]
+old = '''
+        return str(value)
+    return repr(value)'''
+new = '''
+        return repr(float(value))
+    return repr(value)'''
+
+[[mutant]]
+id = "M8B1-O11"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a float ConfigMap value renders as repr(f), never truncated"
+kills = [
+    "tests/test_m8_executor.py::test_configmap_rendering[1500.5-1500.5]",
+    "tests/test_m8_executor.py::test_configmap_request_renders_values_and_keeps_unlisted_keys",
+]
+old = '''
+    return repr(value)
+
+
+def _named'''
+new = '''
+    return str(int(value))
+
+
+def _named'''
+
+[[mutant]]
+id = "M8B1-O12"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "patch_service replaces the selector (JSON patch), never merges it"
+kills = [
+    "tests/test_m8_executor.py::test_service_request_replaces_the_selector_exactly",
+]
+old = '''
+        body = [{"op": "replace", "path": "/spec/selector", "value": selector}]
+        return (
+            prepared(
+                ActionType.PATCH_SERVICE,
+                "Service",
+                self.namespace,
+                spec.name,
+                PatchType.JSON,'''
+new = '''
+        body = {"spec": {"selector": selector}}
+        return (
+            prepared(
+                ActionType.PATCH_SERVICE,
+                "Service",
+                self.namespace,
+                spec.name,
+                PatchType.MERGE,'''
+
+[[mutant]]
+id = "M8B1-O13"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "CPU is written in millicores (<n>m)"
+kills = [
+    "tests/test_m8_executor.py::test_resources_request_patches_only_the_given_fields_in_kubernetes_units",
+]
+old = '''
+RESOURCE_UNITS = {"cpu_millis": ("cpu", "m"), "memory_mib": ("memory", "Mi")}'''
+new = '''
+RESOURCE_UNITS = {"cpu_millis": ("cpu", ""), "memory_mib": ("memory", "Mi")}'''
+
+[[mutant]]
+id = "M8B1-O14"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "memory is written in binary MiB (<n>Mi), never decimal M"
+kills = [
+    "tests/test_m8_executor.py::test_resources_request_patches_only_the_given_fields_in_kubernetes_units",
+]
+old = '''
+RESOURCE_UNITS = {"cpu_millis": ("cpu", "m"), "memory_mib": ("memory", "Mi")}'''
+new = '''
+RESOURCE_UNITS = {"cpu_millis": ("cpu", "m"), "memory_mib": ("memory", "M")}'''
+
+[[mutant]]
+id = "M8B1-O15"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "every request is preflighted before the first write"
+kills = [
+    "tests/test_m8_executor.py::test_a_preflight_refusal_raises_and_nothing_is_written[act0]",
+    "tests/test_m8_executor.py::test_every_request_is_preflighted_together_before_the_first_write",
+]
+old = '''
+        self.writer.preflight(plan)
+        return self._execute(plan)'''
+new = '''
+        return self._execute(plan)'''
+
+[[mutant]]
+id = "M8B1-O16"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "the composite preflights both requests, not only the first"
+kills = [
+    "tests/test_m8_executor.py::test_every_request_is_preflighted_together_before_the_first_write",
+]
+old = '''
+        self.writer.preflight(plan)'''
+new = '''
+        self.writer.preflight(plan[:1])'''
+
+[[mutant]]
+id = "M8B1-Q1"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/quantity.py"
+guard = "a decimal memory suffix is never read as its binary namesake (1G != 1Gi)"
+kills = [
+    "tests/test_m8_executor.py::test_decimal_memory_suffixes_are_not_binary",
+]
+old = '''
+    multiplier = BINARY[suffix] if suffix in BINARY else DECIMAL[suffix]'''
+new = '''
+    multiplier = BINARY[suffix] if suffix in BINARY else BINARY[suffix + "i"]'''
+
+[[mutant]]
+id = "M8B1-Q2"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/quantity.py"
+guard = "bare CPU cores are millicores x 1000 (1 == 1000m)"
+kills = [
+    "tests/test_m8_executor.py::test_cpu_equivalences",
+]
+old = '''
+        return Fraction(value) * 1000'''
+new = '''
+        return Fraction(value)'''
+
+[[mutant]]
+id = "M8B1-Q3"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a returned memory quantity is compared by value, not text (2Gi confirms 2048Mi)"
+kills = [
+    "tests/test_m8_executor.py::test_a_server_canonicalized_quantity_still_confirms_the_write",
+]
+old = '''
+                elif not quantity.memory_is(got, value):'''
+new = '''
+                elif got != f"{value}Mi":'''
+
+[[mutant]]
+id = "M8B1-W1"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a semantic 422 is rejected_invalid_action, not infrastructure_failure"
+kills = [
+    "tests/test_m8_executor.py::test_a_single_write_reply_is_classified[invalid]",
+    "tests/test_m8_executor.py::test_composite_precedence[step1-invalid]",
+]
+old = '''
+            if outcome is _Outcome.REJECTED:'''
+new = '''
+            if False:'''
+
+[[mutant]]
+id = "M8B1-W2"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a definite non-success is infrastructure_failure, not rejected_invalid_action"
+kills = [
+    "tests/test_m8_executor.py::test_a_single_write_reply_is_classified[definite-failure]",
+]
+old = '''
+            return _Outcome.FAILED, bounded(f"{what}: the request failed: {detail}")'''
+new = '''
+            return _Outcome.REJECTED, bounded(f"{what}: the request failed: {detail}")'''
+
+[[mutant]]
+id = "M8B1-W3"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "an ambiguous response is reconciled, never taken as failure"
+kills = [
+    "tests/test_m8_executor.py::test_a_single_write_reply_is_classified[ambiguous-confirmed]",
+]
+old = '''
+        return self._reconcile(request, f"{what}: ambiguous response: {detail}")'''
+new = '''
+        return _Outcome.FAILED, bounded(f"{what}: ambiguous response: {detail}")'''
+
+[[mutant]]
+id = "M8B1-W4"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a success reply must show the postcondition, or it is reconciled"
+kills = [
+    "tests/test_m8_executor.py::test_a_single_write_reply_is_classified[success-without-the-change-absent]",
+]
+old = '''
+            if postcondition_holds(request, reply.returned_object):
+                return _Outcome.CONFIRMED, None'''
+new = '''
+            if True:
+                return _Outcome.CONFIRMED, None'''
+
+[[mutant]]
+id = "M8B1-W5"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a never-sent write records no step"
+kills = [
+    "tests/test_m8_executor.py::test_a_single_write_reply_is_classified[not-attempted]",
+    "tests/test_m8_executor.py::test_composite_precedence[step1-not-attempted]",
+]
+old = '''
+            if outcome is _Outcome.NOT_ATTEMPTED:
+                return ExecutionResult(ExecutionStatus.INFRASTRUCTURE_FAILURE, error, ())'''
+new = '''
+            if False:
+                return ExecutionResult(ExecutionStatus.INFRASTRUCTURE_FAILURE, error, ())'''
+
+[[mutant]]
+id = "M8B1-W6"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a never-sent composite step 2 is skipped, not failed"
+kills = [
+    "tests/test_m8_executor.py::test_composite_precedence[step2-not-attempted]",
+]
+old = '''
+                status = SKIPPED if outcome is _Outcome.NOT_ATTEMPTED else FAILED'''
+new = '''
+                status = FAILED'''
+
+[[mutant]]
+id = "M8B1-W7"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "an earlier applied step dominates: a later failure is partially_applied"
+kills = [
+    "tests/test_m8_executor.py::test_composite_precedence[step2-invalid]",
+    "tests/test_m8_executor.py::test_composite_precedence[step2-definite]",
+]
+old = '''
+            if done:'''
+new = '''
+            if False:'''
+
+[[mutant]]
+id = "M8B1-C1"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "reconciliation confirms a read-back postcondition"
+kills = [
+    "tests/test_m8_executor.py::test_a_single_write_reply_is_classified[ambiguous-confirmed]",
+]
+old = '''
+        if reply.outcome is ReadOutcome.FOUND and postcondition_holds(request, reply.obj):
+            return _Outcome.CONFIRMED, None'''
+new = '''
+        if reply.outcome is ReadOutcome.FOUND and postcondition_holds(request, reply.obj):
+            return _Outcome.FAILED, "confirmed"'''
+
+[[mutant]]
+id = "M8B1-C2"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a read-back without the postcondition is absent, never applied"
+kills = [
+    "tests/test_m8_executor.py::test_a_single_write_reply_is_classified[ambiguous-absent]",
+]
+old = '''
+        if reply.outcome is ReadOutcome.FOUND and postcondition_holds(request, reply.obj):'''
+new = '''
+        if reply.outcome is ReadOutcome.FOUND:'''
+
+[[mutant]]
+id = "M8B1-C3"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "an unreadable reconciliation is a failed step, never applied"
+kills = [
+    "tests/test_m8_executor.py::test_a_single_write_reply_is_classified[ambiguous-unavailable]",
+]
+old = '''
+            return _Outcome.FAILED, bounded(
+                f"{why}; reconciliation could not read it'''
+new = '''
+            return _Outcome.CONFIRMED, (
+                f"{why}; reconciliation could not read it'''
+
+[[mutant]]
+id = "M8B1-C4"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "every read makes at most 3 attempts"
+kills = [
+    "tests/test_m8_executor.py::test_reconciliation_makes_at_most_three_attempts_two_seconds_apart",
+    "tests/test_m8_executor.py::test_the_container_check_reader_unavailable_is_an_infrastructure_failure",
+]
+old = '''
+READ_ATTEMPTS = 3'''
+new = '''
+READ_ATTEMPTS = 4'''
+
+[[mutant]]
+id = "M8B1-C5"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "unavailable attempts are 2 s apart"
+kills = [
+    "tests/test_m8_executor.py::test_reconciliation_makes_at_most_three_attempts_two_seconds_apart",
+]
+old = '''
+            if attempt:
+                self._sleep(READ_RETRY_SLEEP_S)'''
+new = '''
+            if attempt:
+                pass'''
+
+[[mutant]]
+id = "M8B1-C6"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "a successful read proving absence ends the attempts"
+kills = [
+    "tests/test_m8_executor.py::test_a_successful_absent_read_ends_reconciliation",
+]
+old = '''
+            if reply.outcome is not ReadOutcome.UNAVAILABLE:
+                return reply'''
+new = '''
+            if reply.outcome is ReadOutcome.FOUND:
+                return reply'''
+
+[[mutant]]
+id = "M8B1-C7"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "the scale postcondition is spec.replicas == requested"
+kills = [
+    "tests/test_m8_executor.py::test_scale_inside_the_hard_range_executes[15]",
+]
+old = '''
+        return exact_int(replicas) and replicas == expected'''
+new = '''
+        return exact_int(replicas) and replicas != expected'''
+
+[[mutant]]
+id = "M8B1-C8"
+source = "0025 M8B-1 offline executor"
+target = "safeops/executor/executor.py"
+guard = "the selector postcondition is exact: no stale key may survive"
+kills = [
+    "tests/test_m8_executor.py::test_a_selector_with_a_surviving_stale_key_is_not_confirmed",
+]
+old = '''
+        return type(selector) is dict and selector == expected'''
+new = '''
+        return type(selector) is dict and all(selector.get(k) == v for k, v in expected.items())'''
+
+[[mutant]]
+id = "M8B1-R1"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/runner.py"
+guard = "an executor infrastructure_failure raises: the 0018 discard at executed_action"
+kills = [
+    "tests/test_m8_integration.py::test_an_executor_infrastructure_failure_is_discarded_at_executed_action",
+    "tests/test_m8_integration.py::test_executed_action_routes_every_status",
+]
+old = '''
+            raise ExecutionInfrastructureFailure(execution.error)'''
+new = '''
+            return None'''
+
+[[mutant]]
+id = "M8B1-R2"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/runner.py"
+guard = "partially_applied hands the action to harm"
+kills = [
+    "tests/test_m8_integration.py::test_an_execution_status_routes_into_measurement[partially_applied]",
+]
+old = '''
+        if status in (ExecutionStatus.APPLIED, ExecutionStatus.PARTIALLY_APPLIED):
+            return action'''
+new = '''
+        if status is ExecutionStatus.APPLIED:
+            return action
+        if status is ExecutionStatus.PARTIALLY_APPLIED:
+            return None'''
+
+[[mutant]]
+id = "M8B1-R3"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/runner.py"
+guard = "rejected_invalid_action hands harm None"
+kills = [
+    "tests/test_m8_integration.py::test_an_execution_status_routes_into_measurement[rejected_invalid_action]",
+]
+old = '''
+        if status in (ExecutionStatus.REFUSED_BY_ENVELOPE, ExecutionStatus.REJECTED_INVALID_ACTION):
+            return None'''
+new = '''
+        if status is ExecutionStatus.REJECTED_INVALID_ACTION:
+            return action
+        if status is ExecutionStatus.REFUSED_BY_ENVELOPE:
+            return None'''
+
+[[mutant]]
+id = "M8B1-D1"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/schema.py"
+guard = "an infrastructure_failure record has no applied step"
+kills = [
+    "tests/test_m5_crossfield.py::test_an_infrastructure_failure_has_no_applied_step[single-applied]",
+]
+old = '''
+        elif e.status == ExecutionStatus.INFRASTRUCTURE_FAILURE and any(applied):'''
+new = '''
+        elif False:'''
+
+[[mutant]]
+id = "M8B1-D2"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/schema.py"
+guard = "a rejected_invalid_action record has no applied step"
+kills = [
+    "tests/test_m5_crossfield.py::test_a_rejected_action_has_no_applied_step[single-applied]",
+]
+old = '''
+        elif e.status == ExecutionStatus.REJECTED_INVALID_ACTION and any(applied):'''
+new = '''
+        elif False:'''
+
+[[mutant]]
+id = "M8B1-D3"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/schema.py"
+guard = "an executor infrastructure_failure is discarded at stage executed_action"
+kills = [
+    "tests/test_m5_crossfield.py::test_an_executor_infrastructure_failure_is_discarded_at_executed_action",
+    "tests/test_m5_fixlist.py::test_executor_infrastructure_failure_must_be_a_discard",
+]
+old = '''
+        elif r.discard_reason.stage != RunStage.EXECUTED_ACTION:'''
+new = '''
+        elif False:'''
+
+[[mutant]]
+id = "M8B1-D4"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/schema.py"
+guard = "a failed step carries its error"
+kills = [
+    "tests/test_m5_crossfield.py::test_only_a_failed_step_carries_error_text[failed-without-error]",
+]
+old = '''
+            if step.status == "failed" and not step.error:'''
+new = '''
+            if False:'''
+
+[[mutant]]
+id = "M8B1-D5"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/schema.py"
+guard = "an applied step carries no error"
+kills = [
+    "tests/test_m5_crossfield.py::test_only_a_failed_step_carries_error_text[applied-with-error]",
+]
+old = '''
+            elif step.status != "failed" and step.error is not None:'''
+new = '''
+            elif step.status == "skipped" and step.error is not None:'''
+
+[[mutant]]
+id = "M8B1-D6"
+source = "0025 M8B-1 offline executor"
+target = "safeops/experiment/schema.py"
+guard = "execution and step errors are bounded at MAX_DISCARD_ERROR"
+kills = [
+    "tests/test_m5_crossfield.py::test_execution_and_step_errors_are_bounded",
+]
+old = '''
+BoundedError = Annotated[str, Field(max_length=MAX_DISCARD_ERROR)]'''
+new = '''
+BoundedError = str'''

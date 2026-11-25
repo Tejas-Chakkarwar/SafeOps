@@ -24,6 +24,11 @@ Sha256 = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 UnitInterval = Annotated[float, Field(ge=0.0, le=1.0)]
 NonNegInt = Annotated[int, Field(ge=0)]
 
+# The one bound on recorded error text: a discard reason's, and the executor's execution
+# and step errors (decision 0025 D§16). Neutral, so the executor shares it without reaching
+# safeops.experiment.
+MAX_DISCARD_ERROR = 2000
+
 
 class StrictModel(BaseModel):
     """Frozen, extra keys refused, strict types, no NaN or infinity."""

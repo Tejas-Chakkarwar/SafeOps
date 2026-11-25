@@ -252,6 +252,9 @@ def test_executor_infrastructure_failure_must_be_a_discard(good) -> None:
     for k in ("stabilization_timed_out", "postaction_snapshot_hash"):
         rec = _set(rec, (k,), None)
     _check(_as_discard(rec, RunStage.EXECUTED_ACTION, "infrastructure_failure"))
+    # M8B-1 (decision 0025 D§16): and at that stage only, never a later one.
+    with pytest.raises(RecordValidationError, match="discarded at stage executed_action"):
+        _check(_as_discard(rec, RunStage.STABILIZATION, "infrastructure_failure"))
 
 
 def test_every_execution_status_is_covered_above() -> None:

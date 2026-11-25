@@ -46,6 +46,8 @@ PROTECTED = (
     "safeops.cluster",  # the guarded client the tools read through (Milestone 6)
     "safeops.actions",  # structural action contracts: parser now, executor at M8B (0025 D§3.4)
     "safeops.policy",  # strict policy loading + action semantics: features now, executor at M8B
+    "safeops.executor",  # receives only the action (0025 D§15); its transports are M8B-2
+    "safeops.stubs",  # the loud-stub marker the executor's unwired transports use
 )
 FORBIDDEN = (
     "safeops.faults",
@@ -177,6 +179,7 @@ def _fake_tree(tmp_path: Path, files: dict[str, str]) -> Path:
         "agent",
         "features",
         "gate",
+        "executor",
         "tools",
         "faults",
         "experiment",
@@ -466,3 +469,61 @@ def test_the_read_path_check_catches_each_reach(tmp_path: Path, where, source, l
     assert leak in leaked
     if leak == "safeops.tools":  # and, through the package's own __init__, the client
         assert "safeops.cluster" in leaked
+
+
+# --- the executor is protected (decision 0025 D§15, M8B-1) ------------------------------------
+
+
+def test_the_executor_is_walked_and_reaches_nothing_forbidden() -> None:
+    reachable = reachable_modules(REPO_ROOT, "safeops", ("safeops.executor",))
+    assert {
+        "safeops.executor.executor",
+        "safeops.executor.result",
+        "safeops.executor.transport",
+        "safeops.executor.quantity",
+        "safeops.executor.unwired",
+        "safeops.actions",
+        "safeops.policy",
+        "safeops.topology",
+        "safeops.domain",
+    } <= reachable
+    assert not _leaks(reachable, FORBIDDEN), sorted(_leaks(reachable, FORBIDDEN))
+
+
+def test_the_executors_modules_use_no_dynamic_import() -> None:
+    modules = _protected_modules(REPO_ROOT)
+    executor = {m: p for m, p in modules.items() if m.startswith("safeops.executor")}
+    assert "safeops.executor.executor" in executor
+    assert [hit for p in executor.values() for hit in dynamic_imports(p)] == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from safeops.experiment.schema import Execution\n",
+        "def record():\n    from ..experiment import schema\n",
+        "import safeops.faults.spec\n",
+    ],
+    ids=["schema", "relative-lazy", "faults"],
+)
+def test_an_executor_reaching_evaluator_state_is_caught(tmp_path: Path, source: str) -> None:
+    root = _fake_tree(
+        tmp_path,
+        {
+            "experiment/schema.py": "class Execution: ...\n",
+            "faults/spec.py": "X = 1\n",
+            "executor/executor.py": source,
+        },
+    )
+    assert _leaks(reachable_modules(root, "safeops", ("safeops.executor",)), FORBIDDEN)
+
+
+def test_the_m8a_read_path_roots_are_unchanged() -> None:
+    """The executor is protected, not a no-cluster read-path root: its M8B-2 adapters will
+    reach the guarded client legitimately."""
+    assert READ_PATH == (
+        "safeops.agent.parser",
+        "safeops.features",
+        "safeops.gate",
+        "safeops.policy",
+    )
