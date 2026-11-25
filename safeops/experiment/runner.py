@@ -16,9 +16,10 @@ import uuid
 from datetime import UTC, datetime
 
 from safeops.agent.loop import Agent
-from safeops.agent.parser import ProposalParser
+from safeops.agent.output import AgentOutput
+from safeops.agent.parser import ParsedProposal, ProposalParser
 from safeops.cluster import CommandError
-from safeops.enums import RunStage
+from safeops.enums import ProposalStatus, RunStage
 from safeops.environment.manager import (
     MAX_RESET_ERROR,
     CleanStateResult,
@@ -60,7 +61,28 @@ class PreRunDiscard(Exception):
     (§11.1), and the worker was quarantined and rebuilt."""
 
 
-__all__ = ["ExperimentRunner", "PostAgentDiscard", "PreRunDiscard", "RunUnit", "build_runner"]
+class ProviderFailure(Exception):
+    """The parser classified the agent's output as provider_failure: the LLM provider was
+    unavailable after retries. Not an agent outcome (§7.1): the run is discarded at stage
+    route_proposal with cause provider_failure (decision 0018, fix list item 3), and never
+    takes the no_action path into stabilization, effectiveness and harm."""
+
+
+class TrajectoryCountMismatch(RuntimeError):
+    """The agent's output declares a different number of trajectory steps than the loop
+    recorded: a harness inconsistency, an infrastructure_failure at stage parse (decision
+    0025 D§3.1). Never invalid_output: the model doesn't write the envelope."""
+
+
+__all__ = [
+    "ExperimentRunner",
+    "PostAgentDiscard",
+    "PreRunDiscard",
+    "ProviderFailure",
+    "RunUnit",
+    "TrajectoryCountMismatch",
+    "build_runner",
+]
 
 
 class ExperimentRunner:
@@ -203,6 +225,16 @@ class ExperimentRunner:
             raw_output, trajectory = self.agent.investigate(context)
             data["trajectory"] = trajectory  # from here on, R2: a record however it ends
             stage = RunStage.PARSE
+            # Decision 0025 D§3.1: checked at stage parse, after the trajectory is recorded,
+            # so the discard names parse and keeps the steps. A raw output that isn't an
+            # AgentOutput (a recording double) is left to the parser, which refuses it.
+            if isinstance(raw_output, AgentOutput) and raw_output.trajectory_steps != len(
+                trajectory
+            ):
+                raise TrajectoryCountMismatch(
+                    f"the agent declared {raw_output.trajectory_steps} trajectory steps,"
+                    f" the loop recorded {len(trajectory)}"
+                )
             proposal = data["proposal"] = self.parser.parse(raw_output)
 
             executed_action = None
@@ -458,9 +490,22 @@ class ExperimentRunner:
             self._topology = load_topology()
         return IncidentRuntimeContext(alert=alert, topology=self._topology, now=self._wall_clock())
 
-    @stub(milestone=8)
     def _gate_eligible_action(self, proposal):
-        """Return the proposed action if proposal_status == valid_action, else None (§7.1)."""
+        """The proposed action for valid_action, else None (§7.1; decision 0025 D§4).
+
+        no_action, invalid_output, step_limit and model_refusal are agent outcomes: no gate,
+        no execution, and the run is measured with harm(None). provider_failure is not an
+        agent outcome: it raises ProviderFailure, a discard here at route_proposal."""
+        if not isinstance(proposal, ParsedProposal):
+            raise TypeError(f"route_proposal takes a ParsedProposal, not {type(proposal)}")
+        if proposal.status is ProposalStatus.PROVIDER_FAILURE:
+            raise ProviderFailure("the LLM provider was unavailable after retries")
+        if proposal.status is ProposalStatus.VALID_ACTION:
+            action = proposal.proposal.recommended_action
+            if action is None:  # ParsedProposal forbids it; never route it as no_action
+                raise RuntimeError("a valid_action proposal without an action")
+            return action
+        return None
 
     @stub(milestone=8)
     def _should_execute(self, decision) -> bool:
@@ -494,6 +539,8 @@ def _cause(exc: BaseException, data: dict, aborted: bool) -> str:
     """The discard cause recorded for a failure (decision 0017 §1)."""
     if aborted:
         return "operator_abort"
+    if isinstance(exc, ProviderFailure):
+        return "provider_failure"
     if isinstance(exc, NotImplementedStage):
         return "not_implemented"
     if isinstance(exc, WorkloadGeneratorBusy):

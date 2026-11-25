@@ -1071,3 +1071,77 @@ No question is left open for Milestone 8. Items this decision deliberately hands
 - M8B must prove patch-only live, or amend this decision before widening RBAC (D§14).
 
 No case was found that the five execution statuses can't truthfully represent under D§11. The unresolved later composite step is represented conservatively (D§11.5), and its uncertainty is kept in the audit trail.
+
+## Amendment, 2026-11-24: Milestone 8A-1 implementation (parser and proposal routing)
+
+This records the implementation choices D§3 and D§4 delegated to M8A. Nothing above is changed. M8A-2 (features, configuration, gate, shadow scoring, `_should_execute`, feature provenance and schema rules) and M8B are not part of it.
+
+**Where things live:**
+
+| Item | Module |
+|---|---|
+| `AgentOutput` and `Termination` | `safeops/agent/output.py` |
+| `ParsedProposal` and `ProposalParser` | `safeops/agent/parser.py` |
+| The neutral structural action contract (D§3.4) | `safeops/actions.py`, now in the information-wall protected set; M8B imports the same module |
+| `ProviderFailure` and `TrajectoryCountMismatch` | `safeops/experiment/runner.py` |
+
+**`AgentOutput`:**
+- a frozen dataclass;
+- `termination` must be a `Termination` member;
+- `answer` and `refusal` carry a `str` (possibly empty); `step_limit` and `provider_failure` carry `None`;
+- `trajectory_steps` satisfies `type(...) is int` and `>= 0`;
+- a violation is a `TypeError` or `ValueError`: a harness bug, never `invalid_output`.
+
+**`ParsedProposal`:**
+- a frozen dataclass `(status, proposal)`;
+- construction enforces the status/proposal shape: `valid_action` has a proposal with an action, `no_action` one without, the other four none;
+- `to_record()` is `{"proposal_status", "proposal"}`, the proposal dumped in JSON mode.
+
+**Strict JSON:**
+- `json.loads` on the trimmed text, with:
+  - `object_pairs_hook` refusing a duplicate key in any object at any nesting level, while parsing;
+  - `parse_constant` refusing `NaN`, `Infinity` and `-Infinity`;
+  - `parse_float` refusing any decimal that decodes to a non-finite float (`1e400`).
+- A `ValueError` (including Python's integer-digit limit) or `RecursionError` from decoding is model content: `invalid_output`.
+- The value must be a JSON object.
+
+**Model-content validation:**
+- Every field is validated before the domain models are built, so model content can't raise a domain `ValidationError`.
+- No broad exception handler wraps the construction, so a genuine programming error still surfaces.
+- Evidence is checked by the parser as `1 <= e <= trajectory_steps`. The domain's `NonNegInt` would accept 0, and a record citing step 0 would be rejected later, so the parser-owned lower bound is load-bearing.
+
+**Delegated bounds:**
+
+| Field | Bound |
+|---|---|
+| `diagnosis` | at most 4096 characters; empty accepted; kept as written, never trimmed |
+| `prerequisites_claimed` | at most 32 entries, each 1–128 characters; no duplicates; kept as written |
+
+**The trajectory-count guard (D§3.1).**
+- It sits in `ExperimentRunner.run`, after `stage = RunStage.PARSE` and before `self.parser.parse(raw_output)`, so the trajectory is already recorded.
+- A mismatch raises `TrajectoryCountMismatch`. Through `_cause`'s default, that is `infrastructure_failure` at stage `parse`, with the steps kept.
+- A raw output that isn't an `AgentOutput` skips the check and is refused by the real parser (`TypeError`), at the same stage with the same cause. The legacy record tests' recording doubles therefore still pass non-envelope values to their fixed parsers, as decision 0024's workload-identity guard leaves doubles alone.
+
+**Routing (D§4):**
+- `_gate_eligible_action` takes a `ParsedProposal` (anything else is a `TypeError`);
+- `valid_action` returns its action (a missing action is a `RuntimeError`, never `None`);
+- `no_action`, `invalid_output`, `step_limit` and `model_refusal` return `None`;
+- `provider_failure` raises `ProviderFailure`, which `_cause` maps to `provider_failure`, the discard at `route_proposal`.
+
+**Unchanged:**
+- `_should_execute` and `_executed_action` remain stubs (M8A-2 and M8B);
+- `Agent.investigate` remains the first stub (Milestone 9);
+- the record schema, records, features, gates, executor and configuration are untouched.
+
+**Tests:**
+- `tests/test_m8_parser.py`: 130;
+- `tests/test_m8_routing.py`: 19. Every `ProposalStatus` is reached from a real `AgentOutput` through the real parser and routed through the real hook.
+
+**Mutants:** 15, source "0025 M8A-1 parser/routing".
+- Parser: `M8A1-P1`–`P10`. Respectively: duplicate keys, the non-finite tokens, overflow, booleans as integers, evidence lower bound, evidence upper bound, evidence duplicates, unknown proposal keys, a replica range moved into the parser, and provider failure as refusal.
+- Runner: `M8A1-R1`–`R5`. Respectively: provider failure routed as no-action, its `_cause` branch, the count guard, the guard moved before `stage = PARSE`, and `valid_action` routed as `None`.
+- All 15 were killed by their named tests, with 0 survivors and 0 harness errors.
+
+**Carried to M8A-2** (D§15, unchanged; recorded so they aren't lost):
+1. A static test refusing `importlib`, `__import__`, `exec` and `eval` across the complete protected read-path runtime.
+2. A direct import or static assertion that the parser, the extractor, the gate runtime and the shadow scorer never import or reach Kubernetes client machinery. `safeops.cluster` is in the protected set, not the forbidden set, so the ordinary information-wall test alone doesn't prevent protected code from reaching `Kubectl`. A constructor-signature test is not a substitute.

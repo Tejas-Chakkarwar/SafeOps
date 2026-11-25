@@ -36,6 +36,7 @@ PROTECTED = (
     "safeops.enums",
     "safeops.topology",
     "safeops.cluster",  # the guarded client the tools read through (Milestone 6)
+    "safeops.actions",  # structural action contracts: parser now, executor at M8B (0025 D§3.4)
 )
 FORBIDDEN = (
     "safeops.faults",

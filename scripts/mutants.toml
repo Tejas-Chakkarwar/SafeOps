@@ -1612,3 +1612,229 @@ old = '''
         min_successes=data["min_successes"],'''
 new = '''
         min_successes=int(data["min_successes"]),'''
+
+# --- Milestone 8A-1: the proposal parser and proposal routing (decision 0025 D§3, D§4) -------
+
+[[mutant]]
+id = "M8A1-P1"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/agent/parser.py"
+guard = "duplicate JSON keys are refused while parsing, at every level"
+kills = [
+    "tests/test_m8_parser.py::test_duplicate_top_level_key",
+    "tests/test_m8_parser.py::test_duplicate_keys_at_every_nesting_level",
+]
+old = '''
+            object_pairs_hook=_no_duplicates,'''
+new = '''
+            object_pairs_hook=dict,'''
+
+[[mutant]]
+id = "M8A1-P2"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/agent/parser.py"
+guard = "the JSON boundary refuses NaN, Infinity and -Infinity"
+kills = [
+    "tests/test_m8_parser.py::test_the_json_boundary_refuses_non_finite_values_itself",
+]
+old = '''
+            parse_constant=_refuse_constant,'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8A1-P3"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/agent/parser.py"
+guard = "the JSON boundary refuses numbers that overflow to infinity"
+kills = [
+    "tests/test_m8_parser.py::test_the_json_boundary_refuses_numbers_that_overflow_to_infinity",
+]
+old = '''
+    if not math.isfinite(value):
+        raise _Malformed(f"number {text} is not finite")'''
+new = '''
+    if False:
+        raise _Malformed(f"number {text} is not finite")'''
+
+[[mutant]]
+id = "M8A1-P4"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/actions.py"
+guard = "a JSON boolean is never an integer parameter"
+kills = [
+    "tests/test_m8_parser.py::test_malformed_params_are_invalid_output[scale-bool]",
+]
+old = '''
+    return type(value) is int'''
+new = '''
+    return isinstance(value, int)'''
+
+[[mutant]]
+id = "M8A1-P5"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/agent/parser.py"
+guard = "evidence is 1-based: step 0 is invalid_output (the domain type would accept it)"
+kills = [
+    "tests/test_m8_parser.py::test_evidence_zero_is_refused",
+]
+old = '''
+    if not all(exact_int(e) and 1 <= e <= steps for e in evidence):'''
+new = '''
+    if not all(exact_int(e) and 0 <= e <= steps for e in evidence):'''
+
+[[mutant]]
+id = "M8A1-P6"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/agent/parser.py"
+guard = "evidence cites only steps the loop declared"
+kills = [
+    "tests/test_m8_parser.py::test_evidence_above_the_declared_steps_is_refused",
+]
+old = '''
+    if not all(exact_int(e) and 1 <= e <= steps for e in evidence):'''
+new = '''
+    if not all(exact_int(e) and 1 <= e for e in evidence):'''
+
+[[mutant]]
+id = "M8A1-P7"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/agent/parser.py"
+guard = "duplicate evidence steps are refused, never deduplicated"
+kills = [
+    "tests/test_m8_parser.py::test_duplicate_evidence_is_refused",
+]
+old = '''
+    if len(set(evidence)) != len(evidence):
+        return None'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8A1-P8"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/agent/parser.py"
+guard = "the proposal has exactly its five keys; an unknown one is invalid_output"
+kills = [
+    "tests/test_m8_parser.py::test_an_unknown_proposal_key_is_invalid",
+]
+old = '''
+    if set(obj) != PROPOSAL_KEYS:'''
+new = '''
+    if not PROPOSAL_KEYS <= set(obj):'''
+
+[[mutant]]
+id = "M8A1-P9"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/actions.py"
+guard = "the replica hard range is the envelope's, never the parser's"
+kills = [
+    "tests/test_m8_parser.py::test_envelope_invalid_but_well_typed_actions_stay_valid[scale-500]",
+]
+old = '''
+        if not exact_int(params["replicas"]):'''
+new = '''
+        if not (exact_int(params["replicas"]) and 0 <= params["replicas"] <= 20):'''
+
+[[mutant]]
+id = "M8A1-P10"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/agent/parser.py"
+guard = "a provider failure is provider_failure, never model_refusal"
+kills = [
+    "tests/test_m8_parser.py::test_provider_failure_comes_from_the_envelope",
+]
+old = '''
+            return ParsedProposal(ProposalStatus.PROVIDER_FAILURE, None)'''
+new = '''
+            return ParsedProposal(ProposalStatus.MODEL_REFUSAL, None)'''
+
+[[mutant]]
+id = "M8A1-R1"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/experiment/runner.py"
+guard = "provider_failure raises its routing signal, never the no_action path"
+kills = [
+    "tests/test_m8_routing.py::test_provider_failure_raises_its_routing_signal",
+    "tests/test_m8_routing.py::test_provider_failure_is_a_discard_at_route_proposal",
+]
+old = '''
+            raise ProviderFailure("the LLM provider was unavailable after retries")'''
+new = '''
+            return None'''
+
+[[mutant]]
+id = "M8A1-R2"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/experiment/runner.py"
+guard = "the provider signal is cause provider_failure, not the infrastructure_failure default"
+kills = [
+    "tests/test_m8_routing.py::test_the_provider_signal_is_cause_provider_failure",
+    "tests/test_m8_routing.py::test_provider_failure_is_a_discard_at_route_proposal",
+]
+old = '''
+    if isinstance(exc, ProviderFailure):
+        return "provider_failure"'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8A1-R3"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/experiment/runner.py"
+guard = "a trajectory-count mismatch is a harness failure, not parsed"
+kills = [
+    "tests/test_m8_routing.py::test_a_trajectory_count_mismatch_is_discarded_at_parse[declared-1-actual-0]",
+    "tests/test_m8_routing.py::test_a_trajectory_count_mismatch_is_discarded_at_parse[declared-0-actual-1]",
+]
+old = '''
+            if isinstance(raw_output, AgentOutput) and raw_output.trajectory_steps != len('''
+new = '''
+            if False and raw_output.trajectory_steps != len('''
+
+[[mutant]]
+id = "M8A1-R4"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/experiment/runner.py"
+guard = "the count guard runs at stage parse, so its discard names parse, not agent"
+kills = [
+    "tests/test_m8_routing.py::test_a_trajectory_count_mismatch_is_discarded_at_parse[declared-1-actual-0]",
+    "tests/test_m8_routing.py::test_a_trajectory_count_mismatch_is_discarded_at_parse[declared-0-actual-1]",
+]
+old = '''
+            stage = RunStage.PARSE
+            # Decision 0025 D§3.1: checked at stage parse, after the trajectory is recorded,
+            # so the discard names parse and keeps the steps. A raw output that isn't an
+            # AgentOutput (a recording double) is left to the parser, which refuses it.
+            if isinstance(raw_output, AgentOutput) and raw_output.trajectory_steps != len(
+                trajectory
+            ):
+                raise TrajectoryCountMismatch(
+                    f"the agent declared {raw_output.trajectory_steps} trajectory steps,"
+                    f" the loop recorded {len(trajectory)}"
+                )'''
+new = '''
+            if isinstance(raw_output, AgentOutput) and raw_output.trajectory_steps != len(
+                trajectory
+            ):
+                raise TrajectoryCountMismatch(
+                    f"the agent declared {raw_output.trajectory_steps} trajectory steps,"
+                    f" the loop recorded {len(trajectory)}"
+                )
+            stage = RunStage.PARSE'''
+
+[[mutant]]
+id = "M8A1-R5"
+source = "0025 M8A-1 parser/routing"
+target = "safeops/experiment/runner.py"
+guard = "valid_action routes its action, never None"
+kills = [
+    "tests/test_m8_routing.py::test_valid_action_routes_its_action",
+    "tests/test_m8_routing.py::test_valid_action_routes_on_to_the_extract_seam",
+]
+old = '''
+            return action
+        return None'''
+new = '''
+            return None
+        return None'''
