@@ -108,10 +108,15 @@ class ProvenanceSource:
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         kubectl=None,
         is_pilot_run: bool = True,
+        topology_hash: str | None = None,
     ) -> None:
         self._root = repo_root
         self._run = runner
         self._kubectl = kubectl
+        # The bound topology condition's hash (build_runner: TopologyCondition.sha256), so the
+        # record's topology_hash names the bytes the run's topology was parsed from (decision
+        # 0025, M8A-2 topology amendment). None: legacy and offline writers hash the file.
+        self._topology_hash = topology_hash
         # Every run before the Milestone 14 freeze is a pilot run, excluded from the final
         # evaluation (§10.8). The campaign runner turns this off after the freeze.
         self.is_pilot_run = is_pilot_run
@@ -173,7 +178,11 @@ class ProvenanceSource:
             "fault_definition_hash": None,
             "fault_backend": None,
             "desired_state_hash": _sha256_file(self._root / "config" / "desired_state.yaml"),
-            "topology_hash": _sha256_file(self._root / "config" / "topology.yaml"),
+            "topology_hash": (
+                self._topology_hash
+                if self._topology_hash is not None
+                else _sha256_file(self._root / "config" / "topology.yaml")
+            ),
             "snapshot_projection_version": SNAPSHOT_PROJECTION_VERSION,
             "safeops_commit": commit,
             "safeops_tree_dirty": status is None or bool(status.strip()),

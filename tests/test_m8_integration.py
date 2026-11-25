@@ -34,7 +34,7 @@ from safeops.gate.protocol import Gate, GateDecision
 from safeops.gate.shadow import ShadowGateScorer, random_draw
 from safeops.stubs import NotImplementedStage, stub_milestone
 from tests.conftest import FakeEnvironment, FakeInjector, FakeWorkload
-from tests.m8_fixtures import deployment, ok, step
+from tests.m8_fixtures import CONDITION, deployment, ok, step
 from tests.test_m5_records import RECOVERED, SHA, UNIT, AgentProvenance, Fixed, Rec
 
 POLICY = load_policy()
@@ -82,6 +82,17 @@ class Spy:
         return call
 
 
+class BoundProvenance(AgentProvenance):
+    """Agent provenance whose topology_hash is the bound condition's, as build_runner's
+    ProvenanceSource(topology_hash=condition.sha256) gives a production record."""
+
+    def __init__(self, topology_hash: str = CONDITION.sha256) -> None:
+        self.topology_hash = topology_hash
+
+    def collect(self) -> dict:
+        return {**super().collect(), "topology_hash": self.topology_hash}
+
+
 class RecordingWriter(RunRecordWriter):
     """The seam that stops before production persistence: it keeps the fields."""
 
@@ -98,7 +109,11 @@ class CorruptingWriter(RunRecordWriter):
     """The real writer and its read-path check, with one value changed on its way in."""
 
     def __init__(self, runs_dir, read_path, corrupt=None) -> None:
-        super().__init__(runs_dir=runs_dir, provenance=AgentProvenance(), read_path=read_path)
+        super().__init__(
+            runs_dir=runs_dir,
+            provenance=BoundProvenance(read_path.condition.sha256),
+            read_path=read_path,
+        )
         self.corrupt = corrupt
 
     def finalize(self, runtime_context=None, **fields):
@@ -115,14 +130,27 @@ class TracingRunner(ExperimentRunner):
         return result
 
 
-def _runner(tmp_path, *, agent=None, gate=None, executor=None, records=None, scorer=None):
+def _runner(
+    tmp_path,
+    *,
+    agent=None,
+    gate=None,
+    executor=None,
+    records=None,
+    scorer=None,
+    condition=CONDITION,
+    injector=None,
+):
+    """One condition shared, as build_runner shares it: the runner's topology is the very
+    object the writer's ReadPathCheck holds, and the writer records that condition's hash."""
     extractor = RiskFeatureExtractor(POLICY)
     shadow = ShadowGateScorer(POLICY)
-    records = records or CorruptingWriter(tmp_path / "runs", ReadPathCheck(extractor, shadow))
+    check = ReadPathCheck(extractor, shadow, condition)
+    records = records or CorruptingWriter(tmp_path / "runs", check)
     return TracingRunner(
         environment=FakeEnvironment(),
         workload=FakeWorkload(),
-        injector=FakeInjector(),
+        injector=injector or FakeInjector(),
         alerts=AlertGenerator(namespace="testbed"),
         agent=agent or OutputAgent(),
         parser=ProposalParser(),
@@ -133,6 +161,7 @@ def _runner(tmp_path, *, agent=None, gate=None, executor=None, records=None, sco
         effectiveness=Fixed(RECOVERED),
         harm=Fixed(Rec({"harmful": False, "harm_violations": []})),
         records=records,
+        topology=condition.topology,
     )
 
 
@@ -364,7 +393,13 @@ CORRUPTIONS = {
         "provenance.gate_feature_version",
     ),
     "stored-trajectory": (_replace_trajectory, "feature_vector.blast_radius"),
-    "runtime-topology": (_other_topology, "feature_vector.blast_radius"),
+    # Since the M8A-2 topology fix this fails at the condition identity, before any feature
+    # is recomputed; it used to surface later, as a blast_radius mismatch.
+    "runtime-topology": (
+        _other_topology,
+        "the runtime context's topology is not the bound topology condition's",
+    ),
+    "topology-hash": (_replace_provenance("topology_hash", SHA), "provenance.topology_hash"),
     "stored-proposal": (_replace_claims, "feature_vector.prerequisites_unverified"),
     "no-runtime-context": (_drop_context, "no runtime context"),
 }
@@ -379,7 +414,9 @@ def test_the_uncorrupted_record_passes_the_write_time_check(tmp_path) -> None:
 @pytest.mark.parametrize(("corrupt", "problem"), CORRUPTIONS.values(), ids=CORRUPTIONS.keys())
 def test_a_clobbered_value_or_mismatched_evidence_is_refused(tmp_path, corrupt, problem) -> None:
     extractor, scorer = RiskFeatureExtractor(POLICY), ShadowGateScorer(POLICY)
-    writer = CorruptingWriter(tmp_path / "runs", ReadPathCheck(extractor, scorer), corrupt)
+    writer = CorruptingWriter(
+        tmp_path / "runs", ReadPathCheck(extractor, scorer, CONDITION), corrupt
+    )
     r = _runner(tmp_path, records=writer)
     with pytest.raises(RecordValidationError, match="writer bug") as exc:
         r.run(UNIT)
@@ -390,9 +427,11 @@ def test_a_clobbered_value_or_mismatched_evidence_is_refused(tmp_path, corrupt, 
 
 def test_the_read_path_check_needs_one_shared_policy() -> None:
     with pytest.raises(ValueError, match="share one policy"):
-        ReadPathCheck(RiskFeatureExtractor(POLICY), ShadowGateScorer(load_policy()))
+        ReadPathCheck(RiskFeatureExtractor(POLICY), ShadowGateScorer(load_policy()), CONDITION)
     with pytest.raises(TypeError):
-        ReadPathCheck(object(), ShadowGateScorer(POLICY))
+        ReadPathCheck(object(), ShadowGateScorer(POLICY), CONDITION)
+    with pytest.raises(TypeError, match="TopologyCondition"):
+        ReadPathCheck(RiskFeatureExtractor(POLICY), ShadowGateScorer(POLICY), CONDITION.topology)
 
 
 # --- offline validation is configuration-free ----------------------------------------------------
@@ -465,7 +504,9 @@ def test_build_runner_shares_one_loaded_policy() -> None:
 def test_the_writers_provenance_comes_from_the_loaded_policy(tmp_path) -> None:
     extractor, scorer = RiskFeatureExtractor(POLICY), ShadowGateScorer(POLICY)
     writer = RunRecordWriter(
-        runs_dir=tmp_path, provenance=AgentProvenance(), read_path=ReadPathCheck(extractor, scorer)
+        runs_dir=tmp_path,
+        provenance=AgentProvenance(),
+        read_path=ReadPathCheck(extractor, scorer, CONDITION),
     )
     captured = writer.capture_provenance(UNIT)
     assert {k: captured[k] for k in POLICY.provenance()} == POLICY.provenance()
@@ -534,4 +575,177 @@ def test_a_policy_file_that_cannot_load_is_a_readable_usage_error(tmp_path, monk
     )
     assert result.exit_code == cli.EXIT_USAGE
     assert "policy configuration: gate_weights.yaml" in result.stderr
+    assert "Traceback" not in result.output + result.stderr
+
+
+# --- the bound topology condition (decision 0025, M8A-2 topology amendment) -----------------------
+
+import hashlib  # noqa: E402
+import shutil  # noqa: E402
+import subprocess as _subprocess  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from safeops.experiment.records import ProvenanceSource  # noqa: E402
+from safeops.faults.injector import FaultInjectionError  # noqa: E402
+from safeops.topology import TOPOLOGY_PATH, load_topology_condition  # noqa: E402
+
+EDGE_FROM = "  postgres:  {depends_on: [], stateful: true}\n"
+EDGE_TO = EDGE_FROM + "  edge:      {depends_on: [gateway]}\n"
+
+
+def _offline_run(args, **kw):
+    return _subprocess.CompletedProcess(args, 1, "", "")  # git/kind unreadable: null
+
+
+class _NoCluster:
+    def read(self, *args):
+        raise RuntimeError("no cluster in offline tests")
+
+
+def _repo(tmp_path) -> Path:
+    """A repository root holding copies of the two hashed config files."""
+    (tmp_path / "config").mkdir()
+    for name in ("topology.yaml", "desired_state.yaml"):
+        shutil.copy(TOPOLOGY_PATH.parent / name, tmp_path / "config" / name)
+    return tmp_path
+
+
+def _sha(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _count_reads(monkeypatch, name: str) -> list[Path]:
+    reads: list[Path] = []
+    real = Path.read_bytes
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda self: (reads.append(self) if self.name == name else None) or real(self),
+    )
+    return reads
+
+
+def test_production_provenance_records_the_bound_hash_not_the_file(tmp_path, monkeypatch) -> None:
+    root = _repo(tmp_path)
+    topology = root / "config" / "topology.yaml"
+    condition = load_topology_condition(topology)  # A
+    topology.write_text(topology.read_text().replace(EDGE_FROM, EDGE_TO))  # A -> B
+    assert _sha(topology) != condition.sha256
+    reads = _count_reads(monkeypatch, "topology.yaml")
+    bound = ProvenanceSource(
+        repo_root=root, runner=_offline_run, kubectl=_NoCluster(), topology_hash=condition.sha256
+    ).collect()
+    assert bound["topology_hash"] == condition.sha256  # hash(A), never hash(B)
+    assert reads == []  # the bound path never reopens the topology file
+
+
+def test_unbound_provenance_keeps_its_file_hash_fallback(tmp_path) -> None:
+    root = _repo(tmp_path)
+    legacy = ProvenanceSource(repo_root=root, runner=_offline_run, kubectl=_NoCluster()).collect()
+    assert legacy["topology_hash"] == _sha(root / "config" / "topology.yaml")
+
+
+def test_build_runner_reads_one_topology_condition_and_shares_it(monkeypatch) -> None:
+    reads = _count_reads(monkeypatch, "topology.yaml")
+    r = runner_module.build_runner()
+    assert len(reads) == 1  # one read: hashed and parsed from the same bytes
+    condition = r.records.read_path.condition
+    assert r._topology is condition.topology
+    assert r.records.provenance._topology_hash == condition.sha256 == _sha(TOPOLOGY_PATH)
+    assert "topology_hash" not in r.records.read_path.provenance()  # one topology value
+
+
+def test_a_reused_runner_keeps_one_condition_across_a_file_change(tmp_path) -> None:
+    topology = tmp_path / "topology.yaml"
+    shutil.copy(TOPOLOGY_PATH, topology)
+    condition = load_topology_condition(topology)  # A
+    r = _runner(tmp_path, condition=condition)
+    with pytest.raises(NotImplementedStage):
+        r.run(UNIT)
+    topology.write_text(topology.read_text().replace(EDGE_FROM, EDGE_TO))  # A -> B
+    with pytest.raises(NotImplementedStage):
+        r.run(UNIT)
+    records = _written(tmp_path)
+    assert len(records) == 2 and _written(tmp_path, "rejected") == []
+    assert {rec["provenance"]["topology_hash"] for rec in records} == {condition.sha256}
+    assert {rec["feature_vector"]["blast_radius"] for rec in records} == {0.3}  # A's D_max
+    assert r._topology is condition.topology
+
+
+class _FailingInjector(FakeInjector):
+    def inject(self, fault_id, fault_seed):
+        raise FaultInjectionError("injection refused")
+
+
+def test_a_featureless_record_without_a_runtime_context_validates(tmp_path) -> None:
+    r = _runner(tmp_path, injector=_FailingInjector())
+    with pytest.raises(FaultInjectionError):
+        r.run(UNIT)  # a pre-agent discard: no context was ever built
+    (rec,) = _written(tmp_path)
+    assert rec["discard_reason"]["stage"] == "inject" and rec["feature_vector"] is None
+    assert rec["provenance"]["topology_hash"] == CONDITION.sha256
+
+
+def test_a_featureless_record_with_a_wrong_topology_hash_is_refused(tmp_path) -> None:
+    extractor, scorer = RiskFeatureExtractor(POLICY), ShadowGateScorer(POLICY)
+    writer = CorruptingWriter(
+        tmp_path / "runs",
+        ReadPathCheck(extractor, scorer, CONDITION),
+        _replace_provenance("topology_hash", SHA),
+    )
+    r = _runner(tmp_path, injector=_FailingInjector(), records=writer)
+    with pytest.raises(RecordValidationError, match="provenance.topology_hash") as exc:
+        r.run(UNIT)
+    assert "feature_vector" not in str(exc.value)
+    assert _written(tmp_path) == [] and len(_written(tmp_path, "rejected")) == 1
+
+
+@pytest.mark.parametrize("corrupt", [False, True], ids=["correct-hash", "wrong-hash"])
+def test_a_no_action_record_checks_its_topology_hash(tmp_path, corrupt) -> None:
+    no_action = OutputAgent(_text(action=None))
+    extractor, scorer = RiskFeatureExtractor(POLICY), ShadowGateScorer(POLICY)
+    hook = _replace_provenance("topology_hash", SHA) if corrupt else None
+    writer = CorruptingWriter(tmp_path / "runs", ReadPathCheck(extractor, scorer, CONDITION), hook)
+    r = _runner(tmp_path, agent=no_action, records=writer)
+    if corrupt:
+        with pytest.raises(RecordValidationError, match="provenance.topology_hash"):
+            r.run(UNIT)
+        assert _written(tmp_path) == []
+    else:
+        r.run(UNIT)
+        (rec,) = _written(tmp_path)
+        assert rec["proposal_status"] == "no_action" and rec["feature_vector"] is None
+
+
+def test_an_equal_but_unbound_topology_is_refused_before_recomputation(tmp_path) -> None:
+    """Another load of the very same file: equal content, not the bound object."""
+    other = load_topology_condition()
+    assert other.sha256 == CONDITION.sha256 and other.topology is not CONDITION.topology
+    extractor, scorer = RiskFeatureExtractor(POLICY), ShadowGateScorer(POLICY)
+    writer = CorruptingWriter(tmp_path / "runs", ReadPathCheck(extractor, scorer, CONDITION))
+    r = _runner(tmp_path, records=writer)
+    r._topology = other.topology  # the runner's context holds the unbound copy
+    with pytest.raises(RecordValidationError) as exc:
+        r.run(UNIT)
+    message = str(exc.value)
+    assert "the runtime context's topology is not the bound topology condition's" in message
+    assert "feature_vector." not in message  # refused before any feature is recomputed
+
+
+def test_a_broken_topology_is_a_topology_error_not_a_policy_error(tmp_path, monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from safeops import cli
+
+    bad = tmp_path / "topology.yaml"
+    bad.write_text(TOPOLOGY_PATH.read_text().replace("stateful: true", 'stateful: "false"'))
+    monkeypatch.setattr(
+        runner_module, "load_topology_condition", lambda: load_topology_condition(bad)
+    )
+    result = CliRunner().invoke(
+        cli.app, ["run", "--fault", "bad-deployment-config", "--seed", "0", "--trial", "0"]
+    )
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "topology configuration: topology.yaml" in result.stderr
+    assert "policy configuration" not in result.stderr
     assert "Traceback" not in result.output + result.stderr

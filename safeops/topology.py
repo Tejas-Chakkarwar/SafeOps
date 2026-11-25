@@ -12,6 +12,7 @@ Graph direction: depends_on edges point from caller to callee.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -106,18 +107,38 @@ class ServiceTopology:
         return seen
 
 
+def _mapping(raw: object, where: str) -> dict:
+    """`raw` must be a mapping: checked before any .get(), `in` or iteration on it."""
+    if type(raw) is not dict:
+        raise TopologyError(f"{where}: expected a mapping, got {type(raw).__name__}")
+    return raw
+
+
+def _flag(raw: dict, key: str, where: str) -> bool:
+    """An optional boolean: absent is false; present must be a real YAML boolean. A quoted
+    "false" or a 0/1 is refused, never read through truthiness."""
+    value = raw.get(key, False)
+    if type(value) is not bool:
+        raise TopologyError(f"{where}.{key}: expected true or false, got {value!r}")
+    return value
+
+
+def _endpoint(value: object) -> bool:
+    """A finite int or float, never a bool (bool subclasses int) or NaN or an infinity."""
+    return type(value) in (int, float) and math.isfinite(value)
+
+
 def _range(raw: object, where: str) -> Range:
-    if not (
-        isinstance(raw, list) and len(raw) == 2 and all(isinstance(v, int | float) for v in raw)
-    ):
-        raise TopologyError(f"{where}: expected [lo, hi], got {raw!r}")
+    if not (type(raw) is list and len(raw) == 2 and all(_endpoint(v) for v in raw)):
+        raise TopologyError(f"{where}: expected [lo, hi] of finite numbers, got {raw!r}")
     lo, hi = raw
     if lo > hi:
         raise TopologyError(f"{where}: lo {lo} > hi {hi}")
     return Range(lo, hi)
 
 
-def _bounds(raw: dict, where: str) -> Bounds:
+def _bounds(raw: object, where: str) -> Bounds:
+    raw = _mapping(raw, where)
     hard = _range(raw.get("hard_range"), f"{where}.hard_range")
     safe = _range(raw.get("safe_range"), f"{where}.safe_range")
     if not (hard.lo <= safe.lo and safe.hi <= hard.hi):
@@ -138,44 +159,60 @@ def _frozen(value):
     return value
 
 
-def parse_topology(data: dict) -> ServiceTopology:
-    services = data.get("services") or {}
-    depends_on = {
-        name: tuple((spec or {}).get("depends_on", [])) for name, spec in services.items()
-    }
+def parse_topology(data: object) -> ServiceTopology:
+    """The ServiceTopology of a parsed topology document. Every malformed shape is a
+    TopologyError: bodies are checked as mappings before they're read, booleans are real
+    booleans, and range endpoints are finite non-boolean numbers."""
+    data = _mapping(data, "topology")
+    services = _mapping(data.get("services") or {}, "services")
+    depends_on: dict[str, tuple[str, ...]] = {}
+    stateful: set[str] = set()
+    for name, spec in services.items():
+        spec = _mapping(spec, f"service {name}")
+        callees = spec.get("depends_on", [])
+        if type(callees) is not list or any(type(c) is not str for c in callees):
+            raise TopologyError(f"service {name}: depends_on must be a list of service names")
+        depends_on[name] = tuple(callees)
+        if _flag(spec, "stateful", f"service {name}"):
+            stateful.add(name)
     for name, callees in depends_on.items():
         for callee in callees:
             if callee not in depends_on:
                 raise TopologyError(f"service {name} depends on unknown service {callee}")
-    stateful = frozenset(n for n, s in services.items() if (s or {}).get("stateful"))
 
     resources: dict[str, ResourceSpec] = {}
-    for name, raw in (data.get("resources") or {}).items():
+    for name, raw in _mapping(data.get("resources") or {}, "resources").items():
+        raw = _mapping(raw, f"resource {name}")
         kind, owner = raw.get("kind"), raw.get("owner")
-        if kind not in PROJECTED_KINDS:
+        if type(kind) is not str or kind not in PROJECTED_KINDS:
             raise TopologyError(f"resource {name}: kind {kind!r} is not a projected kind")
-        if owner not in depends_on:
+        if type(owner) is not str or owner not in depends_on:
             raise TopologyError(f"resource {name}: owner {owner!r} is not a service")
         bounds = {f: _bounds(raw[f], f"{name}.{f}") for f in RANGED_FIELDS if f in raw}
         if kind == "Deployment" and set(bounds) != set(RANGED_FIELDS):
             raise TopologyError(f"Deployment {name} needs bounds for {', '.join(RANGED_FIELDS)}")
-        approved = raw.get("approved_keys") or {}
+        approved = _mapping(raw.get("approved_keys") or {}, f"resource {name}.approved_keys")
         if approved and kind != "ConfigMap":
             raise TopologyError(f"resource {name}: approved_keys only apply to ConfigMaps")
         for key, rule in approved.items():
-            if "enum" not in rule:
-                _bounds(rule, f"{name}.approved_keys.{key}")
+            where = f"{name}.approved_keys.{key}"
+            rule = _mapping(rule, where)
+            if "enum" in rule:
+                if type(rule["enum"]) is not list or not rule["enum"]:
+                    raise TopologyError(f"{where}.enum: expected a non-empty list")
+            else:
+                _bounds(rule, where)
         resources[name] = ResourceSpec(
             name=name,
             kind=kind,
             owner=owner,
             bounds=MappingProxyType(bounds),
             approved_keys=_frozen(dict(approved)),
-            persistence_affecting=bool(raw.get("persistence_affecting", False)),
+            persistence_affecting=_flag(raw, "persistence_affecting", f"resource {name}"),
         )
     return ServiceTopology(
         depends_on=MappingProxyType(depends_on),
-        stateful=stateful,
+        stateful=frozenset(stateful),
         resources=MappingProxyType(resources),
     )
 
@@ -213,7 +250,36 @@ def ownership_report(topology: ServiceTopology, items: list[dict]) -> list[str]:
     return problems
 
 
-def load_topology(path: Path = TOPOLOGY_PATH) -> ServiceTopology:
-    import yaml
+@dataclass(frozen=True)
+class TopologyCondition:
+    """A parsed topology bound to the SHA-256 of the exact bytes it was parsed from
+    (decision 0025, M8A-2 topology amendment). Whatever records `sha256` as topology_hash
+    and uses `topology` can't be describing two different files."""
 
-    return parse_topology(yaml.safe_load(path.read_text()))
+    topology: ServiceTopology
+    sha256: str  # "sha256:" + 64 lowercase hex, over the file's bytes as read
+
+
+def load_topology_condition(path: Path | None = None) -> TopologyCondition:
+    """Read the topology file once; hash and parse exactly those bytes, strictly.
+
+    The strict loader is safeops.policy's (duplicate, merge and non-string keys refused,
+    strict UTF-8). Its failures are translated back to TopologyError: a bad topology stays
+    a topology error, never a policy one."""
+    from safeops.policy import PolicyError, read_policy_file
+
+    try:
+        loaded = read_policy_file(TOPOLOGY_PATH if path is None else path)
+    except PolicyError as exc:
+        raise TopologyError(str(exc)) from None
+    try:
+        topology = parse_topology(loaded.data)
+    except TopologyError as exc:
+        raise TopologyError(f"{loaded.name}: {exc}") from None
+    return TopologyCondition(topology=topology, sha256=loaded.sha256)
+
+
+def load_topology(path: Path | None = None) -> ServiceTopology:
+    """The topology alone. Its consumers that also record topology_hash must use
+    load_topology_condition instead, so both come from one read."""
+    return load_topology_condition(path).topology

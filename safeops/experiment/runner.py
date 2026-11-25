@@ -35,7 +35,7 @@ from safeops.environment.workload import (
 )
 from safeops.executor.executor import ActionExecutor
 from safeops.experiment.consistency import ReadPathCheck
-from safeops.experiment.records import RECORD_FIELDS, Discard, RunRecordWriter
+from safeops.experiment.records import RECORD_FIELDS, Discard, ProvenanceSource, RunRecordWriter
 from safeops.experiment.unit import RunUnit
 from safeops.faults.alerts import AlertGenerator
 from safeops.faults.injector import (
@@ -50,6 +50,7 @@ from safeops.gate.always_act import AlwaysActGate
 from safeops.gate.protocol import Gate, GateDecision
 from safeops.gate.shadow import ShadowGateScorer
 from safeops.stubs import NotImplementedStage, stub
+from safeops.topology import ServiceTopology, load_topology_condition
 from safeops.verify.effectiveness import EffectivenessVerifier
 from safeops.verify.harm import HarmChecker
 
@@ -105,6 +106,7 @@ class ExperimentRunner:
         effectiveness: EffectivenessVerifier,
         harm: HarmChecker,
         records: RunRecordWriter,
+        topology: ServiceTopology | None = None,
     ) -> None:
         self.environment = environment
         self.workload = workload
@@ -120,7 +122,10 @@ class ExperimentRunner:
         self.harm = harm
         self.records = records
         self._halt: Exception | None = None
-        self._topology = None
+        # build_runner injects the bound TopologyCondition's topology, the same object the
+        # writer's ReadPathCheck holds, so it is fixed before any provenance is captured.
+        # None (legacy doubles only): loaded at the first runtime context, unbound.
+        self._topology = topology
         self._wall_clock = lambda: datetime.now(UTC)
         self._new_run_id = uuid.uuid4
         self._monotonic = time.monotonic  # elapsed time; never serialized
@@ -584,6 +589,9 @@ def build_runner() -> ExperimentRunner:
     policy = load_policy()
     extractor = RiskFeatureExtractor(policy)
     shadow_gates = ShadowGateScorer(policy)
+    # One topology condition, read once: the runtime context's topology, the record's
+    # topology_hash and the write-time check all come from these bytes (M8A-2 topology fix).
+    condition = load_topology_condition()
     return ExperimentRunner(
         environment=EnvironmentManager(),
         workload=workload,
@@ -598,6 +606,9 @@ def build_runner() -> ExperimentRunner:
         effectiveness=EffectivenessVerifier(workload=workload),
         harm=HarmChecker(),
         records=RunRecordWriter(  # one spec source for both
-            faults_dir=FAULTS_DIR, read_path=ReadPathCheck(extractor, shadow_gates)
+            faults_dir=FAULTS_DIR,
+            provenance=ProvenanceSource(topology_hash=condition.sha256),
+            read_path=ReadPathCheck(extractor, shadow_gates, condition),
         ),
+        topology=condition.topology,
     )

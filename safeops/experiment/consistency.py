@@ -7,7 +7,10 @@ tool results, the stored alert, and run_id) under the exact runtime topology and
 policy objects the run used, and compares:
 
 - the eight feature values, the safeops risk_score, the confidence scalar and the draw;
-- the four policy-provenance values against the loaded policy.
+- the four policy-provenance values against the loaded policy, and topology_hash against
+  the bound TopologyCondition (for every record, featureless ones included);
+- the runtime context's topology against that condition's very object, wherever a
+  context was built.
 
 **A plumbing check, not a second formula engine.** It calls the same RiskFeatureExtractor
 and ShadowGateScorer instances the runner used; there is no independent restatement of any
@@ -27,12 +30,20 @@ from safeops.context import Alert, IncidentRuntimeContext
 from safeops.features.extractor import RiskFeatureExtractor
 from safeops.features.policy import FEATURE_NAMES, PolicyBundle
 from safeops.gate.shadow import ShadowGateScorer
+from safeops.topology import TopologyCondition
 
 
 class ReadPathCheck:
     """The runtime-only validation context handed to RunRecordWriter (never persisted)."""
 
-    def __init__(self, extractor: RiskFeatureExtractor, scorer: ShadowGateScorer) -> None:
+    def __init__(
+        self,
+        extractor: RiskFeatureExtractor,
+        scorer: ShadowGateScorer,
+        condition: TopologyCondition,
+    ) -> None:
+        if not isinstance(condition, TopologyCondition):
+            raise TypeError("ReadPathCheck needs the run's bound TopologyCondition")
         if not isinstance(extractor, RiskFeatureExtractor):
             raise TypeError("ReadPathCheck needs the runner's RiskFeatureExtractor")
         if not isinstance(scorer, ShadowGateScorer):
@@ -41,12 +52,15 @@ class ReadPathCheck:
             raise ValueError("the extractor and the shadow scorer must share one policy")
         self.extractor = extractor
         self.scorer = scorer
+        self.condition = condition
 
     @property
     def policy(self) -> PolicyBundle:
         return self.extractor.policy
 
     def provenance(self) -> dict:
+        """The policy provenance only. topology_hash is the writer's ProvenanceSource's, so
+        the merged provenance holds exactly one topology value."""
         return self.policy.provenance()
 
     def problems(self, record, runtime_context) -> list[str]:
@@ -58,10 +72,24 @@ class ReadPathCheck:
             for key, value in self.provenance().items()
             if getattr(record.provenance, key) != value
         ]
+        # Every record, featureless ones included (pre-agent discards, no_action, ...): the
+        # hash must name the bytes of the bound condition the run used.
+        if record.provenance.topology_hash != self.condition.sha256:
+            p.append(
+                f"provenance.topology_hash is {record.provenance.topology_hash!r}, the bound"
+                f" topology condition's is {self.condition.sha256!r}"
+            )
+        # Only where a context was built (from the runtime_context stage on): it must hold the
+        # bound condition's very topology object, never another load of an equal-looking file.
+        if runtime_context is not None:
+            if not isinstance(runtime_context, IncidentRuntimeContext):
+                return p + [f"the runtime context is a {type(runtime_context).__name__}"]
+            if runtime_context.topology is not self.condition.topology:
+                return p + ["the runtime context's topology is not the bound topology condition's"]
         fv = record.feature_vector
         if fv is None:
             return p
-        if not isinstance(runtime_context, IncidentRuntimeContext):
+        if runtime_context is None:
             return p + ["a feature vector, but no runtime context to recompute it against"]
         a = record.alert
         try:

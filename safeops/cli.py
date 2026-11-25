@@ -106,6 +106,7 @@ def run(
         FaultVerificationFailed,
     )
     from safeops.policy import PolicyError
+    from safeops.topology import TopologyError
 
     where = (
         f" Run unit: fault_id={unit.fault_id}, fault_seed={unit.fault_seed},"
@@ -137,6 +138,10 @@ def run(
         # A policy file that can't be loaded as written (decision 0025 D§7): raised while the
         # runner is built, before anything is attempted, so there is no record (R1).
         _fail("run", f"policy configuration: {exc}.{where}", EXIT_USAGE)
+    except TopologyError as exc:
+        # The bound topology condition is loaded while the runner is built (decision 0025,
+        # M8A-2 topology amendment): a topology error, never reported as a policy one.
+        _fail("run", f"topology configuration: {exc}.{recorded(exc)}{where}", EXIT_USAGE)
     except _cluster_errors() as exc:  # incl. WorkerQuarantined, ConfigurationError (finding 6)
         _fail("run", f"{type(exc).__name__}: {exc}.{where}", EXIT_CLUSTER)
 

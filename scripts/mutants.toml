@@ -2529,3 +2529,87 @@ old = '''
     except PolicyError as exc:'''
 new = '''
     except FaultSpecError as exc:'''
+
+[[mutant]]
+id = "M8A2-T1"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/records.py"
+guard = "production provenance records the bound condition's topology hash, never a later file hash"
+kills = [
+    "tests/test_m8_integration.py::test_production_provenance_records_the_bound_hash_not_the_file",
+]
+old = '''
+                if self._topology_hash is not None'''
+new = '''
+                if self._topology_hash is None'''
+
+[[mutant]]
+id = "M8A2-T2"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/consistency.py"
+guard = "write time: every record's topology_hash, featureless ones included, is the bound condition's"
+kills = [
+    "tests/test_m8_integration.py::test_a_featureless_record_with_a_wrong_topology_hash_is_refused",
+    "tests/test_m8_integration.py::test_a_no_action_record_checks_its_topology_hash[wrong-hash]",
+    "tests/test_m8_integration.py::test_a_clobbered_value_or_mismatched_evidence_is_refused[topology-hash]",
+]
+old = '''
+        if record.provenance.topology_hash != self.condition.sha256:'''
+new = '''
+        if record.provenance.topology_hash is None:'''
+
+[[mutant]]
+id = "M8A2-T3"
+source = "0025 M8A-2 read path"
+target = "safeops/topology.py"
+guard = "topology booleans are real booleans: a quoted \"false\" is refused, never truthy"
+kills = [
+    "tests/test_topology.py::test_a_malformed_topology_is_a_topology_error[persistence-quoted-false]",
+    "tests/test_topology.py::test_a_malformed_topology_is_a_topology_error[stateful-quoted-false]",
+]
+old = '''
+    if type(value) is not bool:
+        raise TopologyError(f"{where}.{key}: expected true or false, got {value!r}")
+    return value'''
+new = '''
+    return bool(value)'''
+
+[[mutant]]
+id = "M8A2-T4"
+source = "0025 M8A-2 read path"
+target = "safeops/topology.py"
+guard = "range endpoints are finite: NaN and infinities are refused, not compared"
+kills = [
+    "tests/test_topology.py::test_a_malformed_topology_is_a_topology_error[nan-endpoint]",
+    "tests/test_topology.py::test_a_malformed_topology_is_a_topology_error[plus-infinity-endpoint]",
+]
+old = '''
+    return type(value) in (int, float) and math.isfinite(value)'''
+new = '''
+    return type(value) in (int, float)'''
+
+[[mutant]]
+id = "M8A2-T5"
+source = "0025 M8A-2 read path"
+target = "safeops/topology.py"
+guard = "an approved_keys rule body is checked as a mapping before it is read"
+kills = [
+    "tests/test_topology.py::test_a_malformed_topology_is_a_topology_error[approved-rule-integer]",
+]
+old = '''
+            rule = _mapping(rule, where)'''
+new = '''
+            rule = rule'''
+
+[[mutant]]
+id = "M8A2-T6"
+source = "0025 M8A-2 read path"
+target = "safeops/experiment/consistency.py"
+guard = "the runtime context holds the bound condition's very topology, not an equal-looking load"
+kills = [
+    "tests/test_m8_integration.py::test_an_equal_but_unbound_topology_is_refused_before_recomputation",
+]
+old = '''
+            if runtime_context.topology is not self.condition.topology:'''
+new = '''
+            if runtime_context.topology != self.condition.topology:'''

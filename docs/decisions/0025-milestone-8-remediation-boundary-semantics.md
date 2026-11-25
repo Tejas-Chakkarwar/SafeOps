@@ -1334,3 +1334,96 @@ The feature-side loaders sit in `safeops/features/` because D§7 item 5 says Mil
   - It is unreachable while one CLI invocation is one run. The multi-run campaign runner (Milestone 14) must load the topology once with its hash, or refuse a changed file, before it runs several runs per process.
 - **Limitation, recorded.** The dynamic-import ban is static. It catches imports of `importlib` and every reference to `__import__`, `exec` and `eval`, but not deliberately obfuscated forms such as `getattr(builtins, "ev" + "al")`.
 - **After the fixes:** 48 M8A-2 mutants, 172 in the table, `make test` 2481 passed and 67 skipped. Full mutation run on a clean copy of the fixed tree: 172 killed, 0 survived, 0 harness errors, tree restored.
+
+## Amendment, 2026-11-25: Milestone 8A-2 topology binding (supersedes part of the review fixes above)
+
+This corrects the M8A-2 review-fix entry above. That entry said the topology behind the features could disagree with `topology_hash` only once one process ran several runs, and it carried the binding to Milestone 14. **Both statements were wrong, and are superseded here.** Nothing else above changes.
+
+**The defect (at `bb6d0aa`).**
+- **First run, one CLI invocation.** `ExperimentRunner.run` captured provenance first. That is `records.capture_provenance` at the top of `run`, which hashed `config/topology.yaml` through `ProvenanceSource.collect()`. The topology itself was parsed only later, from a second, independent read, in `_runtime_context` at stage `runtime_context` (`self._topology = load_topology()`).
+  - Between the two reads lie the pre-run reset and verify, the workload start, the steady-state window, injection, verification and the settled snapshot, which is minutes of wall-clock time.
+  - A file changed in that window gave features (and harm) computed from topology B, in a record whose `topology_hash` names topology A.
+  - No campaign, runner reuse or second run is needed.
+- **A reused runner.** It cached topology A from its first run but re-hashed the file at every later run, so it could pair topology A with hash B.
+- **Structurally.** Two independent reads are no provenance proof even when the file didn't change: nothing ties the hashed bytes to the parsed object.
+
+**The fix: one immutable `TopologyCondition`.**
+- **Type and loader.** `safeops.topology.TopologyCondition` is a frozen dataclass `(topology: ServiceTopology, sha256: str)`. `load_topology_condition(path=None)` builds it:
+  - it reads the file once, through `safeops.policy.read_policy_file`;
+  - it hashes exactly those bytes (`"sha256:" + sha256(raw).hexdigest()`, the existing convention);
+  - it decodes them as strict UTF-8, parses them with the strict YAML loader, and parses the `ServiceTopology` from that.
+- **`load_topology()`.** It remains, as `load_topology_condition(path).topology`, for consumers that record no hash.
+- **Production wiring.** `build_runner()` loads one condition and passes:
+  - `ExperimentRunner(topology=condition.topology)`, so the runtime context uses that object and nothing loads lazily;
+  - `RunRecordWriter(provenance=ProvenanceSource(topology_hash=condition.sha256), read_path=ReadPathCheck(extractor, scorer, condition))`.
+
+  A test counts exactly one read of `topology.yaml` during `build_runner()`.
+- **`ProvenanceSource(topology_hash=...)`.**
+  - With an injected hash, it records exactly that value and never reopens the topology file.
+  - Without one (every legacy, offline and live-test writer), it keeps the existing file-hash fallback. So writers without a read-path check still produce the required `topology_hash`.
+  - `ReadPathCheck.provenance()` remains the four policy values and adds no topology value, so the merged provenance has exactly one.
+- **`ReadPathCheck` checks, in this order:**
+  1. the policy provenance;
+  2. `record.provenance.topology_hash == condition.sha256`, for every record. This sits above the `feature_vector is None` early return, so pre-agent discards and `no_action`, `invalid_output`, `step_limit` and `model_refusal` records are checked too;
+  3. only when a runtime context was built (from stage `runtime_context` on): `runtime_context.topology is condition.topology`, by identity. An equal-looking second load of the same file is refused, and so is any other topology, before any feature is recomputed;
+  4. then, for a feature vector, the recomputation as before.
+
+  A pre-agent discard has no runtime context and is valid with the correct hash.
+- **A legacy runner.** A runner built without `topology` (a legacy test double) still loads lazily. That load is unbound, and the identity check refuses any such record once a writer has a `ReadPathCheck`.
+- **Tests share one condition.** `tests/m8_fixtures.py` loads one `CONDITION`, and `TOPOLOGY` is its topology. The integration harness hands `CONDITION.topology` to the runner, `CONDITION` to `ReadPathCheck`, and `CONDITION.sha256` to the writer's provenance, as `build_runner` does.
+- **The changed integration expectation.** The existing `runtime-topology` corruption case now fails at the identity check ("the runtime context's topology is not the bound topology condition's"). It used to fail later, as a `blast_radius` mismatch.
+
+**Scope, stated exactly.**
+- **What is bound.** This binds the M8 read path: the feature extraction, the write-time recomputation and the `topology_hash` stored with that evidence. It does not make every topology use single-loaded.
+- **What is not.** These production consumers still load `config/topology.yaml` independently, through `load_topology()`:
+  - `safeops/environment/manager.py` (reset and verify, snapshots);
+  - `safeops/faults/spec.py` (fault-spec validation);
+  - `safeops/tools/reader.py` (the agent tools' reader context);
+  - `safeops/environment/desired.py` (rendering the desired state);
+  - `safeops/bootstrap.py` (the ownership report).
+- **Topology-derived values elsewhere.** The topology the harm checker (`safeops/verify/harm.py`) uses is the runtime context's, so it is now the bound condition's. The snapshot projection (`safeops/environment/snapshot.py`) uses the environment manager's own load.
+- **Carried forward: the topology-consumer audit.** Before Milestone 8 closes, and before any later subsystem claims the record's `topology_hash` identifies the topology it used, those consumers must be audited. Each must either share the bound condition or document its own provenance contract.
+- **Milestone 14.** The campaign runner reuses and preserves this bound condition; it doesn't create the invariant.
+
+**The strict topology loader.** These are fixed in the one canonical loader that M8B will trust for hard ranges, safe ranges and approved keys. Every failure is a `TopologyError` naming the file; it never becomes a `PolicyError`, an `AttributeError`, a `TypeError` or a `KeyError`.
+- **YAML level:** duplicate keys at any depth, merge keys, non-string keys, invalid UTF-8 and malformed YAML are refused. `PolicyError` is translated back to `TopologyError`.
+- **Shapes:**
+  - the document, `services`, `resources`, each service body, each resource body, each ranged field, `approved_keys` and each approved-key rule body must be mappings, and are checked before any `.get()`, `in` or iteration;
+  - a null service body is no longer accepted as empty;
+  - `depends_on` must be a list of names;
+  - an `enum` rule must be a non-empty list;
+  - `kind` and `owner` must be strings.
+- **Booleans.** `stateful` and `persistence_affecting` must be real YAML booleans. A quoted `"false"`, 0 and 1 are refused; absent still means false.
+- **Range endpoints.** Each is an int or float that is not a bool and is finite. `true`, `false`, `.nan`, `.inf`, `-.inf` and numeric strings are refused. The two-element shape and `lo <= hi` are unchanged.
+- **Unchanged:** the topology format, its semantics, `config/topology.yaml` (it loads unchanged, `sha256:0aafc98e…`), `ServiceTopology` and the graph functions.
+- **CLI.** `safeops run` reports a broken topology as `topology configuration: topology.yaml: …` (exit 2), separately from `policy configuration: …`. Before this change it was an unhandled traceback from whichever consumer first loaded the file.
+
+**Tests:**
+- `tests/test_topology.py`:
+  - the condition hashes and parses the same bytes;
+  - a loaded condition doesn't follow its file;
+  - the 33-case strictness matrix;
+  - shapes checked before they're read;
+  - valid finite-float ranges, booleans and enum rules still load.
+- `tests/test_m8_integration.py`:
+  - bound provenance keeps hash(A) after the file changes to B, without reading the file;
+  - the unbound fallback is kept;
+  - `build_runner` reads the topology once and shares it;
+  - a reused runner keeps one condition across a file change;
+  - a featureless pre-agent record with no runtime context validates, and is refused with a wrong hash;
+  - a `no_action` record is accepted and refused the same way;
+  - an equal but unbound topology is refused before recomputation;
+  - a corrupted hash on a feature-bearing record is refused;
+  - a broken topology is a topology error, not a policy one.
+
+**Mutants (source "0025 M8A-2 read path"):**
+- `M8A2-T1`: provenance ignores the injected hash;
+- `M8A2-T2`: write-time hash check neutralized. Its first kill is the featureless pre-agent record, which proves the check sits above the early return;
+- `M8A2-T3`: topology booleans read through `bool()`;
+- `M8A2-T4`: finiteness check removed;
+- `M8A2-T5`: approved-key rule body read without its mapping check;
+- `M8A2-T6`: identity weakened to equality.
+
+All six were killed in a scratch copy of the candidate, with 0 survived and 0 harness errors. The table holds 178. The full mutation results on the committed tree are in the commit report. Duplicate-key refusal is the shared loader site already pinned by `M8A2-L2`; the topology duplicate case is a focused test.
+
+**Unchanged:** the dynamic-import-obfuscation limitation recorded above; the stored-form extraction and the `PolicyError` CLI mapping from `bb6d0aa`; schema version 2 and `RECORD_FIELDS`; the executor and everything else that is M8B's.

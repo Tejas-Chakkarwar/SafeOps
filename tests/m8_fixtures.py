@@ -16,10 +16,13 @@ from safeops.context import Alert, IncidentRuntimeContext
 from safeops.domain import ActionTarget, Proposal, RecommendedAction, TrajectoryStep
 from safeops.enums import ActionType
 from safeops.tools.canonical import result_digest
-from safeops.topology import load_topology, parse_topology
+from safeops.topology import load_topology_condition, parse_topology
 
 NS = "testbed"
-TOPOLOGY = load_topology()
+# One bound condition for the M8 tests, as build_runner has one for a run: the runner's
+# context and the writer's ReadPathCheck must hold this very topology object.
+CONDITION = load_topology_condition()
+TOPOLOGY = CONDITION.topology
 WHEN = datetime(2026, 11, 24, 18, 0, tzinfo=UTC)
 
 
