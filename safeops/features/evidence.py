@@ -3,9 +3,10 @@ predicates (decision 0025 D§5, D§7.3).
 
 **The representation.** A trajectory is a list of `safeops.domain.TrajectoryStep`. Its
 `args` and `result` are the JSON-safe values the run record stores: dicts, lists and
-scalars, never live tool-contract models. A result is the envelope
-`{"status": "ok", "data": {...}}` or `{"status": "error", ...}`. So every predicate here can
-be recomputed later from a stored record, exactly as it ran.
+scalars, never live tool-contract models. The extractor reads every step through
+`stored_form`, the record's own JSON round trip, so run time and write time see one form.
+A result is the envelope `{"status": "ok", "data": {...}}` or `{"status": "error", ...}`.
+So every predicate here can be recomputed later from a stored record, exactly as it ran.
 
 **Guarded reads.** Nothing here imports safeops.tools: importing any of its modules would
 initialize safeops.tools, whose package imports the kubectl-backed tools (and so
@@ -21,6 +22,7 @@ features that use it (D§7.2's truncation-direction invariant), so no tri-state 
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 
@@ -28,6 +30,28 @@ from safeops.domain import RecommendedAction, TrajectoryStep
 from safeops.enums import ActionType
 
 _A = ActionType
+
+
+def stored_form(trajectory: Sequence[TrajectoryStep]) -> list[TrajectoryStep]:
+    """The trajectory exactly as the run record stores it: each step dumped in JSON mode
+    (the writer's `_plain`), serialized with `allow_nan=False` and validated back, as the
+    writer and the schema do. Extraction reads only this form, so a live value that isn't
+    plain JSON (a tuple where the record will hold a list) can't be read one way at run time
+    and another from the record at write time or later. A value with no stored form at all
+    (an arbitrary object, a mapping proxy) is a harness bug: it raises, as the writer would."""
+    if not isinstance(trajectory, list | tuple) or not all(
+        isinstance(s, TrajectoryStep) for s in trajectory
+    ):
+        raise TypeError("extract takes the stored trajectory: a list of TrajectoryStep")
+    try:
+        return [
+            TrajectoryStep.model_validate_json(
+                json.dumps(s.model_dump(mode="json"), sort_keys=True, allow_nan=False)
+            )
+            for s in trajectory
+        ]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"a trajectory step has no strict-JSON stored form: {exc}") from exc
 
 
 def as_dict(value: object) -> dict | None:

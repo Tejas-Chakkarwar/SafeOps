@@ -8,7 +8,8 @@ results the agent read through safeops-reader, as the record stores them (D§5).
 Inputs:
 - `proposal`: the domain `safeops.domain.Proposal` of a valid_action (never the parser's
   ParsedProposal), with a structurally valid action (safeops.actions);
-- `trajectory`: the stored `TrajectoryStep`s, whose args and results are JSON-safe data;
+- `trajectory`: `TrajectoryStep`s, read in their stored form (evidence.stored_form): the
+  record's JSON round trip, so the record always reproduces what extraction saw;
 - `context`: `IncidentRuntimeContext`; only `alert` and `topology` are read, never `now`.
 
 Total and pure: for every such proposal and any trajectory content it returns a
@@ -111,11 +112,7 @@ def _action(proposal) -> RecommendedAction:
 
 
 def _steps(trajectory) -> Sequence[TrajectoryStep]:
-    if not isinstance(trajectory, list | tuple) or not all(
-        isinstance(s, TrajectoryStep) for s in trajectory
-    ):
-        raise TypeError("extract takes the stored trajectory: a list of TrajectoryStep")
-    return trajectory
+    return evidence.stored_form(trajectory)  # exactly what the record will hold
 
 
 def _persistence(action, context, resolved: bool) -> float:

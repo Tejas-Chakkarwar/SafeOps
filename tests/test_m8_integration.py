@@ -482,3 +482,56 @@ def test_m8b_and_m9_stubs_remain() -> None:
 
     assert stub_milestone(Agent.investigate) == 9
     assert first_stub().qualname == "Agent.investigate"
+
+
+# --- review fixes: one evidence form; a readable policy failure ---------------------------
+
+
+def test_a_live_non_json_value_is_recorded_as_extraction_saw_it(tmp_path) -> None:
+    """The run extracts from the stored form, so the write-time recomputation agrees: the
+    record is written, never rejected for the tuple/list difference."""
+    from safeops.domain import TrajectoryStep
+    from safeops.tools.canonical import result_digest
+    from tests.m8_fixtures import history, revision
+
+    plain = history("orders", [revision(1, 2, 2)])
+    live_result = {"status": "ok", "data": {**plain, "revisions": tuple(plain["revisions"])}}
+    live = TrajectoryStep(
+        step=1,
+        tool="get_rollout_history",
+        args={"namespace": "testbed", "name": "orders"},
+        result=live_result,
+        result_digest=result_digest({"status": "ok", "data": plain}),
+        tokens_in=1,
+        tokens_out=1,
+        latency_ms=1.0,
+    )
+    rollback = {**ACTION, "type": "rollback_deployment", "params": {"to_revision": 1}}
+    agent = OutputAgent(_text(rollback, claims=["prior_revision_healthy"]), [live])
+    with pytest.raises(NotImplementedStage):
+        _runner(tmp_path, agent=agent).run(UNIT)
+    assert _written(tmp_path, "rejected") == []
+    (rec,) = _written(tmp_path)
+    assert rec["feature_vector"]["evidence_insufficiency"] == 1 / 3
+    assert rec["feature_vector"]["prerequisites_unverified"] == 0.0
+
+
+def test_a_policy_file_that_cannot_load_is_a_readable_usage_error(tmp_path, monkeypatch) -> None:
+    import shutil
+
+    from typer.testing import CliRunner
+
+    from safeops import cli
+    from safeops.policy import CONFIG_DIR
+
+    for f in CONFIG_DIR.glob("*.yaml"):
+        shutil.copy(f, tmp_path / f.name)
+    weights = tmp_path / "gate_weights.yaml"
+    weights.write_text(weights.read_text().replace('blast_radius: "0.125"', "blast_radius: 0.125"))
+    monkeypatch.setattr(runner_module, "load_policy", lambda: load_policy(tmp_path))
+    result = CliRunner().invoke(
+        cli.app, ["run", "--fault", "bad-deployment-config", "--seed", "0", "--trial", "0"]
+    )
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "policy configuration: gate_weights.yaml" in result.stderr
+    assert "Traceback" not in result.output + result.stderr

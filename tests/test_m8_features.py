@@ -7,18 +7,20 @@ topology and policy, and literal expected values (Rule 17).
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import typing
 
 import pytest
 
-from safeops.domain import FeatureVector
+from safeops.domain import FeatureVector, TrajectoryStep
 from safeops.features import conflict
 from safeops.features.blast import ReplicaEvidence, TopologyEvidence
 from safeops.features.evidence import latest
 from safeops.features.extractor import RiskFeatureExtractor
 from safeops.features.policy import ConflictRules, load_policy
 from safeops.tools import contracts
+from safeops.tools.canonical import result_digest
 from tests.m8_fixtures import (
     DEPLOYMENT_BOUNDS,
     configmap,
@@ -763,3 +765,51 @@ def test_extraction_never_reads_now() -> None:
     ctx = context()
     later = type(ctx)(alert=ctx.alert, topology=ctx.topology, now=ctx.now.replace(year=2030))
     assert features(restart("orders"), [dep("orders", 2)], later) == a
+
+
+# --- extraction reads the stored form (review fix) ------------------------------------------------
+
+
+def _live(data: dict) -> TrajectoryStep:
+    """A live step whose result isn't plain JSON; its digest is that of its stored form."""
+    stored = json.loads(json.dumps({"status": "ok", "data": data}, default=list))
+    return TrajectoryStep(
+        step=1,
+        tool="get_rollout_history",
+        args={"namespace": "testbed", "name": "orders"},
+        result={"status": "ok", "data": data},
+        result_digest=result_digest(stored),
+        tokens_in=None,
+        tokens_out=None,
+        latency_ms=None,
+    )
+
+
+def test_a_live_tuple_is_read_as_the_list_the_record_stores() -> None:
+    plain = history("orders", [revision(1, 2, 2)])
+    live = _live({**plain, "revisions": tuple(plain["revisions"])})
+    stored = [TrajectoryStep.model_validate_json(live.model_dump_json())]
+    p = proposal(rollback(to=1), claims=["prior_revision_healthy"])
+    at_run_time = EXTRACTOR.extract(p, [live], context())
+    assert at_run_time == EXTRACTOR.extract(p, stored, context())
+    assert (at_run_time.evidence_insufficiency, at_run_time.prerequisites_unverified) == (
+        1 / 3,
+        0.0,
+    )
+
+
+def test_a_step_with_no_stored_form_is_a_harness_error() -> None:
+    from types import MappingProxyType
+
+    bad = TrajectoryStep(
+        step=1,
+        tool="get_deployment",
+        args={"namespace": "testbed", "name": "orders"},
+        result={"status": "ok", "data": MappingProxyType(deployment("orders", 2))},
+        result_digest="sha256:" + "0" * 64,
+        tokens_in=None,
+        tokens_out=None,
+        latency_ms=None,
+    )
+    with pytest.raises(ValueError, match="no strict-JSON stored form"):
+        features(restart("orders"), [bad])

@@ -2502,3 +2502,30 @@ old = '''
             provenance.update(self.read_path.provenance())'''
 new = '''
             pass'''
+
+[[mutant]]
+id = "M8A2-E11"
+source = "0025 M8A-2 read path"
+target = "safeops/features/extractor.py"
+guard = "extraction reads the trajectory's stored form, so the run and its record see one evidence"
+kills = [
+    "tests/test_m8_features.py::test_a_live_tuple_is_read_as_the_list_the_record_stores",
+    "tests/test_m8_integration.py::test_a_live_non_json_value_is_recorded_as_extraction_saw_it",
+]
+old = '''
+    return evidence.stored_form(trajectory)  # exactly what the record will hold'''
+new = '''
+    return list(trajectory)'''
+
+[[mutant]]
+id = "M8A2-X1"
+source = "0025 M8A-2 read path"
+target = "safeops/cli.py"
+guard = "a policy file that can't load is a readable usage error, never a traceback"
+kills = [
+    "tests/test_m8_integration.py::test_a_policy_file_that_cannot_load_is_a_readable_usage_error",
+]
+old = '''
+    except PolicyError as exc:'''
+new = '''
+    except FaultSpecError as exc:'''

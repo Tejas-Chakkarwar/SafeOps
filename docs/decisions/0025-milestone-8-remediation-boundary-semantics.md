@@ -1317,3 +1317,20 @@ The feature-side loaders sit in `safeops/features/` because D§7 item 5 says Mil
 - Each was proven in a scratch copy of the uncommitted tree: 46 killed, 0 survived, 0 harness errors.
 - The table holds 170.
 - Full mutation run (every historical, Milestone 7, pre-Milestone-8, M8A-1 and M8A-2 mutant), on a clean git-initialized copy of exactly this change: 170 killed, 0 survived, 0 harness errors, tree restored. Decision 0025 still requires another full run at Milestone 8 closure.
+
+**Review fixes (adversarial review of `c5b6bb4`).**
+- **One evidence form for the run and its record.** Before this fix, the runner extracted from the live `TrajectoryStep` objects while the write-time check recomputed from the stored JSON. The predicates check JSON types exactly, so a live value that isn't plain JSON was read differently on the two sides.
+  - A probe showed it: a rollback history whose revisions were a tuple scored `evidence_insufficiency` 2/3 live and 1/3 stored. The run's record would then have been rejected at write time.
+  - Real tools normalize their results (`kube.py`), so this wasn't reachable today, but it rested on a Milestone 9 convention.
+  - Now the extractor reads every step through `safeops.features.evidence.stored_form`, the writer's own round trip: a JSON-mode dump, `json.dumps(..., allow_nan=False)`, then `model_validate_json`. So extraction consumes exactly the persisted representation, and the write-time recomputation agrees by construction.
+  - A step with no stored form at all (an arbitrary object, a mapping proxy) raises `ValueError`, a harness bug, as the writer would.
+  - Mutant `M8A2-E11` pins it.
+- **A policy file that can't load is a readable usage error.** `safeops run` maps `PolicyError` to exit 2 (`EXIT_USAGE`), as it does an unloadable fault spec, with one line naming the file and the problem.
+  - It is raised while the runner is built, before anything is attempted, so there is no record (R1).
+  - Mutant `M8A2-X1` pins it.
+- **Carried forward, not changed here: the topology behind the features versus `topology_hash`.**
+  - `ExperimentRunner._runtime_context` loads `config/topology.yaml` once per runner, while `ProvenanceSource.collect()` re-hashes the file at every run. If the file changed while one process ran several runs, the features and the harm check would use the cached topology while the record named the new file.
+  - The gap is pre-existing (harm has used the cached topology since Milestone 4). Since M8A-2, `D_max`, resolvability and scope depend on topology too.
+  - It is unreachable while one CLI invocation is one run. The multi-run campaign runner (Milestone 14) must load the topology once with its hash, or refuse a changed file, before it runs several runs per process.
+- **Limitation, recorded.** The dynamic-import ban is static. It catches imports of `importlib` and every reference to `__import__`, `exec` and `eval`, but not deliberately obfuscated forms such as `getattr(builtins, "ev" + "al")`.
+- **After the fixes:** 48 M8A-2 mutants, 172 in the table, `make test` 2481 passed and 67 skipped. Full mutation run on a clean copy of the fixed tree: 172 killed, 0 survived, 0 harness errors, tree restored.
