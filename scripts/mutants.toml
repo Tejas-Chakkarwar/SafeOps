@@ -2694,9 +2694,10 @@ new = '''
 id = "M8B1-E4"
 source = "0025 M8B-1 offline executor"
 target = "safeops/executor/executor.py"
-guard = "E3: a ConfigMap is whitelisted only with non-empty approved_keys (E3 is the recorded reason)"
+guard = "E3 is the recorded refusal reason (execution.error) for a ConfigMap without approved_keys. Status-equivalent by construction: without the rule the per-key check refuses with the same status and no steps, so this mutant pins only the recorded attribution"
 kills = [
     "tests/test_m8_executor.py::test_a_configmap_without_approved_keys_is_not_whitelisted",
+    "tests/test_m8_executor.py::test_e3_is_the_recorded_reason_for_a_configmap_without_approved_keys",
 ]
 old = '''
         if t.kind == "ConfigMap" and not spec.approved_keys:'''
@@ -2925,7 +2926,7 @@ kills = [
 ]
 old = '''
             if _controlled_by(rs, name, uid)
-            and _at(rs, "metadata", "annotations", REVISION_ANNOTATION) == str(revision)'''
+            and _at(rs, "metadata", "annotations", REVISION_ANNOTATION) == wanted'''
 new = '''
             if _controlled_by(rs, name, uid)'''
 
@@ -3500,3 +3501,240 @@ old = '''
 BoundedError = Annotated[str, Field(max_length=MAX_DISCARD_ERROR)]'''
 new = '''
 BoundedError = str'''
+
+[[mutant]]
+id = "M8B1-H1"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/quantity.py"
+guard = "the CPU parser is total past Python's integer-string digit limit (finding 1)"
+kills = [
+    "tests/test_m8_executor.py::test_the_quantity_parsers_are_total_past_the_digit_limit[parse_cpu-text0]",
+]
+old = '''
+            return Fraction(int(match.group(1)))
+    except ValueError:  # beyond Python's integer-string digit limit'''
+new = '''
+            return Fraction(int(match.group(1)))
+    except ZeroDivisionError:  # beyond Python's integer-string digit limit'''
+
+[[mutant]]
+id = "M8B1-H2"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/quantity.py"
+guard = "the memory parser is total past Python's integer-string digit limit (finding 1)"
+kills = [
+    "tests/test_m8_executor.py::test_the_quantity_parsers_are_total_past_the_digit_limit[parse_memory-text4]",
+    "tests/test_m8_executor.py::test_a_huge_returned_quantity_is_not_shown_and_reconciliation_decides",
+    "tests/test_m8_executor.py::test_a_huge_quantity_read_back_too_is_a_classified_failure_not_a_raise",
+]
+old = '''
+        exact = Fraction(number)
+    except ValueError:  # beyond Python's integer-string digit limit'''
+new = '''
+        exact = Fraction(number)
+    except ZeroDivisionError:  # beyond Python's integer-string digit limit'''
+
+[[mutant]]
+id = "M8B1-H3"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "a postcondition holds only on the requested object (finding 2)"
+kills = [
+    "tests/test_m8_executor.py::test_a_success_reply_carrying_another_object_confirms_nothing",
+    "tests/test_m8_executor.py::test_a_read_back_of_another_object_confirms_nothing",
+    "tests/test_m8_executor.py::test_a_wrong_object_in_the_reply_falls_back_to_the_targets_read_back",
+]
+old = '''
+    if _identity_problem(obj, request.kind, request.name, request.namespace) is not None:
+        return False'''
+new = '''
+    if False:
+        return False'''
+
+[[mutant]]
+id = "M8B1-H4"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "identity is kind, name and namespace, all three, each required (finding 2)"
+kills = [
+    "tests/test_m8_executor.py::test_every_postcondition_checks_the_objects_identity[scale-_rekind]",
+    "tests/test_m8_executor.py::test_every_postcondition_checks_the_objects_identity[scale-_renamespace]",
+]
+old = '''
+    if got == (kind, name, namespace):'''
+new = '''
+    if got[1] == name:'''
+
+[[mutant]]
+id = "M8B1-H5"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "the container check reads the target Deployment, not some other object (finding 2)"
+kills = [
+    "tests/test_m8_executor.py::test_a_pre_write_read_of_the_wrong_object_writes_nothing[resources-_rename]",
+]
+old = '''
+        wrong = _identity_problem(reply.obj, "Deployment", deployment, self.namespace)'''
+new = '''
+        wrong = None'''
+
+[[mutant]]
+id = "M8B1-H6"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "the rollback history read reads the target Deployment, not some other object (finding 2)"
+kills = [
+    "tests/test_m8_executor.py::test_a_pre_write_read_of_the_wrong_object_writes_nothing[rollback-_rename]",
+]
+old = '''
+        wrong = _identity_problem(reply.obj, "Deployment", name, self.namespace)'''
+new = '''
+        wrong = None'''
+
+[[mutant]]
+id = "M8B1-H7"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "every listed ReplicaSet must be a named ReplicaSet in the testbed namespace (finding 2)"
+kills = [
+    "tests/test_m8_executor.py::test_a_replicaset_list_holding_a_foreign_object_writes_nothing[namespace]",
+    "tests/test_m8_executor.py::test_a_replicaset_list_holding_a_foreign_object_writes_nothing[no-name]",
+]
+old = '''
+        for rs in items:
+            if _at(rs, "metadata", "name") is None or ('''
+new = '''
+        for rs in ():
+            if _at(rs, "metadata", "name") is None or ('''
+
+[[mutant]]
+id = "M8B1-H8"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "a ReplicaSet list with a continue token proves nothing absent (finding 4)"
+kills = [
+    "tests/test_m8_executor.py::test_an_incomplete_replicaset_list_proves_nothing[absent-continue]",
+]
+old = '''
+        if _at(listed.obj, "metadata", "continue") or _at('''
+new = '''
+        if _at(listed.obj, "metadata", "no-such-field") or _at('''
+
+[[mutant]]
+id = "M8B1-H9"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "a ReplicaSet list with remaining items proves nothing absent (finding 4)"
+kills = [
+    "tests/test_m8_executor.py::test_an_incomplete_replicaset_list_proves_nothing[absent-remaining]",
+]
+old = '''
+            listed.obj, "metadata", "remainingItemCount"'''
+new = '''
+            listed.obj, "metadata", "no-such-field"'''
+
+[[mutant]]
+id = "M8B1-H10"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "a harness bug at write propagates, never an ambiguous write (finding 3)"
+kills = [
+    "tests/test_m8_executor.py::test_a_harness_bug_at_write_propagates_instead_of_becoming_ambiguous[stub]",
+    "tests/test_m8_integration.py::test_a_half_wired_writer_is_a_loud_not_implemented_discard",
+]
+old = '''
+            reply = self.writer.write(request)
+        except HARNESS_BUGS:
+            raise'''
+new = '''
+            reply = self.writer.write(request)
+        except ZeroDivisionError:
+            raise'''
+
+[[mutant]]
+id = "M8B1-H11"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "a harness bug in a reconciliation read propagates, never an unavailable read (finding 3)"
+kills = [
+    "tests/test_m8_executor.py::test_a_harness_bug_in_reconciliation_propagates_instead_of_becoming_unavailable[stub]",
+]
+old = '''
+            reply = call()
+        except HARNESS_BUGS:
+            raise'''
+new = '''
+            reply = call()
+        except ZeroDivisionError:
+            raise'''
+
+[[mutant]]
+id = "M8B1-H12"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "a context-guard refusal is a harness bug, like a stub (finding 3; D§11.3)"
+kills = [
+    "tests/test_m8_executor.py::test_a_harness_bug_at_write_propagates_instead_of_becoming_ambiguous[guard]",
+]
+old = '''
+HARNESS_BUGS = (NotImplementedStage, GuardError)'''
+new = '''
+HARNESS_BUGS = (NotImplementedStage,)'''
+
+[[mutant]]
+id = "M8B1-H13"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "an agent integer too long for str() is shown by size, never raised on (finding 5)"
+kills = [
+    "tests/test_m8_executor.py::test_an_integer_too_long_to_print_is_refused_not_raised[scale]",
+    "tests/test_m8_executor.py::test_an_integer_too_long_to_print_is_refused_not_raised[configmap]",
+]
+old = '''
+    except ValueError:
+        return f"<an integer of {value.bit_length()} bits>"'''
+new = '''
+    except ZeroDivisionError:
+        return f"<an integer of {value.bit_length()} bits>"'''
+
+[[mutant]]
+id = "M8B1-H14"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "a revision too long for str() matches no annotation and is refused (finding 5)"
+kills = [
+    "tests/test_m8_executor.py::test_an_integer_too_long_to_print_is_refused_not_raised[rollback]",
+]
+old = '''
+        return str(revision)
+    except ValueError:'''
+new = '''
+        return str(revision)
+    except ZeroDivisionError:'''
+
+[[mutant]]
+id = "M8B1-H15"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "an unprintable revision never matches a ReplicaSet without a revision annotation (finding 5)"
+kills = [
+    "tests/test_m8_executor.py::test_an_unprintable_revision_never_matches_an_unannotated_replicaset",
+]
+old = '''
+            and _at(rs, "metadata", "annotations", REVISION_ANNOTATION) == wanted
+            and wanted is not None'''
+new = '''
+            and _at(rs, "metadata", "annotations", REVISION_ANNOTATION) == wanted'''
+
+[[mutant]]
+id = "M8B1-H16"
+source = "0025 M8B-1 review hardening"
+target = "safeops/executor/executor.py"
+guard = "the resources range refusal shows an agent integer by size (finding 5)"
+kills = [
+    "tests/test_m8_executor.py::test_an_integer_too_long_to_print_is_refused_not_raised[resources]",
+]
+old = '''
+                    f"{section}.{field} {_show(value)} is outside'''
+new = '''
+                    f"{section}.{field} {value} is outside'''

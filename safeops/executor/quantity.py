@@ -15,7 +15,10 @@ The supported forms, and nothing else:
 A decimal suffix is never a binary one: 1G is 10^9 bytes and 1Gi is 2^30, so they differ;
 1M (10^6) differs from 1Mi (2^20). Any other form (an exponent, a sign, a CPU suffix on a
 memory quantity, a memory suffix on a CPU quantity, a fractional millicore) returns None:
-the postcondition can't be established from it, and nothing crashes. Milestone 8B-2 checks
+the postcondition can't be established from it, and nothing crashes. A number too long for
+Python's integer conversion (over 4300 digits, ValueError) is unsupported the same way: the
+parsers are total, because they run on server responses after a write may have landed.
+Milestone 8B-2 checks
 the forms the real API server returns for these workloads and amends this contract if it
 returns another one.
 
@@ -41,11 +44,14 @@ def parse_cpu(value: object) -> Fraction | None:
     """Millicores of a CPU quantity, exactly; None for any unsupported form."""
     if type(value) is not str:
         return None
-    if _CPU_CORES.fullmatch(value):
-        return Fraction(value) * 1000
-    match = _CPU_MILLIS.fullmatch(value)
-    if match:
-        return Fraction(int(match.group(1)))
+    try:
+        if _CPU_CORES.fullmatch(value):
+            return Fraction(value) * 1000
+        match = _CPU_MILLIS.fullmatch(value)
+        if match:
+            return Fraction(int(match.group(1)))
+    except ValueError:  # beyond Python's integer-string digit limit
+        return None
     return None
 
 
@@ -57,10 +63,14 @@ def parse_memory(value: object) -> Fraction | None:
     if match is None:
         return None
     number, suffix = match.groups()
+    try:
+        exact = Fraction(number)
+    except ValueError:  # beyond Python's integer-string digit limit
+        return None
     if suffix is None:
-        return Fraction(number)
+        return exact
     multiplier = BINARY[suffix] if suffix in BINARY else DECIMAL[suffix]
-    return Fraction(number) * multiplier
+    return exact * multiplier
 
 
 def cpu_is(value: object, millis: int) -> bool:

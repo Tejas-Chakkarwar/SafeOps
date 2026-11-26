@@ -165,13 +165,23 @@ class WriterTransport(Protocol):
         request the executor must never make (a harness bug, never a classification)."""
 
     def write(self, request: PreparedWrite) -> WriteReply:
-        """Send one request (or not) and say what happened, semantically."""
+        """Send one request (or not) and say what happened, semantically. A returned object
+        is the API server's object as returned, with its kind, metadata.name and
+        metadata.namespace. Raises only a harness bug (NotImplementedStage, GuardError);
+        every refusal of that kind belongs in preflight (D§11.3)."""
 
 
 @runtime_checkable
 class ReaderTransport(Protocol):
     def get(self, kind: str, name: str, namespace: str, timeout_s: float) -> ReadReply:
-        """One attempt to read one object."""
+        """One attempt to read one object. FOUND carries it as the server returned it, with
+        its kind, metadata.name and metadata.namespace."""
 
     def list(self, kind: str, namespace: str, timeout_s: float) -> ReadReply:
-        """One attempt to list one kind in the namespace; FOUND carries {"items": [...]}."""
+        """One attempt to list one kind in the namespace; FOUND carries {"items": [...]},
+        each item with its kind, metadata.name and metadata.namespace.
+
+        FOUND means the COMPLETE list: absence from it is proof of absence. An adapter that
+        can't show the list is complete (a page limit, a continue token, a truncated
+        response) returns UNAVAILABLE. The core also treats a non-empty metadata.continue
+        or a positive metadata.remainingItemCount as incomplete."""

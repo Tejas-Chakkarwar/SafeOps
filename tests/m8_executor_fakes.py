@@ -45,12 +45,12 @@ def _template(image: str, hash_: str) -> dict:
     }
 
 
-def _rs(name: str, revision: str, image: str, *, controller=True, uid=ORDERS_UID) -> dict:
+def _rs(name: str, revision: str, image: str, *, controller=True, uid=ORDERS_UID, ns=NS) -> dict:
     return {
         "kind": "ReplicaSet",
         "metadata": {
             "name": name,
-            "namespace": NS,
+            "namespace": ns,
             "annotations": {"deployment.kubernetes.io/revision": revision},
             "ownerReferences": [
                 {"kind": "Deployment", "name": "orders", "uid": uid, "controller": controller}
@@ -60,12 +60,14 @@ def _rs(name: str, revision: str, image: str, *, controller=True, uid=ORDERS_UID
     }
 
 
-def seed_objects() -> dict:
+def seed_objects(ns: str = NS) -> dict:
+    """The testbed objects, each carrying its kind, name and namespace as the API server
+    returns them (the executor checks all three)."""
     current = _template("orders:2", "hash-orders-rs2")
     del current["metadata"]["labels"]["pod-template-hash"]
     deployment = {
         "kind": "Deployment",
-        "metadata": {"name": "orders", "namespace": NS, "uid": ORDERS_UID},
+        "metadata": {"name": "orders", "namespace": ns, "uid": ORDERS_UID},
         "spec": {"replicas": 2, "template": current},
     }
     gateway = copy.deepcopy(deployment)
@@ -75,25 +77,27 @@ def seed_objects() -> dict:
         ("Deployment", "gateway"): gateway,
         ("ConfigMap", "db-pool-config"): {
             "kind": "ConfigMap",
-            "metadata": {"name": "db-pool-config"},
+            "metadata": {"name": "db-pool-config", "namespace": ns},
             "data": {"max_pool_size": "10", "connection_timeout_ms": "1000", "other": "kept"},
         },
         ("ConfigMap", "orders-config"): {
             "kind": "ConfigMap",
-            "metadata": {"name": "orders-config"},
+            "metadata": {"name": "orders-config", "namespace": ns},
             "data": {"log_level": "info"},
         },
         ("Service", "orders-svc"): {
             "kind": "Service",
-            "metadata": {"name": "orders-svc"},
+            "metadata": {"name": "orders-svc", "namespace": ns},
             "spec": {"selector": {"app": "orders", "tier": "backend"}, "ports": [{"port": 80}]},
         },
-        ("ReplicaSet", "orders-rs1"): _rs("orders-rs1", "1", "orders:1"),
-        ("ReplicaSet", "orders-rs2"): _rs("orders-rs2", "2", "orders:2"),
+        ("ReplicaSet", "orders-rs1"): _rs("orders-rs1", "1", "orders:1", ns=ns),
+        ("ReplicaSet", "orders-rs2"): _rs("orders-rs2", "2", "orders:2", ns=ns),
         # Revision 3 exists only on a ReplicaSet orders doesn't control; revision 4 only on
         # one controlled by an earlier Deployment of the same name (another uid).
-        ("ReplicaSet", "orders-stray"): _rs("orders-stray", "3", "orders:3", controller=False),
-        ("ReplicaSet", "orders-old"): _rs("orders-old", "4", "orders:4", uid="uid-orders-0"),
+        ("ReplicaSet", "orders-stray"): _rs(
+            "orders-stray", "3", "orders:3", controller=False, ns=ns
+        ),
+        ("ReplicaSet", "orders-old"): _rs("orders-old", "4", "orders:4", uid="uid-orders-0", ns=ns),
     }
 
 
@@ -292,7 +296,7 @@ class Rig:
         preflight_raises=None,
         namespace=NS,
     ) -> None:
-        self.cluster = cluster or FakeCluster()
+        self.cluster = cluster or FakeCluster(seed_objects(namespace))
         self.clock = clock or Clock(T0, T0 + timedelta(seconds=1), T0 + timedelta(seconds=2))
         self.writer = FakeWriter(self.cluster, script, preflight_raises, self.clock)
         self.reader = FakeReader(self.cluster, unavailable)

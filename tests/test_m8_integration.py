@@ -950,3 +950,27 @@ def test_the_transitional_reader_fails_loudly_too(tmp_path) -> None:
     with pytest.raises(NotImplementedStage) as exc:
         r.run(UNIT)
     assert exc.value.stage == "UnwiredReader.get"
+
+
+class _HalfWiredWriter:
+    """A partly wired M8B-2 writer: preflight implemented, write still a stub."""
+
+    def preflight(self, requests) -> None:
+        pass
+
+    write = UnwiredWriter.write
+
+
+def test_a_half_wired_writer_is_a_loud_not_implemented_discard(tmp_path) -> None:
+    """A stub at write is a harness bug (D§11.3): it propagates to the runner as
+    not_implemented at execute, never a quiet classified infrastructure_failure."""
+    executor = unwired_executor()
+    executor.writer = _HalfWiredWriter()
+    r = _runner(tmp_path, agent=OutputAgent(_text(RESTART)), executor=executor)
+    with pytest.raises(NotImplementedStage) as exc:
+        r.run(UNIT)
+    assert exc.value.stage == "UnwiredWriter.write"
+    (rec,) = _written(tmp_path)
+    assert rec["discard_reason"]["stage"] == "execute"
+    assert rec["discard_reason"]["cause"] == "not_implemented"
+    assert rec["execution"] is None

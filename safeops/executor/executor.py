@@ -17,7 +17,12 @@ executes what the gate approved, including actions the harm checker will score h
 4. **Plan.** Every request the action will send is built (the composite's restart value
    included) and preflighted together, before the first write. A preflight refusal raises.
 5. **Write and classify.** One write at a time; each semantic reply is classified, and an
-   ambiguous one is reconciled with a bounded read. Nothing raises after a possible send.
+   ambiguous one is reconciled with a bounded read. Nothing raises after a possible send
+   except a harness bug (HARNESS_BUGS), which D§11.3 confines to before the first write.
+
+Every object a transport returns (a write's response, a read-back, a pre-write read, each
+listed ReplicaSet) must be the object asked about: its kind, metadata.name and
+metadata.namespace equal the request's. Anything else is not that object's evidence.
 
 Its dependencies are injected (M8B-2 supplies the concrete transports without changing
 `apply`): the loaded action semantics and bound topology build_runner shares with the M8A
@@ -33,6 +38,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 
 from safeops.actions import exact_int, is_dns_label, params_problem, target_problem
+from safeops.cluster import GuardError
 from safeops.domain import RecommendedAction
 from safeops.enums import ActionType, ExecutionStatus
 from safeops.executor import quantity
@@ -58,6 +64,7 @@ from safeops.executor.transport import (
     prepared,
 )
 from safeops.policy import ActionSemantics
+from safeops.stubs import NotImplementedStage
 from safeops.topology import ResourceSpec, ServiceTopology
 
 # Every read, pre-write or reconciliation (D§11.6): at most 3 attempts, a 10 s timeout each,
@@ -71,6 +78,12 @@ REVISION_ANNOTATION = "deployment.kubernetes.io/revision"
 POD_TEMPLATE_HASH = "pod-template-hash"
 # The executor's units and Kubernetes' quantity suffixes (decision 0011).
 RESOURCE_UNITS = {"cpu_millis": ("cpu", "m"), "memory_mib": ("memory", "Mi")}
+
+# Harness bugs a transport may raise (D§11.3, D§11.6): a stage not implemented yet, and a
+# context-guard refusal. They propagate from every transport call, before or after a write;
+# never classified as an ambiguous write or an unavailable read. M8B-2's writer enforces
+# every such refusal in preflight, so none can happen after a known write (D§11.3).
+HARNESS_BUGS = (NotImplementedStage, GuardError)
 
 
 class ExecutorConfigurationError(ValueError):
@@ -107,6 +120,28 @@ def _at(obj: object, *path: str) -> object:
     return obj
 
 
+def _show(value: object) -> str:
+    """repr(value), total: an integer too long for Python's str conversion (over 4300
+    digits) is described by its size instead of raising."""
+    try:
+        return repr(value)
+    except ValueError:
+        return f"<an integer of {value.bit_length()} bits>"
+
+
+def _identity(obj: object) -> tuple[object, object, object]:
+    return (_at(obj, "kind"), _at(obj, "metadata", "name"), _at(obj, "metadata", "namespace"))
+
+
+def _identity_problem(obj: object, kind: str, name: str, namespace: str) -> str | None:
+    """None if `obj` is kind/name in namespace; otherwise what it is instead."""
+    got = _identity(obj)
+    if got == (kind, name, namespace):
+        return None
+    shown = ", ".join(_show(v) for v in got)
+    return f"expected {kind}/{name} in {namespace!r}, got (kind, name, namespace) = ({shown})"
+
+
 def render_configmap_value(value: object) -> str:
     """The ConfigMap data string for a params value (D§11.2): a string as is, an integer as
     str(i), a finite float as repr(f)."""
@@ -123,7 +158,10 @@ def _named(containers: list, name: str) -> list[dict]:
 
 def postcondition_holds(request: PreparedWrite, obj: object) -> bool:
     """Does `obj` (a returned or read-back object) show what `request` asked for (D§11.6)?
-    Total: a missing, malformed or unrecognized value is simply "not shown"."""
+    Total: a missing, malformed or unrecognized value is simply "not shown", and so is any
+    object other than the requested one (its kind, name and namespace must match)."""
+    if _identity_problem(obj, request.kind, request.name, request.namespace) is not None:
+        return False
     expected = request.postcondition.expected()
     check = request.postcondition.check
     if check is Check.REPLICAS:
@@ -197,9 +235,11 @@ class ActionExecutor:
     def apply(self, action) -> ExecutionResult:
         """Apply a gate-approved action within the hard envelope; return an ExecutionResult.
 
-        Raises only for harness bugs, all before the first write: a structurally invalid
-        action (ValueError), a configuration defect (ExecutorConfigurationError), or a
-        preflight refusal from the writer. Every outcome after a possible send is classified.
+        Raises only for harness bugs: a structurally invalid action (ValueError), a
+        configuration defect (ExecutorConfigurationError), a preflight refusal from the
+        writer, all before the first write; and a HARNESS_BUGS exception from any transport
+        call, which D§11.3 confines to before the first write as well. Every other outcome
+        after a possible send is classified.
         """
         if not isinstance(action, RecommendedAction):
             raise TypeError(f"apply takes a RecommendedAction, not {type(action)}")
@@ -274,7 +314,7 @@ class ActionExecutor:
         hard = spec.bounds["replicas"].hard
         if not hard.contains(replicas):
             return _refused(
-                f"replicas {replicas} is outside Deployment/{spec.name}'s hard range"
+                f"replicas {_show(replicas)} is outside Deployment/{spec.name}'s hard range"
                 f" [{hard.lo}, {hard.hi}]"
             )
         body = {"spec": {"replicas": replicas}}
@@ -380,6 +420,9 @@ class ActionExecutor:
             )
         if reply.outcome is ReadOutcome.ABSENT:
             return _refused(f"Deployment/{deployment} does not exist, so neither does {container}")
+        wrong = _identity_problem(reply.obj, "Deployment", deployment, self.namespace)
+        if wrong is not None:
+            return _unavailable(f"the container check read the wrong object: {wrong}")
         containers = _at(reply.obj, "spec", "template", "spec", "containers")
         if type(containers) is not list:
             return _unavailable(f"Deployment/{deployment} as read has no container list")
@@ -397,8 +440,12 @@ class ActionExecutor:
                 f"the rollback history read could not read Deployment/{name}"
                 f" after {READ_ATTEMPTS} attempts: {reply.diagnostic}"
             )
+        shown = _show(revision)
         if reply.outcome is ReadOutcome.ABSENT:
-            return _refused(f"Deployment/{name} does not exist: revision {revision} has no history")
+            return _refused(f"Deployment/{name} does not exist: revision {shown} has no history")
+        wrong = _identity_problem(reply.obj, "Deployment", name, self.namespace)
+        if wrong is not None:
+            return _unavailable(f"the rollback history read the wrong object: {wrong}")
         uid = _at(reply.obj, "metadata", "uid")
         if type(uid) is not str or not uid:
             return _unavailable(f"Deployment/{name} as read has no uid")
@@ -411,19 +458,37 @@ class ActionExecutor:
         items = _at(listed.obj, "items")
         if type(items) is not list:
             return _unavailable("the ReplicaSet list as read has no items")
+        # Absence from the list proves a revision absent only if the list is complete.
+        if _at(listed.obj, "metadata", "continue") or _at(
+            listed.obj, "metadata", "remainingItemCount"
+        ):
+            return _unavailable(
+                "the ReplicaSet list as read is incomplete (a continue token or remaining items)"
+            )
+        for rs in items:
+            if _at(rs, "metadata", "name") is None or (
+                _at(rs, "kind"),
+                _at(rs, "metadata", "namespace"),
+            ) != ("ReplicaSet", self.namespace):
+                return _unavailable(
+                    f"the ReplicaSet list holds an object that is not a ReplicaSet in"
+                    f" {self.namespace!r}: (kind, name, namespace) = {_identity(rs)!r}"
+                )
+        wanted = _decimal(revision)  # None: no annotation can hold it, so nothing matches
         matches = [
             rs
             for rs in items
             if _controlled_by(rs, name, uid)
-            and _at(rs, "metadata", "annotations", REVISION_ANNOTATION) == str(revision)
+            and _at(rs, "metadata", "annotations", REVISION_ANNOTATION) == wanted
+            and wanted is not None
         ]
         if not matches:
-            return _refused(f"revision {revision} is not in Deployment/{name}'s history")
+            return _refused(f"revision {shown} is not in Deployment/{name}'s history")
         if len(matches) > 1:
-            return _unavailable(f"{len(matches)} ReplicaSets claim revision {revision} of {name}")
+            return _unavailable(f"{len(matches)} ReplicaSets claim revision {shown} of {name}")
         template = _at(matches[0], "spec", "template")
         if type(template) is not dict:
-            return _unavailable(f"revision {revision}'s ReplicaSet has no pod template")
+            return _unavailable(f"revision {shown}'s ReplicaSet has no pod template")
         cleaned = copy.deepcopy(template)  # never change the object as it was read
         labels = _at(cleaned, "metadata", "labels")
         if type(labels) is dict:
@@ -466,6 +531,8 @@ class ActionExecutor:
             return reply
         try:
             reply = call()
+        except HARNESS_BUGS:
+            raise
         except Exception as exc:
             return ReadReply(ReadOutcome.UNAVAILABLE, diagnostic=f"{type(exc).__name__}: {exc}")
         if not isinstance(reply, ReadReply):
@@ -499,9 +566,12 @@ class ActionExecutor:
     def _attempt(self, request: PreparedWrite) -> tuple[_Outcome, str | None]:
         """One write, classified from its semantic reply. Never raises for what happened
         after the request may have been sent: a writer error or a reply of the wrong type is
-        ambiguous, and reconciled like any other."""
+        ambiguous, and reconciled like any other. A HARNESS_BUGS exception is not such an
+        outcome (nothing was sent) and propagates."""
         try:
             reply = self.writer.write(request)
+        except HARNESS_BUGS:
+            raise
         except Exception as exc:
             reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"{type(exc).__name__}: {exc}")
         if not isinstance(reply, WriteReply):
@@ -545,13 +615,13 @@ def _configmap_key_refusal(spec: ResourceSpec, key: str, value: object) -> Execu
         return _refused(f"{key} is not an approved key of ConfigMap/{spec.name}")
     if "enum" in rule:
         if type(value) is not str or value not in rule["enum"]:
-            return _refused(f"{key}={value!r} is not one of {list(rule['enum'])}")
+            return _refused(f"{key}={_show(value)} is not one of {list(rule['enum'])}")
         return None
     if type(value) not in (int, float):
-        return _refused(f"{key} is numeric: {value!r} is not a JSON number")
+        return _refused(f"{key} is numeric: {_show(value)} is not a JSON number")
     lo, hi = rule["hard_range"]
     if not lo <= value <= hi:
-        return _refused(f"{key}={value!r} is outside its hard range [{lo}, {hi}]")
+        return _refused(f"{key}={_show(value)} is outside its hard range [{lo}, {hi}]")
     return None
 
 
@@ -563,10 +633,20 @@ def _resource_range_refusal(params: dict, spec: ResourceSpec) -> ExecutionResult
             hard = spec.bounds[field].hard
             if not hard.contains(value):
                 return _refused(
-                    f"{section}.{field} {value} is outside Deployment/{spec.name}'s hard range"
+                    f"{section}.{field} {_show(value)} is outside Deployment/{spec.name}'s"
+                    " hard range"
                     f" [{hard.lo}, {hard.hi}]"
                 )
     return None
+
+
+def _decimal(revision: int) -> str | None:
+    """The revision annotation's text for `revision`, or None if no annotation can hold it
+    (beyond Python's integer-string digit limit)."""
+    try:
+        return str(revision)
+    except ValueError:
+        return None
 
 
 def _controlled_by(rs: object, name: str, uid: str) -> bool:

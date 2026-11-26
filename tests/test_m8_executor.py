@@ -1081,3 +1081,397 @@ def test_the_read_bounds_are_the_frozen_values() -> None:
     rig = Rig(["ambiguous"], unavailable=3)
     rig.apply(restart())
     assert [c[4] for c in rig.reader.calls] == [10, 10, 10] and rig.sleeps == [2, 2]
+
+
+# --- 13. review hardening (adversarial review of the M8B-1 commit) ----------------------------
+#
+# 1. the quantity parsers are total (no raise after a write); 2. every object a transport
+# returns must be the object asked about; 3. harness bugs propagate from every transport
+# call; 4. a ReplicaSet list proves absence only when complete; 5. agent integers too long
+# for str() are refused, never raised on; 6. E3's approved-keys rule is pinned honestly.
+
+HUGE = "9" * 5000  # past Python's 4300-digit integer-string limit
+
+
+@pytest.mark.parametrize(
+    "parse, text",
+    [
+        (quantity.parse_cpu, HUGE),
+        (quantity.parse_cpu, HUGE + "m"),
+        (quantity.parse_cpu, "0." + HUGE),
+        (quantity.parse_memory, HUGE),
+        (quantity.parse_memory, HUGE + "Mi"),
+        (quantity.parse_memory, "1." + HUGE + "Gi"),
+        (quantity.parse_memory, HUGE + "G"),
+    ],
+)
+def test_the_quantity_parsers_are_total_past_the_digit_limit(parse, text) -> None:
+    assert parse(text) is None
+    assert not quantity.cpu_is(text, 1) and not quantity.memory_is(text, 1)
+
+
+class _Overstating:
+    """A writer that applies the request, then reports SUCCESS with a returned object whose
+    memory request is a 5000-digit quantity (a pathological server response)."""
+
+    def __init__(self, cluster):
+        self.cluster, self.writes = cluster, []
+
+    def preflight(self, requests):
+        pass
+
+    def write(self, request):
+        self.writes.append(request)
+        self.cluster.apply(request)
+        obj = self.cluster.get(request.kind, request.name)
+        obj["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]["memory"] = (
+            HUGE + "Mi"
+        )
+        return WriteReply(WriteClass.SUCCESS, obj)
+
+
+def test_a_huge_returned_quantity_is_not_shown_and_reconciliation_decides() -> None:
+    rig = Rig()
+    rig.executor.writer = _Overstating(rig.cluster)
+    result = rig.apply(resources(requests={"memory_mib": 384}))
+    assert _shape(result) == (S.APPLIED, [("patch_deployment_resources", "applied")])
+    assert [c[0] for c in rig.reader.calls] == ["get", "get"]  # container check, read-back
+
+
+def test_a_huge_quantity_read_back_too_is_a_classified_failure_not_a_raise() -> None:
+    rig = Rig()
+    rig.executor.writer = _Overstating(rig.cluster)
+    real_get = rig.cluster.get
+    reads = []
+
+    def huge_after_write(kind, name):
+        obj = real_get(kind, name)
+        reads.append(name)
+        if len(reads) > 1:  # the reconciliation reads, not the container check
+            c = obj["spec"]["template"]["spec"]["containers"][0]
+            c["resources"]["requests"]["memory"] = HUGE + "Mi"
+        return obj
+
+    rig.cluster.get = huge_after_write
+    result = rig.apply(resources(requests={"memory_mib": 384}))
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [("patch_deployment_resources", "failed")])
+    assert "absent" in result.error
+
+
+# --- 2. identity ---
+
+
+def _replying_with(rig, kind, name, *, apply=False):
+    """Make the writer answer SUCCESS with another stored object's current state."""
+
+    def write(request):
+        rig.writer.writes.append(request)
+        if apply:
+            rig.cluster.apply(request)
+        other = rig.cluster.get(kind, name)
+        other["spec"]["replicas"] = request.body()["spec"]["replicas"]
+        return WriteReply(WriteClass.SUCCESS, other)
+
+    rig.writer.write = write
+
+
+def test_a_success_reply_carrying_another_object_confirms_nothing() -> None:
+    rig = Rig()
+    _replying_with(rig, "Deployment", "gateway")  # gateway at 7; orders never written
+    result = rig.apply(scale(7))
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [("scale_deployment", "failed")])
+    assert rig.cluster.objects[("Deployment", "orders")]["spec"]["replicas"] == 2
+    assert rig.reader.calls[0][:3] == ("get", "Deployment", "orders")
+
+
+def test_a_wrong_object_in_the_reply_falls_back_to_the_targets_read_back() -> None:
+    rig = Rig()
+    _replying_with(rig, "Deployment", "gateway", apply=True)
+    assert rig.apply(scale(7)).status is S.APPLIED
+    assert len(rig.reader.calls) == 1  # reconciled, not confirmed by the reply
+
+
+def _misreading(rig, transform):
+    """Every get returns transform(the stored object)."""
+    real = rig.reader.get
+
+    def get(kind, name, namespace, timeout_s):
+        reply = real(kind, name, namespace, timeout_s)
+        if reply.outcome is ReadOutcome.FOUND:
+            return ReadReply(ReadOutcome.FOUND, transform(copy.deepcopy(reply.obj)))
+        return reply
+
+    rig.reader.get = get
+
+
+def test_a_read_back_of_another_object_confirms_nothing() -> None:
+    rig = Rig(["lost"])
+    gateway = rig.cluster.get("Deployment", "gateway")
+    gateway["spec"]["replicas"] = 7
+    _misreading(rig, lambda obj: copy.deepcopy(gateway))
+    result = rig.apply(scale(7))
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [("scale_deployment", "failed")])
+
+
+def _rename(obj):
+    obj["metadata"]["name"] = "gateway"
+    return obj
+
+
+def _rekind(obj):
+    obj["kind"] = "StatefulSet"
+    return obj
+
+
+def _renamespace(obj):
+    obj["metadata"]["namespace"] = "other-ns"
+    return obj
+
+
+def _no_kind(obj):
+    del obj["kind"]
+    return obj
+
+
+def _no_namespace(obj):
+    del obj["metadata"]["namespace"]
+    return obj
+
+
+IDENTITY_BREAKS = [_rename, _rekind, _renamespace, _no_kind, _no_namespace]
+
+
+@pytest.mark.parametrize("brk", IDENTITY_BREAKS)
+@pytest.mark.parametrize(
+    "act",
+    [
+        restart(),
+        scale(3),
+        patch_configmap({"max_pool_size": 20}),
+        patch_service({"app": "orders"}),
+        resources(requests={"cpu_millis": 200}),
+        rollback(1),
+    ],
+    ids=["restart", "scale", "configmap", "service", "resources", "rollback"],
+)
+def test_every_postcondition_checks_the_objects_identity(act, brk) -> None:
+    """The write lands, but every response and read-back shows a misidentified object: the
+    change is never confirmed, whichever check the action uses."""
+    rig = Rig(["stale"] * 2)
+    real_write = rig.writer.write
+
+    def write(request):
+        real_write(request)  # the write lands
+        real = rig.cluster.get(request.kind, request.name)
+        return WriteReply(WriteClass.SUCCESS, brk(real))
+
+    rig.writer.write = write
+    real_get = rig.reader.get
+
+    def get(kind, name, namespace, timeout_s):
+        reply = real_get(kind, name, namespace, timeout_s)
+        if rig.writer.writes and reply.outcome is ReadOutcome.FOUND:
+            return ReadReply(ReadOutcome.FOUND, brk(copy.deepcopy(reply.obj)))
+        return reply
+
+    rig.reader.get = get
+    result = rig.apply(act)
+    assert result.status is S.INFRASTRUCTURE_FAILURE
+    assert result.steps[-1].status == "failed" and "absent" in result.error
+
+
+@pytest.mark.parametrize("brk", IDENTITY_BREAKS)
+@pytest.mark.parametrize(
+    "act, what",
+    [
+        (resources(requests={"cpu_millis": 200}), "the container check"),
+        (rollback(1), "the rollback history"),
+    ],
+    ids=["resources", "rollback"],
+)
+def test_a_pre_write_read_of_the_wrong_object_writes_nothing(act, what, brk) -> None:
+    rig = Rig()
+    _misreading(rig, brk)
+    result = rig.apply(act)
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [])
+    assert result.error.startswith(f"{what} read the wrong object")
+    assert not rig.writer.preflights and not rig.writer.writes
+
+
+def _listing(rig, transform):
+    real = rig.reader.list
+
+    def list_(kind, namespace, timeout_s):
+        reply = real(kind, namespace, timeout_s)
+        return ReadReply(ReadOutcome.FOUND, transform(copy.deepcopy(reply.obj)))
+
+    rig.reader.list = list_
+
+
+def _first_item(change):
+    def transform(listed):
+        change(listed["items"][0])
+        return listed
+
+    return transform
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        _first_item(lambda rs: rs.update(kind="Pod")),
+        _first_item(lambda rs: rs.pop("kind")),
+        _first_item(lambda rs: rs["metadata"].update(namespace="other-ns")),
+        _first_item(lambda rs: rs["metadata"].pop("namespace")),
+        _first_item(lambda rs: rs["metadata"].pop("name")),
+        lambda listed: {"items": [*listed["items"], "not an object"]},
+    ],
+    ids=["kind", "no-kind", "namespace", "no-namespace", "no-name", "non-object"],
+)
+def test_a_replicaset_list_holding_a_foreign_object_writes_nothing(transform) -> None:
+    rig = Rig()
+    _listing(rig, transform)
+    result = rig.apply(rollback(1))
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [])
+    assert "not a ReplicaSet in 'testbed'" in result.error
+    assert not rig.writer.preflights
+
+
+# --- 4. list completeness ---
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [{"continue": "eyJ2IjoibWV0YS5rOHMuaW8vdjEifQ"}, {"remainingItemCount": 3}],
+    ids=["continue", "remaining"],
+)
+@pytest.mark.parametrize("revision", [1, 9], ids=["present", "absent"])
+def test_an_incomplete_replicaset_list_proves_nothing(meta, revision) -> None:
+    """A truncated list can't prove a revision absent (a false refusal), nor be trusted to
+    hold every claimant of it: unavailable, before any write."""
+    rig = Rig()
+    _listing(rig, lambda listed: {**listed, "metadata": meta})
+    result = rig.apply(rollback(revision))
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [])
+    assert "incomplete" in result.error and not rig.writer.writes
+
+
+@pytest.mark.parametrize("meta", [{}, {"continue": ""}, {"remainingItemCount": 0}])
+def test_a_complete_replicaset_list_still_decides(meta) -> None:
+    rig = Rig()
+    _listing(rig, lambda listed: {**listed, "metadata": {"resourceVersion": "9", **meta}})
+    assert rig.apply(rollback(1)).status is S.APPLIED
+    rig = Rig()
+    _listing(rig, lambda listed: {**listed, "metadata": meta})
+    assert rig.apply(rollback(9)).status is S.REFUSED_BY_ENVELOPE
+
+
+# --- 3. harness bugs propagate ---
+
+
+def _guard_error():
+    from safeops.cluster import GuardError
+
+    return GuardError("context kind-safeops is outside the executor phase's scope")
+
+
+def _stub_error():
+    from safeops.stubs import NotImplementedStage
+
+    return NotImplementedStage("HalfWiredWriter.write", 8)
+
+
+@pytest.mark.parametrize("make", [_stub_error, _guard_error], ids=["stub", "guard"])
+def test_a_harness_bug_at_write_propagates_instead_of_becoming_ambiguous(make) -> None:
+    rig = Rig()
+    exc = make()
+
+    def write(request):
+        rig.writer.writes.append(request)
+        raise exc
+
+    rig.writer.write = write
+    with pytest.raises(type(exc)) as raised:
+        rig.apply(scale(3))
+    assert raised.value is exc
+    assert len(rig.writer.writes) == 1 and not rig.reader.calls  # no reconciliation
+
+
+@pytest.mark.parametrize("make", [_stub_error, _guard_error], ids=["stub", "guard"])
+def test_a_harness_bug_in_reconciliation_propagates_instead_of_becoming_unavailable(
+    make,
+) -> None:
+    rig = Rig(["ambiguous"])
+    exc = make()
+
+    def get(*args):
+        raise exc
+
+    rig.reader.get = get
+    with pytest.raises(type(exc)):
+        rig.apply(scale(3))
+    assert not rig.sleeps  # not retried as an unavailable read
+
+
+def test_a_credential_error_at_write_is_not_a_harness_bug() -> None:
+    """D§11.3: a locally detected credential problem is a classified cause (M8B-2's adapter
+    reports it NOT_ATTEMPTED). Raised raw, it is reconciled like any other writer error."""
+    from safeops.cluster import CredentialError
+
+    rig = Rig()
+
+    def write(request):
+        rig.writer.writes.append(request)
+        raise CredentialError("token expired")
+
+    rig.writer.write = write
+    result = rig.apply(scale(3))
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [("scale_deployment", "failed")])
+    assert "CredentialError" in result.error
+
+
+# --- 5. agent integers too long for str() ---
+
+
+@pytest.mark.parametrize(
+    "act, fragment",
+    [
+        (scale(10**5000), "replicas <an integer of 16610 bits> is outside"),
+        (rollback(10**5000), "revision <an integer of 16610 bits> is not in"),
+        (patch_configmap({"max_pool_size": 10**5000}), "max_pool_size=<an integer of 16610 bits>"),
+        (resources(requests={"cpu_millis": 10**5000}), "requests.cpu_millis <an integer of"),
+    ],
+    ids=["scale", "rollback", "configmap", "resources"],
+)
+def test_an_integer_too_long_to_print_is_refused_not_raised(act, fragment) -> None:
+    rig = Rig()
+    result = rig.apply(act)
+    assert _shape(result) == (S.REFUSED_BY_ENVELOPE, [])
+    assert fragment in result.error and len(result.error) < 200
+    assert not rig.writer.preflights and not rig.writer.writes
+
+
+# --- 6. E3's approved-keys rule ---
+
+
+def test_e3_is_the_recorded_reason_for_a_configmap_without_approved_keys() -> None:
+    """Without E3's approved-keys rule the per-key check would refuse the same action with
+    the same status and no steps, so the rule's only observable effect is the recorded
+    reason (execution.error): this pins that attribution, and that no read or write
+    happens, explicitly."""
+    topology = _topology_with(**{"bare-config": {"kind": "ConfigMap", "owner": "orders"}})
+    rig = Rig(topology=topology)
+    result = rig.apply(patch_configmap({"max_pool_size": 20}, name="bare-config"))
+    assert result.to_record()["error"] == "E3: ConfigMap/bare-config has no approved keys"
+    assert "not an approved key" not in result.error
+    assert rig.untouched
+
+
+def test_an_unprintable_revision_never_matches_an_unannotated_replicaset() -> None:
+    """A ReplicaSet without a revision annotation has no revision: an integer too long for
+    str() must not 'equal' its missing annotation."""
+    rig = Rig()
+    del rig.cluster.objects[("ReplicaSet", "orders-rs1")]["metadata"]["annotations"]
+    result = rig.apply(rollback(10**5000))
+    assert _shape(result) == (S.REFUSED_BY_ENVELOPE, [])
+    assert "is not in Deployment/orders's history" in result.error

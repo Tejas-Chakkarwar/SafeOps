@@ -1647,3 +1647,59 @@ The classes are closed:
 - In a scratch copy of the candidate, all 60 were killed, with 0 survived and 0 harness errors, and every named kill test fails under its mutant. The table holds 239.
 
 **Unchanged:** the M8A read path (parser, features, gate, shadow scoring, policy, topology binding and its strict loader); `config/*.yaml`; `manifests/`; `safeops/bootstrap.py`; the design document. The Milestone 8 closure carry-forward stands: the cross-subsystem audit of independent `load_topology()` consumers (`environment/manager.py`, `faults/spec.py`, `tools/reader.py`, `environment/desired.py`, `bootstrap.py`). Milestone 8 is not closed: M8B-2 and that audit remain.
+
+## Amendment, 2026-11-25: Milestone 8B-1 review hardening (adversarial review of `20d3e80`)
+
+An adversarial review of the M8B-1 commit found six defects or gaps, each reproduced offline. All six are fixed here. The amendment above stands except where a paragraph below names what it supersedes. No `ExecutionStatus`, `WriteClass`, record field or schema rule changes, and no M8B-2 work starts.
+
+**1. The quantity parsers are total.**
+- *Found:* `Fraction(...)` and `int(...)` raise `ValueError` on a number of more than 4300 digits (Python's integer-string limit). The parsers run on a write's returned object and on reconciliation reads, so a pathological server response raised out of `apply()` after a write was sent. That broke "nothing raises after a possible send", and on the composite it would have lost a known-applied step 1 (`execution: null`).
+- *Fixed:* such a number is an unsupported form. `parse_cpu` and `parse_memory` return `None`, so the postcondition is not shown and reconciliation decides. Tests cover each form past the limit, a returned object that reconciles to `applied`, and one whose read-back is also huge, giving `infrastructure_failure` `[failed]` with no raise.
+
+**2. Every object a transport returns must be the object asked about.**
+- *Found:* postconditions checked fields only. A `SUCCESS` reply carrying `gateway` at 7 replicas confirmed `scale(orders, 7)` while `orders` stayed at 2, and a reconciliation read of the wrong object confirmed too. The two pre-write reads had the same gap, and so did the container check and the uid the rollback history check binds to.
+- *Fixed:* an object is the target only if its `kind`, `metadata.name` and `metadata.namespace` all equal the request's. A missing field is a mismatch, since the API server returns all three for these namespaced kinds. In detail:
+  - `postcondition_holds` returns false for any other object. The write is then reconciled, never confirmed.
+  - A pre-write read of the wrong object is `INFRASTRUCTURE_FAILURE`, `[]`, with nothing preflighted or written: "… read the wrong object: expected …, got …".
+  - Every listed ReplicaSet must be a named object of kind `ReplicaSet` in the testbed namespace; otherwise the rollback is `INFRASTRUCTURE_FAILURE`, `[]`.
+  - M8B-2 confirms live that `kubectl get`/`patch -o json` and the list items carry all three fields, and amends this rule if they don't.
+- The offline fakes now carry all three fields on every seeded object, as the server would.
+
+**3. Harness bugs propagate from every transport call.**
+- *Found:* a broad `except Exception` around `writer.write` and around after-write reads turned a `NotImplementedStage` (a half-wired writer: real preflight, stubbed write) into a quiet `infrastructure_failure`, "ambiguous response: NotImplementedStage…". A context-guard refusal raised at write would have been hidden the same way. D§11.3 and D§11.6 make both harness bugs that raise.
+- *Fixed:*
+  - `HARNESS_BUGS = (NotImplementedStage, GuardError)` in `safeops/executor/executor.py` propagates from `writer.write` and from reconciliation reads, unreconciled and unretried.
+  - Every other writer or after-write reader exception keeps its M8B-1 meaning: an ambiguous write, or an unavailable read attempt.
+  - A raw `CredentialError` is deliberately not in the set. D§11.3 makes a locally detected credential problem a classified cause, which M8B-2's adapter reports as `NOT_ATTEMPTED`; raised raw, it is reconciled like any other writer error. A test pins this.
+  - The runner turns a propagated stub into a `not_implemented` discard at `execute`, with `execution: null`. `tests/test_m8_integration.py` pins this for a half-wired writer.
+- *Supersedes:* "After a possible send, nothing raises" now reads "after a possible send, nothing raises except a `HARNESS_BUGS` exception". D§11.3 confines those to before the first write: **M8B-2's writer must enforce every such refusal in `preflight`**, so none can reach `write` after a known applied step.
+- *Supersedes:* the core now imports `safeops.cluster`, for the `GuardError` class only. It still parses no kubectl output and makes no client call. The wall allows it, because `safeops.executor` is protected but is not a no-cluster read-path root.
+
+**4. A ReplicaSet list proves absence only when complete.**
+- *Found:* `ReadReply` had no completeness signal. A truncated or paginated list would make a real revision look absent, a false `REFUSED_BY_ENVELOPE`.
+- *Fixed:* the `ReaderTransport.list` contract now says `FOUND` means the complete list. An adapter that can't show completeness returns `UNAVAILABLE`.
+- As a backstop, the core treats a non-empty `metadata.continue` or a positive `metadata.remainingItemCount` as incomplete: `INFRASTRUCTURE_FAILURE`, `[]`, whether or not the revision appears in the partial list. An empty token and a zero count are complete.
+
+**5. Agent integers too long for `str()` are refused, never raised on.**
+- *Found:* `scale(10**5000)` raised `ValueError` while formatting its own refusal text. A rollback's `str(revision)` raised the same way, before any write.
+- *Fixed:* refusal texts render agent numbers through `_show`, which describes such an integer by its size (`<an integer of 16610 bits>`). The revision is compared through `_decimal`, which gives `None` for an unprintable revision, so nothing matches, including a ReplicaSet with no revision annotation. Each action refuses with `REFUSED_BY_ENVELOPE`, `[]`, without reading, preflighting or writing anything for scale, ConfigMap and resources.
+- Production can't reach this today, because the parser rejects such output as `invalid_output`. The fix makes the executor's own contract hold for any structurally valid action.
+
+**6. `M8B1-E4` is described honestly.**
+- *Found:* without E3's approved-keys rule, the per-key check refuses the same action with the same status and no steps. The mutant changes only the recorded reason.
+- *Fixed:* its `guard` now says so. A second kill test pins the recorded attribution (`execution.error` is `"E3: ConfigMap/… has no approved keys"`, not the per-key reason) and that nothing is read or written. It is kept, because `execution.error` is recorded evidence.
+
+**Mutants:** 16 new, source "0025 M8B-1 review hardening". `M8B1-O3`'s target text follows the reordered revision match. The table holds 255.
+
+| Mutants | What they pin |
+|---|---|
+| `M8B1-H1`, `H2` | the CPU and memory parsers past the digit limit |
+| `M8B1-H3`–`H7` | the postcondition identity check, the comparison of all three fields, both pre-write reads, the listed-item check |
+| `M8B1-H8`, `H9` | a continue token, a remaining-item count |
+| `M8B1-H10`–`H12` | propagation at write and at reconciliation, `GuardError` in the set |
+| `M8B1-H13`–`H16` | `_show`, `_decimal`, the unannotated-ReplicaSet guard, the resources refusal text |
+
+- In a scratch copy, every named kill test fails under its mutant: 28 kill tests across the 16 new mutants and the two amended ones, with 0 survivors.
+- Of the new tests, 70 fail against `20d3e80`. The rest pin behavior that didn't change: complete lists, `CredentialError` reconciled, and the E3 reason.
+
+**Unchanged:** every `ExecutionStatus` producer shape; the read bounds; the provisional rollback template equality (`M8B1-O7`); the schema; the information-wall roots; `config/*.yaml`, `manifests/`, `safeops/bootstrap.py` and the design document. M8B-2 is not started.
