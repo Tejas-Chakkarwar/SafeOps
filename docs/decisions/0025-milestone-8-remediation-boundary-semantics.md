@@ -2110,3 +2110,69 @@ The split between the two identities is deliberately asymmetric:
 The table holds 304.
 
 **Unchanged:** schema version 2 and `RECORD_FIELDS`; the `ExecutionStatus` and `WriteClass` sets; `safeops/actions.py`; features and gate; `action_semantics.yaml`; `topology.yaml`; the hard envelope; reader semantics and reader RBAC; quantity semantics; `config/bootstrap_scope.yaml`; the executor manifest (patch-only, exact resourceNames). The live evidence follows in the B2-B live-proof section.
+
+### B2-B live proof (2026-11-26)
+
+**Runs.** Both used the committed correction tree (`4ef618b`). No manifest, RBAC or config changed after B2-A.
+- **First run:** the B2-A cluster, 30/30 executor-live tests, with `-s` to capture the evidence below.
+- **Final acceptance:** `make cluster-down` verified ownership. Then `make cluster-up` built a fresh cluster from the committed tree. `make cluster-test` passed 97/97, all 30 executor-live tests among them, and `safeops verify` ended CLEAN.
+
+**The original STOP, kept as evidence.** `kubectl patch` with the executor kubeconfig (kubectl v1.37.2) still GETs the object first and gets a 403. Its `-v=6` log has no PATCH line (`test_kubectl_patch_itself_is_blocked_by_its_own_get`).
+
+**GET denied while PATCH succeeds**, with the same credential and the same allowed Deployment:
+- `kubectl get deployment orders` → "cannot get resource".
+- The production writer's direct PATCH returned `APPLIED` and replicas are 3. It sent exactly `[("PATCH", "/apis/apps/v1/namespaces/testbed/deployments/orders")]`: zero executor GET, no kubectl patch.
+- The connection details:
+  - authority `127.0.0.1:<published port>`, equal to the verified kubeconfig server;
+  - `CERT_REQUIRED` with `check_hostname=True`; kind's API-server certificate verifies for `127.0.0.1` against the pinned CA, which is one certificate with no system trust;
+  - timeout 20;
+  - `Content-Type: application/merge-patch+json`;
+  - Authorization present; its value was never recorded.
+- `kubectl replace` (update) → "cannot update resource \"configmaps\"".
+- Delete dry runs, list, watch, other names, StatefulSet, PVC, Secret, Pod, `deployments/scale`, `deployments/status`, other namespaces and cluster-scoped objects are all denied, by both the admin impersonation matrix and the executor token itself.
+
+**The six operations.**
+- **Reader:** safeops-reader through the existing `Kubectl(cfg, Phase.READER)`, unchanged.
+- **Writer:** `system:serviceaccount:safeops-system:safeops-executor`, direct HTTPS PATCH.
+- **Cleanup:** each test reset and verified CLEAN afterwards.
+
+| Operation | Requests | Result |
+|---|---|---|
+| `restart_deployment` orders | 1 PATCH `/apis/apps/v1/.../deployments/orders` | `APPLIED`; the live restart annotation equals the one sent; the returned object's identity is Deployment/orders/testbed |
+| `scale_deployment` orders → 3 | 1 PATCH on the Deployment itself, no scale subresource | `APPLIED`; replicas 3 |
+| `patch_configmap` db-pool-config `max_pool_size=20` | PATCH `/api/v1/.../configmaps/db-pool-config`, then PATCH `/apis/apps/v1/.../deployments/orders` | `APPLIED`; steps `[patch_configmap applied, restart_deployment applied]`; 2 `before_write`, 2 `after_write`, 1 `final`, one run id and file |
+| `patch_service` orders-svc | 2 PATCH `/api/v1/.../services/orders-svc` | before `{app: orders}`; requested `{app: orders, safeops-probe: one}`, then `{safeops-probe: two}`; after exactly `{safeops-probe: two}`, no stale key |
+| `patch_deployment_resources` orders | a `container_check` read, then 1 PATCH | `APPLIED`; same containers, no new one; every non-resources field preserved |
+| `rollback_deployment` orders (after a restart) | 2 `rollback_history` reads, then the rollback PATCH (restart PATCH first) | `APPLIED`: the B1 canonical template comparison held against real server defaulting; the restart annotation is gone |
+
+The server returned these quantity forms: requests `{"cpu": "150m", "memory": "1Gi"}`, limits `{"cpu": "1500m", "memory": "2Gi"}`. Every form in the testbed parses.
+
+**Real 422** (request memory 2048 MiB > limit 1024 MiB, each value individually hard-valid):
+- `ExecutionStatus.REJECTED_INVALID_ACTION`, `WriteClass.INVALID_ACTION`;
+- one PATCH, no mutation: generation and template unchanged;
+- the response: HTTP 422, 530 bytes, `body_truncated=False`, a strict `Status` with `reason: Invalid`, code 422;
+- the diagnostic: "HTTP 422: Deployment.apps "orders" is invalid: spec.template.spec.containers[0].resources.requests: Invalid value: "2Gi": must be less than or equal to memory limit of 1Gi".
+
+**Reconciliation.**
+- One real PATCH, with the successful reply hidden as `AMBIGUOUS`.
+- The unchanged reader confirmed it: the `reconciliation` read has outcome `confirmed` and identity `[Deployment, orders, testbed]`.
+- `APPLIED`, exactly one PATCH, no retry.
+- Audit: `before_write`, `after_write`, `read(reconciliation)`, `final`.
+
+**An `after_write` failure** kept the real write: `APPLIED`, one PATCH, replicas 3, audit `[before_write, final]`.
+
+**Returned identity.** The direct responses carry `kind`, `metadata.name` and `metadata.namespace` for Deployment, Service and ConfigMap. Reader objects and ReplicaSet list items carry their identity too.
+
+**Audit.**
+- Each run's audit file gets events in order with one run id per file, and every returned result ends in exactly one `final`. An envelope refusal is `[final]`, and a container-check refusal adds `[read, final]`.
+- No audit file holds a token, `Bearer`, `Authorization`, a CA or kubeconfig content, or a response body. The check covered a refusal, a real write and a real 422.
+- The patch body is audited; diagnostics are bounded.
+
+**Patch-only conclusion.** All six operations succeed with safeops-executor holding only `patch` on exact resourceNames:
+- every executor write is a direct HTTPS PATCH;
+- every executor read goes through safeops-reader;
+- zero executor GET and zero kubectl patch;
+- update and delete are denied;
+- RBAC is not widened.
+
+The patch-only security ceiling is sufficient. Milestone 8B-2 is complete. Milestone 8 is not closed by this amendment: the separate closure review remains, with the topology-consumer audit and an independent acceptance review.
