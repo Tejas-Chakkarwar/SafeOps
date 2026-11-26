@@ -482,6 +482,9 @@ def test_the_executor_is_walked_and_reaches_nothing_forbidden() -> None:
         "safeops.executor.transport",
         "safeops.executor.quantity",
         "safeops.executor.unwired",
+        "safeops.executor.audit",  # M8B-2: the audit trail, and HarnessMisuse
+        "safeops.executor.kubernetes",  # M8B-2: the concrete transports
+        "safeops.cluster",  # the guarded client they run (protected, neutral)
         "safeops.actions",
         "safeops.policy",
         "safeops.topology",

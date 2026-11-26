@@ -43,7 +43,7 @@ from safeops.gate.protocol import Gate, GateDecision
 from safeops.gate.shadow import ShadowGateScorer, random_draw
 from safeops.stubs import NotImplementedStage, stub_milestone
 from tests.conftest import FakeEnvironment, FakeInjector, FakeWorkload
-from tests.m8_executor_fakes import Rig
+from tests.m8_executor_fakes import RecordingAudit, Rig
 from tests.m8_fixtures import CONDITION, deployment, ok, step
 from tests.test_m5_records import RECOVERED, SHA, UNIT, AgentProvenance, Fixed, Rec
 
@@ -69,13 +69,15 @@ def _text(action=ACTION, claims=()) -> str:
 
 
 def unwired_executor(condition=CONDITION) -> ActionExecutor:
-    """The executor exactly as build_runner wires it before Milestone 8B-2."""
+    """The executor as build_runner wired it before Milestone 8B-2: loud placeholder
+    transports, now with an unbound in-memory audit sink the runner binds before apply."""
     return ActionExecutor(
         semantics=POLICY.action_semantics,
         topology=condition.topology,
         namespace="testbed",
         reader=UnwiredReader(),
         writer=UnwiredWriter(),
+        audit=RecordingAudit(run_id=None),
     )
 
 
@@ -539,7 +541,7 @@ def test_m8b1_implements_the_executor_and_m8b2_and_m9_stubs_remain() -> None:
     assert stub_milestone(ExperimentRunner._executed_action) is None
     assert stub_milestone(ActionExecutor.apply) is None
     for transport in (UnwiredWriter.preflight, UnwiredWriter.write):
-        assert stub_milestone(transport) == 8  # the concrete writer is Milestone 8B-2
+        assert stub_milestone(transport) == 8  # loud placeholders, no longer wired (M8B-2)
     for transport in (UnwiredReader.get, UnwiredReader.list):
         assert stub_milestone(transport) == 8
     assert stub_milestone(ExperimentRunner._should_execute) is None
@@ -922,7 +924,13 @@ def test_build_runner_gives_the_executor_the_shared_conditions() -> None:
     )
     assert ex.topology is r._topology is r.records.read_path.condition.topology
     assert ex.namespace == load_cluster_config().namespace
-    assert isinstance(ex.reader, UnwiredReader) and isinstance(ex.writer, UnwiredWriter)
+    from safeops.executor.audit import JsonlExecutorAudit
+    from safeops.executor.kubernetes import KubernetesReaderTransport, KubernetesWriterTransport
+
+    # M8B-2: the concrete transports, one audit sink shared by the writer and the executor.
+    assert isinstance(ex.reader, KubernetesReaderTransport)
+    assert isinstance(ex.writer, KubernetesWriterTransport)
+    assert isinstance(ex.audit, JsonlExecutorAudit) and ex.writer.audit is ex.audit
 
 
 @pytest.mark.parametrize(

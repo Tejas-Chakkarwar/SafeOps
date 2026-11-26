@@ -34,7 +34,7 @@ _ZERO_SHA = re.compile(r"0+")
 
 # Anchored at the repository root: `reference/` is the root tree only, so
 # docs/decisions/reference-review.md is untouched by it.
-_FORBIDDEN_ROOT_DIRS = ("data/runs/", ".safeops/", "reference/")
+_FORBIDDEN_ROOT_DIRS = ("data/runs/", "data/executor_audit/", ".safeops/", "reference/")
 
 Git = Callable[[list[str]], str]
 

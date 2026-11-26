@@ -35,7 +35,6 @@ from safeops.environment.workload import (
 )
 from safeops.executor.executor import ActionExecutor
 from safeops.executor.result import ExecutionResult
-from safeops.executor.unwired import UnwiredReader, UnwiredWriter
 from safeops.experiment.consistency import ReadPathCheck
 from safeops.experiment.records import RECORD_FIELDS, Discard, ProvenanceSource, RunRecordWriter
 from safeops.experiment.unit import RunUnit
@@ -273,6 +272,9 @@ class ExperimentRunner:
                 if self._should_execute(decision):
                     stage = RunStage.EXECUTE
                     data["action_attempted"] = True  # before the call: it may raise mid-way
+                    if isinstance(self.executor, ActionExecutor):
+                        # The shared audit sink belongs to this run from here on (D§11.8).
+                        self.executor.bind_run(run_id)
                     execution = data["execution"] = self.executor.apply(action)
                     stage = RunStage.EXECUTED_ACTION
                     executed_action = self._executed_action(action, execution)
@@ -618,15 +620,22 @@ def build_runner() -> ExperimentRunner:
     # topology_hash and the write-time check all come from these bytes (M8A-2 topology fix).
     condition = load_topology_condition()
     # The executor shares both: the same loaded action semantics and the same bound topology,
-    # with the configured namespace (a file read, no Kubernetes call). Its transports are
-    # unwired until Milestone 8B-2: no write or read is possible, and reaching one is a loud
-    # Milestone 8 stub (decision 0025, M8B-1 amendment).
+    # with the configured namespace (a file read, no Kubernetes call). Its transports are the
+    # concrete safeops-executor writer and safeops-reader reader, and one audit sink is shared
+    # by the writer and the executor (decision 0025, M8B-2 amendment). None of them resolves
+    # a credential, builds a client or touches the filesystem until an action is applied.
+    from safeops.executor.audit import JsonlExecutorAudit
+    from safeops.executor.kubernetes import KubernetesReaderTransport, KubernetesWriterTransport
+
+    cluster = load_cluster_config()
+    audit = JsonlExecutorAudit()
     executor = ActionExecutor(
         semantics=policy.action_semantics,
         topology=condition.topology,
-        namespace=load_cluster_config().namespace,
-        reader=UnwiredReader(),
-        writer=UnwiredWriter(),
+        namespace=cluster.namespace,
+        reader=KubernetesReaderTransport(cluster),
+        writer=KubernetesWriterTransport(cluster, audit),
+        audit=audit,
     )
     return ExperimentRunner(
         environment=EnvironmentManager(),

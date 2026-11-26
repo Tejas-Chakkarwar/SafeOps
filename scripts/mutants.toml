@@ -3658,9 +3658,9 @@ kills = [
     "tests/test_m8_executor.py::test_a_harness_bug_at_the_first_write_stays_loud[guard]",
 ]
 old = '''
-HARNESS_BUGS = (NotImplementedStage, GuardError)'''
+HARNESS_BUGS = (NotImplementedStage, GuardError, HarnessMisuse)'''
 new = '''
-HARNESS_BUGS = (NotImplementedStage,)'''
+HARNESS_BUGS = (NotImplementedStage, HarnessMisuse)'''
 
 [[mutant]]
 id = "M8B1-H13"
@@ -3758,3 +3758,553 @@ new = '''
             raise
         except Exception as exc:
             return ReadReply(ReadOutcome.UNAVAILABLE'''
+
+[[mutant]]
+id = "M8B2-C1"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/cluster.py"
+guard = "the executor phase uses only its own credential: never another identity's"
+kills = [
+    "tests/test_m8b2_client.py::test_the_executor_credential_is_its_own_and_nothing_falls_back",
+]
+old = '''
+
+    if phase is Phase.EXECUTOR:
+        return executor_credential(cfg)'''
+new = '''
+
+    if phase is Phase.EXECUTOR:
+        return harness_credential(cfg)'''
+
+[[mutant]]
+id = "M8B2-C2"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/cluster.py"
+guard = "the executor phase has its own check_object branch: it never falls through to bootstrap's namespaces"
+kills = [
+    "tests/test_m8b2_client.py::test_the_executor_phase_never_falls_through_to_the_bootstrap_scope",
+]
+old = '''
+    if phase is Phase.EXECUTOR:
+        if namespace is None:
+            raise GuardError(f"the executor may not mutate cluster-scoped {kind}/{name}")
+        if kind not in EXECUTOR_RESOURCES:
+            raise GuardError(
+                f"the executor may patch only {', '.join(EXECUTOR_RESOURCES)}, not {kind}/{name}"
+            )
+        if namespace != cfg.namespace:
+            raise GuardError(
+                f"executor may not mutate {kind}/{name} in namespace {namespace!r}"
+                f" (allowed: {cfg.namespace})"
+            )
+        return
+    if phase not in (Phase.RUNTIME, Phase.BOOTSTRAP):
+        raise GuardError(f"unknown phase {phase!r}")
+'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8B2-C3"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/cluster.py"
+guard = "the executor client refuses every read verb"
+kills = [
+    "tests/test_m8b2_client.py::test_the_executor_client_refuses_everything_but_patch[get]",
+]
+old = '''
+        """Run a read-only kubectl command. Caller arguments can't override the identity."""
+        self._refuse_executor("a read")'''
+new = '''
+        """Run a read-only kubectl command. Caller arguments can't override the identity."""'''
+
+[[mutant]]
+id = "M8B2-C4"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/cluster.py"
+guard = "Kubectl.patch checks its object with check_object before any process runs"
+kills = [
+    "tests/test_m8b2_client.py::test_the_patch_guard_refuses_before_any_process[Deployment-orders-safeops-system-merge-{}]",
+]
+old = '''
+
+        check_object(self.cfg, self.phase, kind=kind, name=name, namespace=namespace)
+        self._verify_identity()'''
+new = '''
+
+        self._verify_identity()'''
+
+[[mutant]]
+id = "M8B2-C5"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "the writer's preflight refuses an out-of-scope request (loud, before the first write)"
+kills = [
+    "tests/test_m8b2_client.py::test_preflight_refuses_what_the_executor_must_never_send[requests3]",
+]
+old = '''
+    check_object(
+        cfg, Phase.EXECUTOR, kind=request.kind, name=request.name, namespace=request.namespace
+    )
+'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8B2-C6"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "the writer sends only a request it preflighted"
+kills = [
+    "tests/test_m8b2_client.py::test_a_request_that_was_not_preflighted_is_never_sent",
+]
+old = '''
+        if request not in self._preflighted:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M8B2-C7"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/cluster.py"
+guard = "an explicitly passed reader kubeconfig is refused for the executor phase"
+kills = [
+    "tests/test_m8b2_client.py::test_the_three_credential_failures_are_distinct",
+]
+old = '''
+            if phase is Phase.EXECUTOR:
+                refused[cfg.reader_kubeconfig_path.resolve()]'''
+new = '''
+            if False:
+                refused[cfg.reader_kubeconfig_path.resolve()]'''
+
+[[mutant]]
+id = "M8B2-L1"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "the writer builds no client and resolves no credential when constructed"
+kills = [
+    "tests/test_m8b2_client.py::test_constructing_the_transports_resolves_no_credential_and_runs_nothing",
+    "tests/test_m8b2_audit.py::test_build_runner_is_free_of_credentials_clients_and_files",
+]
+old = '''
+        self._kubectl: Kubectl | None = None
+        self._preflighted'''
+new = '''
+        self._kubectl: Kubectl | None = Kubectl(cfg, Phase.EXECUTOR, runner=runner)
+        self._preflighted'''
+
+[[mutant]]
+id = "M8B2-L2"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "only a missing or expired credential is not-attempted; an unreadable one stays loud"
+kills = [
+    "tests/test_m8b2_client.py::test_unreadable_token_metadata_is_loud_in_preflight_not_unavailable",
+]
+old = '''
+            path = executor_credential(self.cfg, self._now)
+        except CredentialUnavailable:'''
+new = '''
+            path = executor_credential(self.cfg, self._now)
+        except CredentialError:'''
+
+[[mutant]]
+id = "M8B2-L3"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/cluster.py"
+guard = "a missing credential is CredentialUnavailable, distinct from an unusable one"
+kills = [
+    "tests/test_m8b2_client.py::test_a_missing_or_expired_credential_is_not_attempted[missing]",
+]
+old = '''
+        raise CredentialUnavailable(
+            f"{who} credential missing'''
+new = '''
+        raise CredentialError(
+            f"{who} credential missing'''
+
+[[mutant]]
+id = "M8B2-W1"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "a 422 from the PATCH is INVALID_ACTION"
+kills = [
+    "tests/test_m8b2_client.py::test_a_422_is_invalid_action_with_kubectl_s_own_text",
+    "tests/test_m8b2_audit.py::test_a_real_422_through_the_writer_is_rejected_and_unchanged",
+]
+old = '''
+    if status == 422:'''
+new = '''
+    if status == 4220:'''
+
+[[mutant]]
+id = "M8B2-W2"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "a 5xx from the PATCH is AMBIGUOUS (may have applied), never a definite failure"
+kills = [
+    "tests/test_m8b2_client.py::test_every_process_outcome_is_a_reply_with_an_after_entry[server-ambiguous]",
+]
+old = '''
+    if 400 <= status < 500:'''
+new = '''
+    if 400 <= status < 600:'''
+
+[[mutant]]
+id = "M8B2-W3"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "a credential that expired after preflight is NOT_ATTEMPTED, never ambiguous"
+kills = [
+    "tests/test_m8b2_client.py::test_a_credential_that_expires_after_preflight_is_not_attempted",
+]
+old = '''
+            return self._after(request, WriteReply(WriteClass.NOT_ATTEMPTED, diagnostic=str(exc)))'''
+new = '''
+            return self._after(request, WriteReply(WriteClass.AMBIGUOUS, diagnostic=str(exc)))'''
+
+[[mutant]]
+id = "M8B2-A1"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "the before_write entry is made durable before the patch process runs"
+kills = [
+    "tests/test_m8b2_client.py::test_the_before_write_entry_is_durable_before_the_patch_runs",
+]
+old = '''
+        try:
+            self.audit.before_write(request, self.identity)  # an unbound sink raises: loud
+        except AuditPersistenceError as exc:
+            return self._after(
+                request,
+                WriteReply(
+                    WriteClass.NOT_ATTEMPTED,
+                    diagnostic=f"the audit before-entry could not be made durable: {exc}",
+                ),
+            )
+        try:
+            executor_credential(self.cfg, self._now)
+        except CredentialUnavailable as exc:
+            return self._after(request, WriteReply(WriteClass.NOT_ATTEMPTED, diagnostic=str(exc)))
+        if self._kubectl is None:
+            return self._after(
+                request,
+                WriteReply(
+                    WriteClass.NOT_ATTEMPTED,
+                    diagnostic="the executor credential was unavailable at preflight, so its"
+                    " identity was never verified; not sent",
+                ),
+            )
+        try:
+            process = self._kubectl.patch(
+                kind=request.kind,
+                name=request.name,
+                namespace=request.namespace,
+                patch_type=request.patch_type.value,
+                body_json=request.body_json,
+                timeout_s=WRITE_TIMEOUT_S,
+            )
+        except GuardError:
+            raise  # the client guard refused before running anything: a harness bug
+        except Exception as exc:  # the patch process may have run
+            reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"{type(exc).__name__}: {exc}")
+        else:
+            reply = classify_patch(process, request)
+'''
+new = '''
+        try:
+            executor_credential(self.cfg, self._now)
+        except CredentialUnavailable as exc:
+            return self._after(request, WriteReply(WriteClass.NOT_ATTEMPTED, diagnostic=str(exc)))
+        if self._kubectl is None:
+            return self._after(
+                request,
+                WriteReply(
+                    WriteClass.NOT_ATTEMPTED,
+                    diagnostic="the executor credential was unavailable at preflight, so its"
+                    " identity was never verified; not sent",
+                ),
+            )
+        try:
+            process = self._kubectl.patch(
+                kind=request.kind,
+                name=request.name,
+                namespace=request.namespace,
+                patch_type=request.patch_type.value,
+                body_json=request.body_json,
+                timeout_s=WRITE_TIMEOUT_S,
+            )
+        except GuardError:
+            raise  # the client guard refused before running anything: a harness bug
+        except Exception as exc:  # the patch process may have run
+            reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"{type(exc).__name__}: {exc}")
+        else:
+            self.audit.before_write(request, self.identity)
+            reply = classify_patch(process, request)
+'''
+
+[[mutant]]
+id = "M8B2-A2"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "a before_write that can't be made durable prevents the send (NOT_ATTEMPTED)"
+kills = [
+    "tests/test_m8b2_client.py::test_a_before_write_that_cannot_persist_is_not_attempted_and_nothing_is_sent",
+    "tests/test_m8b2_audit.py::test_a_before_write_failure_through_the_real_writer_is_an_unsent_infra_failure",
+]
+old = '''
+        except AuditPersistenceError as exc:
+            return self._after(
+                request,
+                WriteReply(
+                    WriteClass.NOT_ATTEMPTED,
+                    diagnostic=f"the audit before-entry could not be made durable: {exc}",
+                ),
+            )'''
+new = '''
+        except AuditPersistenceError:
+            pass'''
+
+[[mutant]]
+id = "M8B2-A3"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/audit.py"
+guard = "each newly created audit directory's entry is fsynced, up to the first existing ancestor"
+kills = [
+    "tests/test_m8b2_audit.py::test_new_directories_and_the_new_run_file_are_made_durable_in_order",
+]
+old = '''
+        for directory in missing:  # innermost first, ending at the first existing ancestor
+            fs.fsync_dir(directory.parent)'''
+new = '''
+        for directory in missing:  # innermost first, ending at the first existing ancestor
+            pass'''
+
+[[mutant]]
+id = "M8B2-A4"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/executor.py"
+guard = "HarnessMisuse is a HARNESS_BUGS member: before a possible send it propagates, never an ambiguous write"
+kills = [
+    "tests/test_m8b2_audit.py::test_harness_misuse_at_the_first_write_propagates",
+    "tests/test_m8b2_audit.py::test_harness_misuse_is_a_harness_bug",
+]
+old = '''
+
+HARNESS_BUGS = (NotImplementedStage, GuardError, HarnessMisuse)'''
+new = '''
+
+HARNESS_BUGS = (NotImplementedStage, GuardError)'''
+
+[[mutant]]
+id = "M8B2-A5"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/executor.py"
+guard = "the writer and the executor share one audit sink"
+kills = [
+    "tests/test_m8b2_audit.py::test_the_writer_and_the_executor_must_share_one_sink",
+]
+old = '''
+        if getattr(writer, "audit", audit) is not audit:'''
+new = '''
+        if False:'''
+
+[[mutant]]
+id = "M8B2-A6"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/audit.py"
+guard = "bind_run rebinds: no stale run id is kept"
+kills = [
+    "tests/test_m8b2_audit.py::test_rebinding_a_to_b_keeps_each_run_in_its_own_file",
+]
+old = '''
+        self._run_id = canonical_run_id(run_id)'''
+new = '''
+        self._run_id = self._run_id or canonical_run_id(run_id)'''
+
+[[mutant]]
+id = "M8B2-A7"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/audit.py"
+guard = "every append checks the binding before any path or filesystem call"
+kills = [
+    "tests/test_m8b2_audit.py::test_an_unbound_append_is_harness_misuse_before_any_filesystem_call[read]",
+    "tests/test_m8b2_audit.py::test_an_unbound_sink_over_an_unwritable_root_is_misuse_not_a_persistence_failure",
+]
+old = '''
+        run_id = self._bound_run_id()  # first: no path, no filesystem call before it
+        try:'''
+new = '''
+        self._durable_directory()
+        run_id = self._bound_run_id()
+        try:'''
+
+[[mutant]]
+id = "M8B2-A8"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/audit.py"
+guard = "the sink's bound-run guard exists: an unbound sink is HarnessMisuse"
+kills = [
+    "tests/test_m8b2_audit.py::test_an_unbound_append_is_harness_misuse_before_any_filesystem_call[before_write]",
+    "tests/test_m8b2_client.py::test_an_unbound_sink_is_harness_misuse_and_nothing_is_sent",
+    "tests/test_m8b2_audit.py::test_bind_run_takes_a_canonical_uuid_only_and_touches_nothing[not-a-uuid]",
+]
+old = '''
+        if run_id is None:
+            raise HarnessMisuse('''
+new = '''
+        if False:
+            raise HarnessMisuse('''
+
+[[mutant]]
+id = "M8B2-A9"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/audit.py"
+guard = "a late audit failure (after_write, final, a reconciliation read) never erases existing write or result evidence"
+kills = [
+    "tests/test_m8b2_client.py::test_after_a_sent_patch_the_reply_survives_any_after_write_failure[misuse]",
+    "tests/test_m8b2_audit.py::test_an_after_write_failure_after_a_sent_patch_is_still_applied[misuse]",
+    "tests/test_m8b2_audit.py::test_a_failed_final_never_changes_or_suppresses_the_result[misuse]",
+]
+old = '''
+    try:
+        append()
+    except Exception:
+        return'''
+new = '''
+    try:
+        append()
+    except ZeroDivisionError:
+        return'''
+
+[[mutant]]
+id = "M8B2-A10"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/executor.py"
+guard = "every returned ExecutionResult gets exactly one final audit attempt"
+kills = [
+    "tests/test_m8b2_audit.py::test_f1_a_common_envelope_refusal_gets_exactly_one_final",
+    "tests/test_m8b2_audit.py::test_f2_a_failed_pre_write_read_ends_its_audit_with_one_final",
+    "tests/test_m8b2_audit.py::test_f3_a_normal_result_gets_exactly_one_final",
+]
+old = '''
+        keep_evidence(lambda: self.audit.final(result))
+        return result'''
+new = '''
+        return result'''
+
+[[mutant]]
+id = "M8B2-A11"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/executor.py"
+guard = "apply() checks the run binding before any envelope check, read or write"
+kills = [
+    "tests/test_m8b2_audit.py::test_an_unbound_executor_raises_before_any_read_preflight_write_or_final[act0]",
+    "tests/test_m8b2_audit.py::test_an_unbound_common_envelope_refusal_is_loud_too",
+]
+old = '''
+        self.audit.require_bound()  # before any envelope check, read or write
+'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8B2-A12"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/executor.py"
+guard = "a pre-write read entry that can't persist never stops the remediation"
+kills = [
+    "tests/test_m8b2_audit.py::test_a_pre_write_read_entry_failure_never_stops_the_remediation",
+]
+old = '''
+        try:
+            append()
+        except AuditPersistenceError:
+            return'''
+new = '''
+        append()'''
+
+[[mutant]]
+id = "M8B2-D1"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/executor.py"
+guard = "status-equivalent: the recorded execution.error names a HarnessMisuse as itself, not as an adapter contract violation"
+kills = [
+    "tests/test_m8b2_audit.py::test_harness_misuse_at_step_two_is_skipped_with_its_real_cause",
+]
+old = '''
+    if isinstance(exc, HarnessMisuse):'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "M8B2-R1"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "the executor's reads run with the safeops-reader identity"
+kills = [
+    "tests/test_m8b2_client.py::test_the_reader_transport_uses_the_reader_phase",
+    "tests/test_m8b2_client.py::test_a_get_is_one_reader_process_found_or_absent",
+]
+old = '''
+            self._kubectl = Kubectl(self.cfg, Phase.READER, runner=self._runner)'''
+new = '''
+            self._kubectl = Kubectl(self.cfg, Phase.EXECUTOR, runner=self._runner)'''
+
+[[mutant]]
+id = "M8B2-R2"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/kubernetes.py"
+guard = "an incomplete ReplicaSet list is UNAVAILABLE, never FOUND"
+kills = [
+    "tests/test_m8b2_client.py::test_an_incomplete_list_is_unavailable[metadata0]",
+    "tests/test_m8b2_client.py::test_an_incomplete_list_is_unavailable[metadata1]",
+]
+old = '''
+        if type(meta) is not dict or meta.get("continue") or meta.get("remainingItemCount"):'''
+new = '''
+        if type(meta) is not dict:'''
+
+[[mutant]]
+id = "M8B2-B1"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/executor/audit.py"
+guard = "a run id must be a canonical UUID before any path is built from it"
+kills = [
+    "tests/test_m8b2_audit.py::test_bind_run_takes_a_canonical_uuid_only_and_touches_nothing[00000000-0000-4000-8000-00000000000A]",
+    "tests/test_m8b2_audit.py::test_bind_run_takes_a_canonical_uuid_only_and_touches_nothing[{00000000-0000-4000-8000-00000000000a}]",
+]
+old = '''
+    if canonical != run_id:'''
+new = '''
+    if False:'''
+
+[[mutant]]
+id = "M8B2-K1"
+source = "0025 M8B-2 executor boundary"
+target = "safeops/bootstrap.py"
+guard = "a can-i call that gave no explicit answer is a verification failure, never a denial"
+kills = [
+    "tests/test_m8b2_rbac.py::test_can_i_reads_only_an_explicit_yes_or_no",
+]
+old = '''
+    if proc.returncode == 1 and out == "no":
+        return False'''
+new = '''
+    if True:
+        return False'''
+
+[[mutant]]
+id = "M8B2-P1"
+source = "0025 M8B-2 executor boundary"
+target = "scripts/check_repo_policy.py"
+guard = "a tracked executor audit file fails the repository policy"
+kills = [
+    "tests/test_m8b2_rbac.py::test_a_tracked_audit_file_fails_the_policy[data/executor_audit/nested/x.jsonl]",
+    "tests/test_m8b2_rbac.py::test_a_force_added_audit_file_fails_the_tracked_tree_check",
+]
+old = '''
+_FORBIDDEN_ROOT_DIRS = ("data/runs/", "data/executor_audit/", ".safeops/", "reference/")'''
+new = '''
+_FORBIDDEN_ROOT_DIRS = ("data/runs/", ".safeops/", "reference/")'''

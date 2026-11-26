@@ -4,7 +4,9 @@ A FakeCluster holds JSON objects and applies the three patch types the executor 
 (merge, JSON-patch replace, strategic merge of containers by name) the way the API server
 would, so a test can see what a request really does: a stale selector key surviving, a
 container added by name. FakeWriter answers each write from a script of semantic outcomes;
-FakeReader reads the cluster, failing as scripted. Nothing here touches Kubernetes.
+FakeReader reads the cluster, failing as scripted. RecordingAudit is an in-memory audit sink
+with the production sink's binding rule and scripted failures (M8B-2). Nothing here touches
+Kubernetes or the filesystem.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from safeops.cluster import GuardError
 from safeops.domain import ActionTarget, RecommendedAction
 from safeops.enums import ActionType
+from safeops.executor.audit import HarnessMisuse, canonical_run_id
 from safeops.executor.executor import ActionExecutor
 from safeops.executor.transport import PatchType, ReadOutcome, ReadReply, WriteClass, WriteReply
 from safeops.policy import load_action_semantics
@@ -23,6 +26,8 @@ from tests.m8_fixtures import TOPOLOGY
 
 SEMANTICS = load_action_semantics()
 NS = "testbed"
+RUN_A = "00000000-0000-4000-8000-00000000000a"
+RUN_B = "00000000-0000-4000-8000-00000000000b"
 ORDERS_UID = "uid-orders-1"
 
 
@@ -278,6 +283,55 @@ class FakeReader:
         return reply
 
 
+class RecordingAudit:
+    """An in-memory ExecutorAudit. Bound to RUN_A unless `run_id=None`. `fail` maps an event
+    name (before_write, after_write, read, final) to an exception raised on that event, after
+    the attempt is recorded; a list gives one entry per attempt (None = succeed).
+
+    attempts: every (event, fields) append attempted, in order.
+    events:   the (event, fields) appends that succeeded (what a file would hold)."""
+
+    def __init__(self, run_id: str | None = RUN_A, fail: dict | None = None) -> None:
+        self._run_id = None if run_id is None else canonical_run_id(run_id)
+        self.fail = dict(fail or {})
+        self.attempts: list[tuple[str, dict]] = []
+        self.events: list[tuple[str, str, dict]] = []  # (run_id, event, fields)
+
+    def bind_run(self, run_id: str) -> None:
+        self._run_id = canonical_run_id(run_id)
+
+    def require_bound(self) -> None:
+        if self._run_id is None:
+            raise HarnessMisuse("the recording audit sink is unbound")
+
+    def _append(self, event: str, fields: dict) -> None:
+        self.require_bound()
+        self.attempts.append((event, fields))
+        how = self.fail.get(event)
+        if isinstance(how, list):
+            how = how.pop(0) if how else None
+        if how is not None:
+            raise how
+        self.events.append((self._run_id, event, fields))
+
+    def before_write(self, request, identity: str) -> None:
+        self._append("before_write", {"name": request.name, "identity": identity})
+
+    def after_write(self, request, reply) -> None:
+        self._append("after_write", {"name": request.name, "class": reply.semantic_class})
+
+    def read(self, **fields) -> None:
+        self._append("read", fields)
+
+    def final(self, result) -> None:
+        self._append("final", {"result": result})
+
+    def kinds(self, *, attempted: bool = False) -> list[str]:
+        if attempted:
+            return [e for e, _ in self.attempts]
+        return [e for _, e, _ in self.events]
+
+
 class Clock:
     """A scripted clock: each call returns the next instant (the last one repeats)."""
 
@@ -307,18 +361,21 @@ class Rig:
         clock=None,
         preflight_raises=None,
         namespace=NS,
+        audit=None,
     ) -> None:
         self.cluster = cluster or FakeCluster(seed_objects(namespace))
         self.clock = clock or Clock(T0, T0 + timedelta(seconds=1), T0 + timedelta(seconds=2))
         self.writer = FakeWriter(self.cluster, script, preflight_raises, self.clock)
         self.reader = FakeReader(self.cluster, unavailable)
         self.sleeps: list[float] = []
+        self.audit = audit if audit is not None else RecordingAudit()
         self.executor = ActionExecutor(
             semantics=SEMANTICS,
             topology=topology,
             namespace=namespace,
             reader=self.reader,
             writer=self.writer,
+            audit=self.audit,
             clock=self.clock,
             sleep=self.sleeps.append,
         )

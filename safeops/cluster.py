@@ -8,10 +8,18 @@ kubectl (decisions 0002, 0006, 0009).
   that kind wrote, and only safeops.bootstrap may ask for it
   (tests/test_cluster_guard.py enforces that). Reader is SafeOps' read-only identity,
   safeops-reader (design §4, Milestone 6): its own token, never the harness or admin
-  credential, no mutation at all, and raw calls only to Prometheus' query API.
+  credential, no mutation at all, and raw calls only to Prometheus' query API. It serves
+  the agent's tools and the executor's pre-write reads and reconciliation (decision 0025
+  D§11.7).
+- Executor is SafeOps' write identity, safeops-executor (design §4, Milestone 8; decision
+  0025 D§14): its own token, never another identity's credential, and exactly one capability,
+  `Kubectl.patch` on a Deployment, Service or ConfigMap in the testbed namespace. It makes no
+  read of its own (no get, list, watch, api-resources, auth or raw call), and no other
+  mutation (no apply, create, replace, delete, token or subresource).
 - Kubernetes-object mutations go through `check_object`. Runtime allows the testbed
-  namespace only; bootstrap allows its namespaces plus an exactly recorded set of
-  cluster-scoped objects (config/bootstrap_scope.yaml).
+  namespace only; executor the testbed namespace and its three kinds only; bootstrap allows
+  its namespaces plus an exactly recorded set of cluster-scoped objects
+  (config/bootstrap_scope.yaml).
 - The workload-generator proxy is not an object mutation. It has its own capability
   check: one namespace, one Service, operations {stats, control}.
 
@@ -115,6 +123,13 @@ class CredentialError(Exception):
     """The credential for a phase is missing, invalid, or expired."""
 
 
+class CredentialUnavailable(CredentialError):
+    """The configured credential file is absent, or its token has expired: detected locally,
+    before any command runs. Distinct from a credential that exists but can't be used (a
+    corrupt kubeconfig or unreadable token metadata) and from another identity's credential,
+    which stay plain CredentialErrors."""
+
+
 class CommandError(Exception):
     """A kubectl, helm or kind command failed."""
 
@@ -122,7 +137,18 @@ class CommandError(Exception):
 class Phase(Enum):
     RUNTIME = "runtime"
     BOOTSTRAP = "bootstrap"
-    READER = "reader"  # safeops-reader: the agent's tools (Milestone 6); never mutates
+    READER = "reader"  # safeops-reader: tools (M6) and executor reads (M8); never mutates
+    EXECUTOR = "executor"  # safeops-executor (M8): patch only, three kinds, testbed only
+
+
+# The only kinds the executor phase may patch (decision 0025 D§11.1 E1, D§14), and the
+# kubectl resource for each: fully qualified, so no discovery shortcut can pick another group.
+EXECUTOR_RESOURCES = {
+    "Deployment": "deployments.apps",
+    "Service": "services",
+    "ConfigMap": "configmaps",
+}
+EXECUTOR_PATCH_TYPES = frozenset({"json", "merge", "strategic"})
 
 
 @dataclass(frozen=True)
@@ -135,6 +161,8 @@ class ClusterConfig:
     harness_token_meta_path: Path
     reader_kubeconfig_path: Path
     reader_token_meta_path: Path
+    executor_kubeconfig_path: Path
+    executor_token_meta_path: Path
     harness_session_s: int
     namespace: str
     system_namespace: str
@@ -174,6 +202,8 @@ _PATH_KEYS = (
     "harness_token_meta_path",
     "reader_kubeconfig_path",
     "reader_token_meta_path",
+    "executor_kubeconfig_path",
+    "executor_token_meta_path",
 )
 _INT_KEYS = ("harness_session_s", "workload_service_port", "prometheus_service_port")
 
@@ -216,10 +246,26 @@ def check_object(
 ) -> None:
     """Refuse a Kubernetes-object mutation outside the phase's scope (decision 0006).
 
-    namespace=None means a cluster-scoped object.
+    namespace=None means a cluster-scoped object. Every phase has its own explicit branch:
+    none falls through to bootstrap's wider scope.
     """
     if phase is Phase.READER:
         raise GuardError(f"the reader identity never mutates ({kind}/{name})")
+    if phase is Phase.EXECUTOR:
+        if namespace is None:
+            raise GuardError(f"the executor may not mutate cluster-scoped {kind}/{name}")
+        if kind not in EXECUTOR_RESOURCES:
+            raise GuardError(
+                f"the executor may patch only {', '.join(EXECUTOR_RESOURCES)}, not {kind}/{name}"
+            )
+        if namespace != cfg.namespace:
+            raise GuardError(
+                f"executor may not mutate {kind}/{name} in namespace {namespace!r}"
+                f" (allowed: {cfg.namespace})"
+            )
+        return
+    if phase not in (Phase.RUNTIME, Phase.BOOTSTRAP):
+        raise GuardError(f"unknown phase {phase!r}")
     if namespace is None:
         if phase is Phase.RUNTIME:
             raise GuardError(f"runtime may not mutate cluster-scoped {kind}/{name}")
@@ -250,7 +296,7 @@ def decode_token_times(token: str) -> tuple[int, int]:
 
 def _token_credential(path: Path, meta: Path, who: str, now: Callable[[], float]) -> Path:
     if not path.is_file() or not meta.is_file():
-        raise CredentialError(
+        raise CredentialUnavailable(
             f"{who} credential missing ({path.name}); run `make cluster-up`."
             " Runtime never falls back to the admin kubeconfig."
         )
@@ -259,7 +305,7 @@ def _token_credential(path: Path, meta: Path, who: str, now: Callable[[], float]
     except Exception as exc:
         raise CredentialError(f"{who} token metadata is unreadable; run `make cluster-up`") from exc
     if now() >= expires_at:
-        raise CredentialError(
+        raise CredentialUnavailable(
             f"{who} token has expired; recreate the cluster or re-issue the token"
             " (refresh is deferred to before Milestone 14, decision 0009)."
             " Runtime never falls back to the admin kubeconfig."
@@ -280,11 +326,25 @@ def reader_credential(cfg: ClusterConfig, now: Callable[[], float] = time.time) 
     return _token_credential(cfg.reader_kubeconfig_path, cfg.reader_token_meta_path, "reader", now)
 
 
+def executor_credential(cfg: ClusterConfig, now: Callable[[], float] = time.time) -> Path:
+    """Path of safeops-executor's credential (Milestone 8), if present and unexpired. Never the
+    harness, reader or admin credential. Missing or expired is CredentialUnavailable."""
+    return _token_credential(
+        cfg.executor_kubeconfig_path, cfg.executor_token_meta_path, "executor", now
+    )
+
+
 def kubeconfig_for(cfg: ClusterConfig, phase: Phase) -> Path:
+    """The one credential each phase uses. An explicit branch per phase: no phase falls
+    through to another identity's credential, and only bootstrap reaches the admin one."""
     if phase is Phase.RUNTIME:
         return harness_credential(cfg)
     if phase is Phase.READER:
         return reader_credential(cfg)
+    if phase is Phase.EXECUTOR:
+        return executor_credential(cfg)
+    if phase is not Phase.BOOTSTRAP:
+        raise GuardError(f"no credential is defined for phase {phase!r}")
     if not cfg.kubeconfig_path.is_file():
         raise CredentialError(f"admin kubeconfig missing ({cfg.kubeconfig_path.name})")
     return cfg.kubeconfig_path
@@ -309,6 +369,19 @@ def decode_raw(data: bytes | str | None) -> str:
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
+@dataclass(frozen=True)
+class ProcessResult:
+    """What one guarded kubectl process did, uninterpreted (the executor's adapter reads it).
+    Exactly one of: it never started (spawn_error), it timed out (timed_out), or it exited
+    (returncode). Output is decoded text; it never holds a credential (kubectl prints none)."""
+
+    returncode: int | None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    spawn_error: str | None = None
+
+
 class Kubectl:
     """kubectl with an explicit kubeconfig and context on every call."""
 
@@ -323,12 +396,17 @@ class Kubectl:
         self.cfg = cfg
         self.phase = phase
         self._run = runner
-        if kubeconfig is not None and phase in (Phase.RUNTIME, Phase.READER):
-            # Runtime never uses the admin credential, however it is passed in (review C1),
-            # and the reader never uses anyone's credential but its own (Milestone 6).
+        if kubeconfig is not None and phase in (Phase.RUNTIME, Phase.READER, Phase.EXECUTOR):
+            # Runtime never uses the admin credential, however it is passed in (review C1);
+            # the reader (Milestone 6) and the executor (Milestone 8) never use anyone's
+            # credential but their own.
             refused = {cfg.kubeconfig_path.resolve(): "the admin kubeconfig"}
-            if phase is Phase.READER:
+            if phase in (Phase.READER, Phase.EXECUTOR):
                 refused[cfg.harness_kubeconfig_path.resolve()] = "the harness kubeconfig"
+            if phase is Phase.READER:
+                refused[cfg.executor_kubeconfig_path.resolve()] = "the executor kubeconfig"
+            if phase is Phase.EXECUTOR:
+                refused[cfg.reader_kubeconfig_path.resolve()] = "the reader kubeconfig"
             if kubeconfig.resolve() in refused:
                 raise CredentialError(
                     f"{phase.value} was handed {refused[kubeconfig.resolve()]}; it never falls"
@@ -340,6 +418,10 @@ class Kubectl:
 
     def base_args(self) -> list[str]:
         return ["kubectl", "--kubeconfig", str(self.kubeconfig), "--context", self.cfg.kube_context]
+
+    def verify_identity(self) -> None:
+        """Check the context's API server now, before any command (see _verify_identity)."""
+        self._verify_identity()
 
     def _verify_identity(self) -> None:
         """The context must really be the SafeOps kind cluster (review C3).
@@ -414,8 +496,15 @@ class Kubectl:
             raise CommandError(f"kubectl {args[0]} failed: {detail}")
         return stdout
 
+    def _refuse_executor(self, what: str) -> None:
+        """The executor phase has one capability, `patch`; everything else is refused here,
+        before any command runs."""
+        if self.phase is Phase.EXECUTOR:
+            raise GuardError(f"the executor identity may only patch; {what} is refused")
+
     def read(self, *args: str, timeout: float = 120) -> str:
         """Run a read-only kubectl command. Caller arguments can't override the identity."""
+        self._refuse_executor("a read")
         self._check_read(args)
         return self._exec(list(args), timeout=timeout)
 
@@ -423,6 +512,7 @@ class Kubectl:
         r"""read(), behind the same guard, identity check, timeout and errors, with the output
         taken as bytes and decoded explicitly (see _exec). For `kubectl logs`, whose output
         is application data: every character except kubectl's own "\n" must arrive as is."""
+        self._refuse_executor("a read")
         self._check_read(args)
         return self._exec(list(args), timeout=timeout, raw=True)
 
@@ -443,6 +533,7 @@ class Kubectl:
     def cluster_scoped_kinds(self) -> frozenset[str]:
         """Built-in cluster-scoped kinds plus every kind the live API server reports as
         cluster-scoped. Asked once per Kubectl; the caller never supplies it."""
+        self._refuse_executor("API discovery (api-resources)")
         if self._cluster_scoped is None:
             out = self._exec(["api-resources", "--namespaced=false", "--no-headers"])
             live = {line.split()[-1] for line in out.splitlines() if line.strip()}
@@ -478,6 +569,7 @@ class Kubectl:
     def _mutate(self, verb_args: list[str], objects, cluster_scope) -> None:
         import yaml
 
+        self._refuse_executor(f"kubectl {verb_args[0]}")
         objects = list(objects)
         self._check_objects(objects, cluster_scope)
         self._exec(verb_args + ["-f", "-"], stdin=yaml.safe_dump_all(objects, sort_keys=False))
@@ -500,6 +592,7 @@ class Kubectl:
         (decision 0017 §6)."""
         import yaml
 
+        self._refuse_executor("kubectl create")
         self._check_objects([obj], frozenset())
         out = self._exec(
             ["create", "-o", "json", "-f", "-"], stdin=yaml.safe_dump(obj), timeout=timeout
@@ -521,6 +614,7 @@ class Kubectl:
         networkchaos.chaos-mesh.org); `kind` is what the guard checks."""
         import re
 
+        self._refuse_executor("kubectl delete")
         if not re.fullmatch(r"[a-z0-9]+(\.[a-z0-9-]+)*", resource):
             raise GuardError(f"invalid resource name {resource!r}")
         if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", name):
@@ -565,6 +659,7 @@ class Kubectl:
         without this, a bootstrap path shaped like a flag ("--kubeconfig=...") would land
         after the guard's own --kubeconfig and win, because kubectl takes the last one.
         """
+        self._refuse_executor("a raw API call")
         if not path.startswith("/"):
             raise GuardError(f"raw path must start with '/', got {path[:40]!r}")
         if self.phase is Phase.RUNTIME:
@@ -585,6 +680,8 @@ class Kubectl:
                 raise GuardError("reader raw calls may only GET Prometheus' query API")
             if ".." in path or "#" in path or "?" not in rest:
                 raise GuardError("reader raw calls need a plain query string")
+        elif self.phase is not Phase.BOOTSTRAP:
+            raise GuardError(f"no raw call is defined for phase {self.phase!r}")
         elif method != "GET":
             raise GuardError("bootstrap raw calls are GET only")
         if method == "GET":
@@ -594,6 +691,79 @@ class Kubectl:
                 ["replace", "--raw", path, "-f", "-"], stdin=json.dumps(body or {}), timeout=timeout
             )
         raise GuardError(f"raw {method} is not supported")
+
+    def patch(
+        self,
+        *,
+        kind: str,
+        name: str,
+        namespace: str,
+        patch_type: str,
+        body_json: str,
+        timeout_s: float,
+    ) -> ProcessResult:
+        """The executor's one capability (decision 0025 D§14): `kubectl patch` of one object,
+        returning the patched object as JSON, with kubectl's request log (-v=6: method, URL and
+        HTTP status of each request; never a header or a token) on stderr for the adapter.
+
+        Guarded before anything runs: the executor phase only; a structured kind, name,
+        namespace, patch type and JSON body, never caller argv; the object checked with
+        `check_object` directly. Never `_check_objects`: that asks the API server for its
+        cluster-scoped kinds (`kubectl api-resources`), a read the executor must never make, and
+        the executor's three kinds are fixed and namespaced.
+
+        Never raises for a process outcome: exit status, timeout and a failure to start are
+        returned as a ProcessResult. A guard refusal or an unusable identity raises (nothing
+        was sent)."""
+        import re
+
+        if self.phase is not Phase.EXECUTOR:
+            raise GuardError("only the executor identity patches through Kubectl.patch")
+        resource = EXECUTOR_RESOURCES.get(kind)
+        if resource is None:
+            raise GuardError(f"the executor may not patch kind {kind!r}")
+        if type(name) is not str or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", name):
+            raise GuardError(f"invalid object name {name!r}")
+        if patch_type not in EXECUTOR_PATCH_TYPES:
+            raise GuardError(f"patch type {patch_type!r} is not json, merge or strategic")
+        try:
+            parsed = json.loads(body_json)
+        except (TypeError, ValueError) as exc:
+            raise GuardError("the patch body is not JSON") from exc
+        if type(parsed) is not (list if patch_type == "json" else dict):
+            raise GuardError(f"a {patch_type} patch body has the wrong JSON shape")
+        check_object(self.cfg, self.phase, kind=kind, name=name, namespace=namespace)
+        self._verify_identity()
+        args = [
+            "patch",
+            resource,
+            name,
+            "-n",
+            namespace,
+            "--type",
+            patch_type,
+            "-p",
+            body_json,
+            "-o",
+            "json",
+            "-v=6",
+            f"--request-timeout={int(timeout_s)}s",
+        ]
+        try:
+            proc = self._run(
+                self.base_args() + args,
+                capture_output=True,
+                text=False,
+                timeout=timeout_s + 5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return ProcessResult(
+                None, decode_raw(exc.stdout), decode_raw(exc.stderr), timed_out=True
+            )
+        except OSError as exc:  # kubectl never started: nothing was sent
+            return ProcessResult(None, spawn_error=f"{type(exc).__name__}: {exc}")
+        return ProcessResult(proc.returncode, decode_raw(proc.stdout), decode_raw(proc.stderr))
 
 
 # --- workload generator proxy --------------------------------------------------------

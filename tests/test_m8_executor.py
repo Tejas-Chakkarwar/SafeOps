@@ -995,7 +995,12 @@ def test_a_prepared_write_is_immutable() -> None:
 def test_the_executor_needs_its_loaded_dependencies() -> None:
     rig = Rig()
     ok = dict(
-        semantics=SEMANTICS, topology=TOPOLOGY, namespace=NS, reader=rig.reader, writer=rig.writer
+        semantics=SEMANTICS,
+        topology=TOPOLOGY,
+        namespace=NS,
+        reader=rig.reader,
+        writer=rig.writer,
+        audit=rig.audit,
     )
     ActionExecutor(**ok)
     for key, bad in [
@@ -1004,6 +1009,7 @@ def test_the_executor_needs_its_loaded_dependencies() -> None:
         ("namespace", "Test_Bed"),
         ("reader", object()),
         ("writer", object()),
+        ("audit", object()),
     ]:
         with pytest.raises((TypeError, ValueError)):
             ActionExecutor(**{**ok, key: bad})

@@ -23,6 +23,7 @@ from safeops.verify.effectiveness import EffectivenessVerifier
 FIXED_TIME = datetime(2026, 11, 19, 18, 0, 0, tzinfo=UTC)
 
 REPO_RUNS_DIR = Path(__file__).resolve().parent.parent / "data" / "runs"
+REPO_AUDIT_DIR = Path(__file__).resolve().parent.parent / "data" / "executor_audit"
 REPO_STATE_DIR = Path(__file__).resolve().parent.parent / ".safeops"
 
 
@@ -78,6 +79,31 @@ def _never_write_the_real_dataset(tmp_path, monkeypatch):
     monkeypatch.setattr(records, "RUNS_DIR", tmp_path / "default-runs")
     yield
     assert _repo_records() == before, "a test wrote into the repository's data/runs/"
+
+
+def _audit_state() -> tuple:
+    """The real audit root's existence and contents: an empty leftover directory counts."""
+    if not REPO_AUDIT_DIR.exists() and not REPO_AUDIT_DIR.is_symlink():
+        return (False, ())
+    entries = sorted(
+        (str(p.relative_to(REPO_AUDIT_DIR)), p.is_dir(), p.stat().st_size if p.is_file() else 0)
+        for p in REPO_AUDIT_DIR.rglob("*")
+    )
+    return (True, tuple(entries))
+
+
+@pytest.fixture(autouse=True)
+def _never_write_the_real_executor_audit(tmp_path, monkeypatch):
+    """No test may create, change or remove the real executor audit trail
+    (data/executor_audit/, decision 0025 D§11.8): the default sink root points at a temporary
+    directory, and the real root's existence and contents are checked unchanged. Live tests
+    are held to the same rule; they inject their own roots."""
+    from safeops.executor import audit
+
+    before = _audit_state()
+    monkeypatch.setattr(audit, "EXECUTOR_AUDIT_DIR", tmp_path / "default-executor-audit")
+    yield
+    assert _audit_state() == before, "a test touched the real data/executor_audit/"
 
 
 def clock_reading(offset_s: int = 0, at: datetime = FIXED_TIME):

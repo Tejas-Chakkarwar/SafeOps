@@ -22,6 +22,7 @@ from pathlib import Path
 from safeops import manifests
 from safeops.cluster import (
     CLUSTER_SCOPED_KINDS,
+    EXECUTOR_RESOURCES,
     REPO_ROOT,
     ClusterConfig,
     CommandError,
@@ -379,6 +380,14 @@ def issue_reader_credential(cfg: ClusterConfig, k: Kubectl) -> dict:
     )
 
 
+def issue_executor_credential(cfg: ClusterConfig, k: Kubectl) -> dict:
+    """Time-limited TokenRequest token for safeops-executor, the executor's patch-only write
+    identity (design §4; Milestone 8, decision 0025 D§14). Same lifetime as the harness token."""
+    return _issue_credential(
+        cfg, k, "safeops-executor", cfg.executor_kubeconfig_path, cfg.executor_token_meta_path
+    )
+
+
 def _issue_credential(
     cfg: ClusterConfig, k: Kubectl, service_account: str, kubeconfig_path: Path, meta_path: Path
 ) -> dict:
@@ -422,6 +431,23 @@ def _issue_credential(
 # --- health checks -------------------------------------------------------------------
 
 
+def can_i_answer(proc: subprocess.CompletedProcess) -> bool:
+    """A `kubectl auth can-i` answer, strictly (decision 0025, M8B-2): exit 0 and exactly
+    "yes" is allowed; exit 1 and exactly "no" is denied. Anything else (a timeout's partial
+    output, an error, another exit code, extra text) is not an answer, and raises: a failed
+    check must never read as a denial (or as a grant)."""
+    out = (proc.stdout or "").strip()
+    if proc.returncode == 0 and out == "yes":
+        return True
+    if proc.returncode == 1 and out == "no":
+        return False
+    err = (proc.stderr or "").strip().splitlines()
+    raise CommandError(
+        f"kubectl auth can-i gave no answer (exit {proc.returncode},"
+        f" stdout {out[:80]!r}{', ' + err[-1][:200] if err else ''})"
+    )
+
+
 def _can_i(
     cfg: ClusterConfig,
     verb: str,
@@ -430,6 +456,8 @@ def _can_i(
     namespace: str,
     service_account: str = "experiment-controller",
 ) -> bool:
+    """Admin impersonation of one ServiceAccount (`--as`): what its RBAC grants, as the API
+    server evaluates it. Strict (can_i_answer)."""
     sa = f"system:serviceaccount:{cfg.system_namespace}:{service_account}"
     proc = subprocess.run(
         [
@@ -453,7 +481,7 @@ def _can_i(
         timeout=60,
         check=False,
     )
-    return proc.stdout.strip() == "yes"
+    return can_i_answer(proc)
 
 
 def rbac_checks(cfg: ClusterConfig) -> list[str]:
@@ -500,7 +528,86 @@ def rbac_checks(cfg: ClusterConfig) -> list[str]:
         if got != want:
             what = f"{resource}" + (f" --subresource={sub}" if sub else "")
             failures.append(f"reader can-i {verb} {what} -n {ns}: expected {want}, got {got}")
+    for verb, resource, sub, ns, want in executor_rbac_expectations(cfg):
+        got = _can_i(cfg, verb, resource, sub, ns, service_account="safeops-executor")
+        if got != want:
+            what = f"{resource}" + (f" --subresource={sub}" if sub else "")
+            failures.append(f"executor can-i {verb} {what} -n {ns}: expected {want}, got {got}")
     return failures
+
+
+# The safeops-executor ceiling (Milestone 8, decision 0025 D§14): `patch` on exactly the
+# ownership-map whitelist, and the denied surface around it. Shared by the bootstrap health
+# check and tests/cluster.
+
+
+def executor_whitelist(topology=None) -> dict[str, tuple[str, ...]]:
+    """kind -> sorted names: the D§11.1 E3 whitelist (ConfigMaps need approved keys)."""
+    topology = topology or load_topology()
+    out: dict[str, list[str]] = {kind: [] for kind in EXECUTOR_RESOURCES}
+    for spec in topology.resources.values():
+        if spec.kind in out and (spec.kind != "ConfigMap" or spec.approved_keys):
+            out[spec.kind].append(spec.name)
+    return {kind: tuple(sorted(names)) for kind, names in out.items()}
+
+
+def executor_rbac_expectations(cfg: ClusterConfig, topology=None) -> list[tuple]:
+    ns = cfg.namespace
+    expect: list[tuple] = []
+    for kind, names in executor_whitelist(topology).items():
+        resource = EXECUTOR_RESOURCES[kind]
+        for name in names:
+            expect.append(("patch", f"{resource}/{name}", None, ns, True))
+            expect += [
+                (verb, f"{resource}/{name}", None, ns, False)
+                for verb in ("get", "update", "delete", "create")
+            ]
+            for sub in ("status", "scale") if kind == "Deployment" else ("status",):
+                expect += [
+                    (verb, f"{resource}/{name}", sub, ns, False) for verb in ("patch", "update")
+                ]
+        expect.append(("patch", f"{resource}/not-in-the-whitelist", None, ns, False))
+        expect += [
+            (verb, resource, None, ns, False)
+            for verb in ("get", "list", "watch", "create", "deletecollection")
+        ]
+        expect += [
+            ("patch", f"{resource}/{names[0]}", None, other, False)
+            for other in (
+                cfg.system_namespace,
+                cfg.workload_namespace,
+                cfg.monitoring_namespace,
+                "default",
+                "kube-system",
+            )
+        ]
+    expect += [
+        ("patch", "statefulsets.apps/postgres", None, ns, False),
+        ("update", "statefulsets.apps/postgres", None, ns, False),
+        ("list", "statefulsets.apps", None, ns, False),
+        ("patch", "persistentvolumeclaims/data-postgres-0", None, ns, False),
+        ("delete", "persistentvolumeclaims", None, ns, False),
+        ("get", "secrets", None, ns, False),
+        ("patch", "secrets/postgres-credentials", None, ns, False),
+        ("list", "pods", None, ns, False),
+        ("patch", "pods", None, ns, False),
+        ("delete", "pods", None, ns, False),
+        ("create", "pods", "exec", ns, False),
+        ("get", "pods", "log", ns, False),
+        ("list", "replicasets.apps", None, ns, False),
+        ("patch", "replicasets.apps", None, ns, False),
+        ("list", "events", None, ns, False),
+        ("list", "endpointslices.discovery.k8s.io", None, ns, False),
+        ("create", "serviceaccounts", "token", cfg.system_namespace, False),
+        ("patch", "roles.rbac.authorization.k8s.io/safeops-executor", None, ns, False),
+        ("patch", "networkchaos.chaos-mesh.org", None, ns, False),
+        ("patch", "namespaces/testbed", None, ns, False),
+        ("delete", "namespaces", None, ns, False),
+        ("list", "nodes", None, ns, False),
+        ("patch", f"services/{cfg.workload_service}", None, cfg.workload_namespace, False),
+        ("get", f"services/{cfg.workload_service}", "proxy", cfg.workload_namespace, False),
+    ]
+    return expect
 
 
 # The §4 reader surface (Milestone 6, decision 0023): every read it needs, and the denied
@@ -770,9 +877,10 @@ def up() -> None:
         k, (cfg.namespace, cfg.workload_namespace, cfg.monitoring_namespace, cfg.chaos_namespace)
     )
 
-    _say("issuing the harness and reader credentials")
+    _say("issuing the harness, reader and executor credentials")
     meta = issue_harness_credential(cfg, k)
     issue_reader_credential(cfg, k)
+    issue_executor_credential(cfg, k)
 
     _say("health checks")
     ownership_check(cfg, k)
@@ -819,6 +927,7 @@ def up() -> None:
     )
     print(f"  rbac:        proxy to {cfg.workload_service} allowed; everything else denied")
     print("  reader:      safeops-reader reads testbed (§4) and queries Prometheus; never writes")
+    print("  executor:    safeops-executor patches the testbed whitelist only; never reads")
     running = state.get("running")
     print(f"  workload:    generator reachable via the harness path (running={running})")
     print(
@@ -880,6 +989,8 @@ def down(
         cfg.harness_token_meta_path,
         cfg.reader_kubeconfig_path,
         cfg.reader_token_meta_path,
+        cfg.executor_kubeconfig_path,
+        cfg.executor_token_meta_path,
         cfg.kubeconfig_path.parent / "images.json",
     ):
         path.unlink(missing_ok=True)

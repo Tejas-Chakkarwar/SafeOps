@@ -1,11 +1,11 @@
-"""The executor's transitional production transports (decision 0025, M8B-1 amendment).
+"""Loud placeholder transports (decision 0025, M8B-1 amendment).
 
-Milestone 8B-1 builds the executor's semantics offline; Milestone 8B-2 supplies the
-concrete safeops-executor writer and safeops-reader adapters. Until then, build_runner
-wires these. They hold no credential and no client, so no Kubernetes mutation (or read) is
-possible through them, and reaching one is loud: each method is a Milestone 8 stub, raising
-NotImplementedStage before anything is sent. A run that gets that far is recorded as a
-not_implemented discard at stage execute, never as an outcome.
+Milestone 8B-1 wired these in build_runner until Milestone 8B-2 supplied the concrete
+safeops-executor writer and safeops-reader reader (safeops/executor/kubernetes.py), which
+build_runner now uses. They are no longer production wiring; offline tests keep them as a
+transport that is loud by construction. They hold no credential and no client, so no
+Kubernetes mutation (or read) is possible through them: each method is a Milestone 8 stub,
+raising NotImplementedStage before anything is sent.
 """
 
 from __future__ import annotations

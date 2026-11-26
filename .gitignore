@@ -3,6 +3,9 @@ reference/
 # Run records: gitignored, backed up separately, immutable once finalized.
 data/runs/
 
+# Executor audit trail (decision 0025 D§11.8): one append-only file per run. Never commit.
+data/executor_audit/
+
 # macOS
 .DS_Store
 

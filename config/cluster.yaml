@@ -17,9 +17,14 @@ kubeconfig_path: .safeops/kubeconfig
 harness_kubeconfig_path: .safeops/experiment-controller.kubeconfig
 harness_token_meta_path: .safeops/experiment-controller.token.json
 # reader:  safeops-reader's time-limited TokenRequest token (design §4, Milestone 6). Used
-#          only by the agent's read-only tools; same lifetime as the harness token.
+#          by the agent's read-only tools and by the executor's pre-write reads and
+#          reconciliation (decision 0025 D§11.7); same lifetime as the harness token.
 reader_kubeconfig_path: .safeops/safeops-reader.kubeconfig
 reader_token_meta_path: .safeops/safeops-reader.token.json
+# executor: safeops-executor's time-limited TokenRequest token (design §4, Milestone 8;
+#          decision 0025 D§14). Used only by the executor's patch-only writer; same lifetime.
+executor_kubeconfig_path: .safeops/safeops-executor.kubeconfig
+executor_token_meta_path: .safeops/safeops-executor.token.json
 # Requested lifetime of the harness token: one development cluster session of 7 days.
 # Bootstrap reads the issued expiry back and fails if the API server caps it lower.
 # Never falls back to the admin kubeconfig. Revisit before Milestone 14 with the measured

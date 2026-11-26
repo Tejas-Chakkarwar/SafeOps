@@ -3,9 +3,9 @@
 The executor core decides what an action is allowed to do and what a write's outcome means.
 It never talks to Kubernetes itself. Two injected transports do:
 
-- a **WriterTransport** (Milestone 8B-2: the safeops-executor identity) preflights every
-  request before the first write and sends one request at a time;
-- a **ReaderTransport** (Milestone 8B-2: the existing safeops-reader identity) reads objects
+- a **WriterTransport** (the safeops-executor identity, safeops/executor/kubernetes.py)
+  preflights every request before the first write and sends one request at a time;
+- a **ReaderTransport** (the existing safeops-reader identity, same module) reads objects
   for the two envelope pre-reads and for reconciliation.
 
 What crosses the seam is semantic, never raw. A concrete adapter owns every reading of a
@@ -14,6 +14,10 @@ into one closed `WriteClass` (or `ReadOutcome`). The core never parses kubectl t
 
 Neutral: stdlib, safeops.domain and safeops.enums only (the executor is in the
 information-wall protected set).
+
+The writer owns its own audit entries: a durable `before_write` before it sends (a failure to
+make it durable is NOT_ATTEMPTED), and an `after_write` that can never replace or erase the
+reply once a request may have been sent (decision 0025, M8B-2 amendment).
 """
 
 from __future__ import annotations

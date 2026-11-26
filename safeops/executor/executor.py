@@ -20,6 +20,14 @@ executes what the gate approved, including actions the harm checker will score h
    ambiguous one is reconciled with a bounded read. Once any write may have been sent,
    nothing but an interrupt escapes: every outcome, a harness bug included, becomes a
    truthful ExecutionResult that keeps the execution evidence.
+6. **Finish.** Every ExecutionResult apply() returns passes through one completion seam
+   (`_finish`), which attempts exactly one `final` audit event. A failed final append
+   can't change or suppress the result. A raising apply() produces no result and no final.
+
+**Audit (M8B-2, D§11.8).** One sink, shared with the writer and bound to the current run
+before the action starts (`bind_run`). apply() checks that binding first, before any envelope
+check, read or write (HarnessMisuse). Every executor read attempt is audited: a failed read
+entry never changes the read's result. The writer audits its own writes.
 
 Every object a transport returns (a write's response, a read-back, a pre-write read, each
 listed ReplicaSet) must be the object asked about: its kind, metadata.name and
@@ -33,6 +41,7 @@ read path, the configured namespace, a reader, a writer, a clock and a sleep.
 from __future__ import annotations
 
 import copy
+import hashlib
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -43,6 +52,12 @@ from safeops.cluster import GuardError
 from safeops.domain import RecommendedAction
 from safeops.enums import ActionType, ExecutionStatus
 from safeops.executor import quantity
+from safeops.executor.audit import (
+    AuditPersistenceError,
+    ExecutorAudit,
+    HarnessMisuse,
+    keep_evidence,
+)
 from safeops.executor.result import (
     APPLIED,
     FAILED,
@@ -80,12 +95,23 @@ POD_TEMPLATE_HASH = "pod-template-hash"
 # The executor's units and Kubernetes' quantity suffixes (decision 0011).
 RESOURCE_UNITS = {"cpu_millis": ("cpu", "m"), "memory_mib": ("memory", "Mi")}
 
-# Harness bugs a transport may raise (D§11.3, D§11.6): a stage not implemented yet, and a
-# context-guard refusal.
+# Harness bugs a transport may raise (D§11.3, D§11.6): a stage not implemented yet, a
+# context-guard refusal, and use of the executor outside its run lifecycle.
 #
 # PREMISE: every member is guaranteed pre-send. NotImplementedStage is raised by a stub
 # before it does anything; GuardError by the context guard before any command runs. So a
 # write that raised one was never sent.
+#
+# HarnessMisuse currently has exactly one semantic raise source: the audit sink's
+# unbound-run append guard (safeops/executor/audit.py, JsonlExecutorAudit._bound_run_id).
+# Normal action lifecycle binds before the first executor-owned audited operation. The sink
+# has no unbind operation. bind_run changes binding only between runs. Therefore an unbound
+# HarnessMisuse is normally reachable only before a correct action's first possible send:
+# apply() checks the binding first, and the writer's before_write append runs before its
+# patch. Once a send is possible, the writer and the final seam consume any late audit
+# exception themselves (audit.keep_evidence), so none reaches _attempt. Any future
+# HarnessMisuse raise site must independently re-prove this pre-send property before being
+# added.
 #
 # - Before any write may have been sent, a member stays loud: it propagates out of apply()
 #   (preflight, a pre-write read, or the plan's first write).
@@ -98,7 +124,7 @@ RESOURCE_UNITS = {"cpu_millis": ("cpu", "m"), "memory_mib": ("memory", "Mi")}
 #
 # Adding a member requires re-evaluating the `skipped` mapping. An exception that can be
 # raised after a request was sent MUST NOT be added here without changing those semantics.
-HARNESS_BUGS = (NotImplementedStage, GuardError)
+HARNESS_BUGS = (NotImplementedStage, GuardError, HarnessMisuse)
 
 
 class ExecutorConfigurationError(ValueError):
@@ -225,6 +251,7 @@ class ActionExecutor:
         namespace: str,
         reader: ReaderTransport,
         writer: WriterTransport,
+        audit: ExecutorAudit,
         clock: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -238,24 +265,48 @@ class ActionExecutor:
             raise TypeError(f"{type(reader).__name__} is not a ReaderTransport")
         if not isinstance(writer, WriterTransport):
             raise TypeError(f"{type(writer).__name__} is not a WriterTransport")
+        if not isinstance(audit, ExecutorAudit):
+            raise TypeError(f"{type(audit).__name__} is not an ExecutorAudit")
+        # One sink: the writer audits its writes into the same object the executor binds.
+        if getattr(writer, "audit", audit) is not audit:
+            raise ValueError("the writer and the executor must share one audit sink")
         self.semantics = semantics
         self.topology = topology
         self.namespace = namespace
         self.reader = reader
         self.writer = writer
+        self.audit = audit
         self._clock = clock
         self._sleep = sleep
         self._last_restart: datetime | None = None
+
+    def bind_run(self, run_id: str) -> None:
+        """Bind the shared audit sink to the run about to apply an action (D§11.8). Between
+        runs only; apply(action) is unchanged."""
+        self.audit.bind_run(run_id)
 
     def apply(self, action) -> ExecutionResult:
         """Apply a gate-approved action within the hard envelope; return an ExecutionResult.
 
         Raises only for harness bugs, and only before any write may have been sent: a
-        structurally invalid action (ValueError), a configuration defect
-        (ExecutorConfigurationError), a preflight refusal from the writer, a pre-write
-        reader error, and a HARNESS_BUGS exception from the first write. After a possible
-        send nothing but an interrupt escapes; every outcome is classified.
+        structurally invalid action (ValueError), an unbound audit sink (HarnessMisuse), a
+        configuration defect (ExecutorConfigurationError), a preflight refusal from the
+        writer, a pre-write reader error, and a HARNESS_BUGS exception from the first write.
+        After a possible send nothing but an interrupt escapes; every outcome is classified.
+
+        Every result returned passes through `_finish` (one final audit attempt); a raise
+        never does.
         """
+        return self._finish(self._apply(action))
+
+    def _finish(self, result: ExecutionResult) -> ExecutionResult:
+        """The one completion seam: exactly one final audit append for a produced result. The
+        result is already authoritative; a failed append can't change or suppress it, and is
+        not retried."""
+        keep_evidence(lambda: self.audit.final(result))
+        return result
+
+    def _apply(self, action) -> ExecutionResult:
         if not isinstance(action, RecommendedAction):
             raise TypeError(f"apply takes a RecommendedAction, not {type(action)}")
         problem = target_problem(action.target.model_dump()) or params_problem(
@@ -263,6 +314,7 @@ class ActionExecutor:
         )
         if problem is not None:
             raise ValueError(f"apply takes a structurally valid action: {problem}")
+        self.audit.require_bound()  # before any envelope check, read or write
 
         refusal = self._common_envelope(action)
         if refusal is not None:
@@ -426,7 +478,10 @@ class ActionExecutor:
         """The named container must already exist (D§11.2): a strategic merge by name could
         otherwise add one. None to continue; else the refusal or the read failure."""
         reply = self._read(
-            lambda: self.reader.get("Deployment", deployment, self.namespace, READ_TIMEOUT_S)
+            lambda: self.reader.get("Deployment", deployment, self.namespace, READ_TIMEOUT_S),
+            purpose="container_check",
+            kind="Deployment",
+            name=deployment,
         )
         if reply.outcome is ReadOutcome.UNAVAILABLE:
             return _unavailable(
@@ -448,7 +503,10 @@ class ActionExecutor:
     def _plan_rollback(self, action, spec):
         name, revision = spec.name, action.params["to_revision"]
         reply = self._read(
-            lambda: self.reader.get("Deployment", name, self.namespace, READ_TIMEOUT_S)
+            lambda: self.reader.get("Deployment", name, self.namespace, READ_TIMEOUT_S),
+            purpose="rollback_history",
+            kind="Deployment",
+            name=name,
         )
         if reply.outcome is ReadOutcome.UNAVAILABLE:
             return _unavailable(
@@ -464,7 +522,12 @@ class ActionExecutor:
         uid = _at(reply.obj, "metadata", "uid")
         if type(uid) is not str or not uid:
             return _unavailable(f"Deployment/{name} as read has no uid")
-        listed = self._read(lambda: self.reader.list("ReplicaSet", self.namespace, READ_TIMEOUT_S))
+        listed = self._read(
+            lambda: self.reader.list("ReplicaSet", self.namespace, READ_TIMEOUT_S),
+            purpose="rollback_history",
+            kind="ReplicaSet",
+            name=None,
+        )
         if listed.outcome is ReadOutcome.UNAVAILABLE:
             return _unavailable(
                 f"the rollback history read could not list ReplicaSets"
@@ -524,17 +587,27 @@ class ActionExecutor:
 
     # --- reads -------------------------------------------------------------------------------
 
-    def _read(self, call: Callable[[], ReadReply], *, after_write: bool = False) -> ReadReply:
+    def _read(
+        self,
+        call: Callable[[], ReadReply],
+        *,
+        purpose: str,
+        kind: str,
+        name: str | None,
+        request: PreparedWrite | None = None,
+        after_write: bool = False,
+    ) -> ReadReply:
         """At most READ_ATTEMPTS attempts, READ_RETRY_SLEEP_S apart; the first FOUND or
         ABSENT decides. Before any write a reader error propagates (a harness bug, nothing
         sent). After a possible write any non-interrupt reader error, a HARNESS_BUGS one
         included, makes THAT attempt unavailable and the loop goes on: it never ends
-        reconciliation early and never escapes."""
+        reconciliation early and never escapes. Each attempt is audited (_audit_read)."""
         reply = ReadReply(ReadOutcome.UNAVAILABLE, diagnostic="no read was attempted")
         for attempt in range(READ_ATTEMPTS):
             if attempt:
                 self._sleep(READ_RETRY_SLEEP_S)
             reply = self._one_read(call, after_write)
+            self._audit_read(purpose, attempt + 1, kind, name, reply, request, after_write)
             if reply.outcome is not ReadOutcome.UNAVAILABLE:
                 return reply
         return reply
@@ -553,6 +626,34 @@ class ActionExecutor:
         if not isinstance(reply, ReadReply):
             return ReadReply(ReadOutcome.UNAVAILABLE, diagnostic="the reader returned no reply")
         return reply
+
+    def _audit_read(self, purpose, attempt, kind, name, reply, request, after_write) -> None:
+        """One read event (D§11.7, D§11.8). The read already happened: a failed entry never
+        changes its result. Before any write an unbound sink stays loud (apply() checked the
+        binding first, so this is defensive); after one, nothing the entry does can escape.
+        Reconciliation entries carry the compared fields only, never the object."""
+
+        def append() -> None:
+            fields = {
+                "purpose": purpose,
+                "attempt": attempt,
+                "kind": kind,
+                "namespace": self.namespace,
+                "name": name,
+                "outcome": reply.outcome.value,
+                "diagnostic": reply.diagnostic,
+            }
+            if request is not None:
+                fields["reconciliation"] = _reconciliation_view(request, reply)
+            self.audit.read(**fields)
+
+        if after_write:
+            keep_evidence(append)
+            return
+        try:
+            append()
+        except AuditPersistenceError:
+            return
 
     # --- writes ------------------------------------------------------------------------------
 
@@ -587,20 +688,18 @@ class ActionExecutor:
         after the request may have been sent: a writer error or a reply of the wrong type is
         ambiguous, and reconciled like any other.
 
-        A HARNESS_BUGS exception is an adapter contract violation (preflight owns those
-        refusals), and by the HARNESS_BUGS premise this request was never sent. Before any
-        possible write it propagates. After one it must not erase the evidence, so it is
-        NOT_ATTEMPTED: the composite's step 2 becomes `skipped`."""
+        A HARNESS_BUGS exception means, by the HARNESS_BUGS premise, that this request was
+        never sent. Before any possible write it propagates. After one it must not erase the
+        evidence, so it is NOT_ATTEMPTED: the composite's step 2 becomes `skipped`. The
+        diagnostic names the real cause: a HarnessMisuse is a lifecycle bug (an unbound
+        audit sink), not an adapter contract violation."""
         what = f"{request.operation.value} {request.kind}/{request.name}"
         try:
             reply = self.writer.write(request)
         except HARNESS_BUGS as exc:
             if not after_possible_write:
                 raise
-            return _Outcome.NOT_ATTEMPTED, bounded(
-                f"{what}: not attempted: the writer refused before sending, an adapter"
-                f" contract violation (preflight owns it): {type(exc).__name__}: {exc}"
-            )
+            return _Outcome.NOT_ATTEMPTED, bounded(_not_sent(what, exc))
         except Exception as exc:
             reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"{type(exc).__name__}: {exc}")
         if not isinstance(reply, WriteReply):
@@ -623,6 +722,10 @@ class ActionExecutor:
         """Read the object back (bounded): confirmed, absent or unavailable. Never a write."""
         reply = self._read(
             lambda: self.reader.get(request.kind, request.name, request.namespace, READ_TIMEOUT_S),
+            purpose="reconciliation",
+            kind=request.kind,
+            name=request.name,
+            request=request,
             after_write=True,
         )
         if reply.outcome is ReadOutcome.UNAVAILABLE:
@@ -633,6 +736,57 @@ class ActionExecutor:
         if reply.outcome is ReadOutcome.FOUND and postcondition_holds(request, reply.obj):
             return _Outcome.CONFIRMED, None
         return _Outcome.FAILED, bounded(f"{why}; reconciliation found the change absent")
+
+
+def _not_sent(what: str, exc: Exception) -> str:
+    """The diagnostic for a HARNESS_BUGS refusal after a possible write: its real cause."""
+    cause = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, HarnessMisuse):
+        return f"{what}: not attempted before send: {cause}"
+    return (
+        f"{what}: not attempted before send: the writer refused, an adapter contract"
+        f" violation (preflight owns it): {cause}"
+    )
+
+
+def _reconciliation_view(request: PreparedWrite, reply: ReadReply) -> dict:
+    """What a reconciliation entry records (D§11.8): the outcome (confirmed, absent or
+    unavailable) and the compared fields only. Total; never the whole object."""
+    if reply.outcome is ReadOutcome.UNAVAILABLE:
+        return {"outcome": "unavailable"}
+    if reply.outcome is ReadOutcome.ABSENT:
+        return {"outcome": "absent"}
+    obj = reply.obj
+    holds = postcondition_holds(request, obj)
+    check = request.postcondition.check
+    if check is Check.REPLICAS:
+        observed = _at(obj, "spec", "replicas")
+    elif check is Check.RESTART_ANNOTATION:
+        observed = _at(obj, "spec", "template", "metadata", "annotations", RESTART_ANNOTATION)
+    elif check is Check.CONFIGMAP_DATA:
+        data = _at(obj, "data")
+        keys = request.postcondition.expected()
+        observed = {k: data.get(k) for k in keys} if type(data) is dict else None
+    elif check is Check.SELECTOR:
+        observed = _at(obj, "spec", "selector")
+    elif check is Check.RESOURCES:
+        containers = _at(obj, "spec", "template", "spec", "containers")
+        name = request.postcondition.expected()["container"]
+        named = _named(containers, name) if type(containers) is list else []
+        observed = _at(named[0], "resources") if len(named) == 1 else None
+    else:  # the template: its digest, never the template itself
+        template = _at(obj, "spec", "template")
+        observed = (
+            "sha256:" + hashlib.sha256(canonical_json(template).encode()).hexdigest()
+            if type(template) is dict
+            else None
+        )
+    return {
+        "outcome": "confirmed" if holds else "absent",
+        "identity": list(_identity(obj)),
+        "check": check.value,
+        "observed": observed,
+    }
 
 
 def _configmap_key_refusal(spec: ResourceSpec, key: str, value: object) -> ExecutionResult | None:

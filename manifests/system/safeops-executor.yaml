@@ -1,0 +1,50 @@
+# safeops-executor: SafeOps' write identity, used only by the action executor (design §4,
+# §11.6; Milestone 8, decision 0025 D§14). Its ceiling is enforced here, by the API server,
+# and separately by the client phase (Phase.EXECUTOR). It lives in the system namespace so a
+# testbed rebuild keeps it.
+#
+# Exactly `patch`, in the testbed namespace, on the ownership-map whitelist (D§11.1 E3), by
+# resourceName. Nothing else:
+# - no get, list or watch: the executor never reads (safeops-reader does its reads, D§11.7);
+# - no create, update, delete or deletecollection (`update` is withheld provisionally, D§14);
+# - no subresource (deployments/scale, */status), no StatefulSets, Secrets, PVCs or Pods;
+# - nothing in any other namespace, nothing cluster-scoped, no wildcard.
+# Every object here is namespaced, so config/bootstrap_scope.yaml is unchanged.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: safeops-executor
+  namespace: ${SYSTEM_NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: safeops-executor
+  namespace: ${TESTBED_NAMESPACE}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["gateway", "inventory", "orders", "payment"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["gateway-svc", "inventory-svc", "orders-svc", "payment-svc", "postgres-svc"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["db-pool-config", "orders-config"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: safeops-executor
+  namespace: ${TESTBED_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: safeops-executor
+    namespace: ${SYSTEM_NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: safeops-executor

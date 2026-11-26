@@ -1761,3 +1761,173 @@ The governing question is whether a write could already have reached the cluster
 - `M8B1-H11` (reconciliation errors propagate) is retired: this amendment reverses its guard, and `H18` pins the new behavior. The table holds 256.
 
 **Unchanged:** every `ExecutionStatus` shape; `WriteReply`; object identity; ReplicaSet completeness; quantity totality; huge-integer handling; the schema; the information wall; and the provisional rollback template equality (`M8B1-O7`).
+
+## Amendment, 2026-11-26: Milestone 8B-2 implementation (the Kubernetes executor boundary)
+
+This records the choices D§11.3, D§11.7, D§11.8 and D§14 left to M8B-2. The M8B-1 semantic core is unchanged: `apply(action)`, structural validation, E1 → E2 → E3, the six planners, `PreparedWrite`, `WriteReply`, every producer shape, the read bounds, possible-write evidence preservation (H17, H18), `_executed_action`, schema version 2 and the quantity contract. Live findings are recorded under **Live proof**, below.
+
+**Where things live:**
+
+| Item | Module |
+|---|---|
+| `Phase.EXECUTOR`, `EXECUTOR_RESOURCES`, `executor_credential`, `CredentialUnavailable`, `ProcessResult`, `Kubectl.patch` | `safeops/cluster.py` |
+| `KubernetesWriterTransport`, `KubernetesReaderTransport`, `classify_patch` | `safeops/executor/kubernetes.py` |
+| `JsonlExecutorAudit`, `HarnessMisuse`, `AuditPersistenceError`, `keep_evidence`, `EXECUTOR_AUDIT_DIR` | `safeops/executor/audit.py` |
+| the ServiceAccount, Role and RoleBinding | `manifests/system/safeops-executor.yaml` |
+| `issue_executor_credential`, `executor_rbac_expectations`, `executor_whitelist`, `can_i_answer` | `safeops/bootstrap.py` |
+| `executor_kubeconfig_path`, `executor_token_meta_path` | `config/cluster.yaml` (`.safeops/safeops-executor.*`) |
+
+**1. The executor client phase.**
+- `Phase.EXECUTOR` has an explicit branch in every phase conditional. Before this change, two would have fallen through to bootstrap's wider scope: `check_object` (its `else` gave a non-runtime phase every bootstrap namespace and the recorded cluster scope) and `Kubectl.raw` (its `else` is bootstrap's GET). `kubeconfig_for` now has one branch per phase, and only bootstrap reaches the admin credential; any other phase raises.
+- **Scope:** the testbed namespace and the kinds Deployment, Service and ConfigMap. Cluster scope, every other namespace (the bootstrap namespaces included) and every other kind are refused.
+- **One capability:** `Kubectl.patch(kind, name, namespace, patch_type, body_json, timeout_s)`, which builds `kubectl patch <resource> <name> -n <ns> --type <t> -p <body> -o json -v=6 --request-timeout=<n>s` from structured arguments, never caller argv. Every other `Kubectl` method refuses the executor phase before anything runs: `read`, `read_raw` and `get_json` (every `_READ_VERBS` entry and subcommand, including `auth can-i`, `api-resources` and `version`), `raw`, `cluster_scoped_kinds`, `apply`, `create`, `create_returning`, `replace`, `delete` and `create_token`. `patch` refuses every other phase.
+- **`patch` checks its object with `check_object` directly, never `_check_objects`.** `_check_objects` calls `cluster_scoped_kinds()`, which runs `kubectl api-resources`, a read the executor must never make. The executor's three kinds are fixed and namespaced. A test pins the exact argv and that neither helper is called.
+- **The read and discovery boundary.** SafeOps never initiates an executor read: no workload `get`, `list` or `watch`, no `api-resources`, no `can-i`, no raw call. kubectl's own discovery (`GET /api`, `/apis`, served to every authenticated identity by the default `system:discovery` binding) is inherent in resolving the resource. It reads no workload state, and the Role grants no `get`. `-o json` prints the PATCH response; it is not a GET.
+- **Credentials.** The executor uses only `.safeops/safeops-executor.kubeconfig`, issued by bootstrap's TokenRequest, with the harness lifetime, and removed by `cluster-down`. An explicitly passed admin, harness or reader kubeconfig is refused, and the reader phase now also refuses the executor's.
+
+**2. Credential failures are three different things.** A broad `except CredentialError` is never used.
+
+| Cause | Raised as | Writer outcome |
+|---|---|---|
+| the configured file is missing, or its token has expired (detected locally) | `CredentialUnavailable` (a `CredentialError` subclass, raised by `_token_credential`) | `NOT_ATTEMPTED` (D§11.3): preflight doesn't raise, and `write` reports it, also when the token expires between preflight and write |
+| another identity's credential passed explicitly | `CredentialError` (`Kubectl.__init__`) | loud |
+| an existing but unusable kubeconfig (no usable context), or unreadable token metadata | `CredentialError` (`_verify_identity`, `_token_credential`) | loud, from preflight |
+| the context's API server isn't this cluster's | `GuardError` (`_verify_identity`) | loud, from preflight |
+
+The production writer takes no kubeconfig parameter, so it can't be handed another identity's credential. It resolves `executor_credential(cfg)` in preflight and again at each write. Separately, in preflight only and only when the credential is available, it builds the client and verifies its identity.
+
+**3. Lazy construction.** Neither transport builds a `Kubectl` or resolves a credential in its constructor: `Kubectl.__init__` resolves the credential, so an eager client would make a missing credential a construction crash instead of `NOT_ATTEMPTED`. The writer builds its client in `preflight`, once, keeping it only after identity verification succeeds; the reader builds its client on its first read. `build_runner()` runs no process, resolves no credential and touches no file. A test proves this with nonexistent credentials and a `subprocess.run` that fails.
+
+**4. The concrete writer** (`KubernetesWriterTransport(cfg, audit, *, runner, now)`):
+- **`preflight(requests)`:**
+  - takes a non-empty tuple of `PreparedWrite`, each checked with `check_object` directly, plus the name, the patch type and the body's JSON shape;
+  - checks credential availability;
+  - builds and verifies the lazy client.
+
+  Everything it refuses raises, before anything is sent.
+- **`write(request)`, in order:**
+  1. the request must be one that was preflighted, else `GuardError`;
+  2. the `before_write` entry is appended, durable;
+  3. credential availability is re-checked;
+  4. the one patch runs;
+  5. the outcome is classified;
+  6. `after_write` is attempted;
+  7. the same reply is returned.
+- **Classification, from the PATCH request's HTTP status in kubectl's `-v=6` response log** (the legacy `PATCH <url> <status>` form and the structured `"Response" verb="PATCH" url="…" status="…"` form, matched to this object's path):
+
+  | Outcome | Class |
+  |---|---|
+  | kubectl never started | `NOT_ATTEMPTED` |
+  | process timeout | `AMBIGUOUS` |
+  | 2xx, exit 0, a JSON object returned | `SUCCESS` (the core still checks the postcondition and identity) |
+  | 2xx otherwise | `AMBIGUOUS` |
+  | 422 | `INVALID_ACTION` |
+  | any other 4xx | `DEFINITE_FAILURE` |
+  | 5xx or any other status | `AMBIGUOUS` |
+  | no PATCH response, but a 401/403 response to discovery and a non-zero exit | `DEFINITE_FAILURE` (the PATCH was never sent) |
+  | no PATCH response, exit 0 with a JSON object | `SUCCESS` |
+  | anything else | `AMBIGUOUS` |
+
+  Classification is total; an unexpected error while reading the output is `AMBIGUOUS`. The status is read from the response log because kubectl prints a 422 as "The Deployment "x" is invalid: …", with no `Error from server (Invalid)` prefix to parse.
+- An unexpected exception from the patch process (other than a pre-run `GuardError`) is `AMBIGUOUS`, and its `after_write` is still attempted.
+- **The write timeout** is `WRITE_TIMEOUT_S = 20` (`--request-timeout=20s`, with the process bound 5 s above). There is no retry.
+
+**5. The concrete reader** (`KubernetesReaderTransport(cfg, *, runner)`, the safeops-reader identity, no RBAC change; D§11.7). Each call runs one kubectl process.
+- `get`: `kubectl get <resource> <name> -n <testbed> -o json --ignore-not-found`. Exit 0 with empty output is `ABSENT`, a successful read proving absence with no stderr parsing; a JSON object is `FOUND`.
+- `list` (ReplicaSets only): `kubectl get replicasets.apps -n <testbed> -o json --chunk-size=0`, one unpaginated LIST. It is `FOUND` only with an `items` list, an empty `metadata.continue` and no positive `metadata.remainingItemCount`; otherwise `UNAVAILABLE`.
+- A credential, command, timeout, OS or decode failure is `UNAVAILABLE`. A kind outside the three (or ReplicaSet for `list`), another namespace, or an invalid name is a `GuardError`.
+
+**6. `HarnessMisuse` and `HARNESS_BUGS`.**
+- `HARNESS_BUGS = (NotImplementedStage, GuardError, HarnessMisuse)`. `HarnessMisuse` (in `safeops/executor/audit.py`, a protected, neutral module) means the executor was used outside its run lifecycle: its audit sink has no current binding.
+- **It has exactly one semantic raise source: the audit sink's unbound-run guard, `JsonlExecutorAudit._bound_run_id`.** Every append runs it first. `apply()` runs it, through `require_bound()`, before E1, before any read, preflight or write.
+- **The pre-send premise for it:**
+  - the normal action lifecycle binds before the first executor-owned audited operation;
+  - the sink has no unbind operation;
+  - `bind_run` changes the binding only between runs (the runner binds immediately before `apply`, once per run);
+  - so an unbound `HarnessMisuse` is normally reachable only before a correct action's first possible send. With the shared sink it surfaces at `apply()` entry. With a writer over an unbound sink, it surfaces at the first `before_write`, which precedes the patch.
+- **Any future `HarnessMisuse` raise site must independently re-prove this pre-send property before it is added.** Defensive preservation of an impossible late audit exception (items 7–9) does not authorize adding a post-send raise source.
+- **Before a possible write, `HarnessMisuse` propagates:** no `ExecutionResult`, and no final event. At a later write it is that write not attempted (step 2 `skipped`), truthful only because of the premise.
+- **The `_attempt` diagnostic names the real cause.** For a `HARNESS_BUGS` refusal after a possible write:
+  - a `HarnessMisuse` reads "`<op> <Kind>/<name>`: not attempted before send: HarnessMisuse: `<detail>`";
+  - `NotImplementedStage` and `GuardError` keep "… not attempted before send: the writer refused, an adapter contract violation (preflight owns it): `<class>`: `<detail>`".
+
+  This replaces the single M8B-1 wording, which attributed every cause to preflight. Mutant `M8B2-D1` pins the recorded `execution.error`; it is status-equivalent.
+- **The post-write branch of `_one_read` is unchanged from `6d81a8c`.** It protects reconciliation reads only: a reader exception after a possible write is one `UNAVAILABLE` attempt (H18). It is not the mechanism for `after_write` or `final`, which have their own barriers.
+
+**7. `after_write`: its own evidence-preservation barrier.**
+- `after_write` runs inside `writer.write`, after the reply has been determined.
+- Once a patch may have been sent, the writer returns the already-determined `WriteReply` despite any non-interrupt `after_write` failure: an ordinary persistence failure, or a `HarnessMisuse` that the correct lifecycle makes impossible.
+- No such failure may replace the reply, turn it into `NOT_ATTEMPTED`, retry the write, or escape and erase the evidence. `keep_evidence` drops it; interrupts propagate, and `BaseException` is never caught.
+- This barrier keeps `_attempt`'s pre-send premise true across the writer surface: a post-send audit exception never reaches `_attempt`.
+
+**8. Final: one completion seam, exactly one attempt.**
+- `apply(action)` is `self._finish(self._apply(action))`. Every path that returns an `ExecutionResult` passes through `_finish`, which makes exactly one `final` append attempt:
+  - the common-envelope refusal;
+  - a planner's refusal, or its failed pre-write read (a file that already holds `read` events then ends in `final`, never at `read`);
+  - the `_execute` result.
+- A path that raises makes no final attempt, because there is no completed result to finalize.
+- **The result is authoritative once produced.** No non-interrupt final failure may prevent `apply()` from returning it or change its status, steps or error. A failed final append is not retried. A successful final append closes every completed audit with exactly one `final` event.
+
+**9. Audit persistence: only `before_write` gates.**
+
+| Event | Unbound sink | Bound sink, persistence failure |
+|---|---|---|
+| `before_write` | `HarnessMisuse`, loud, nothing sent | `NOT_ATTEMPTED`, nothing sent |
+| `read` | pre-write: `HarnessMisuse` at `apply()` entry, before any reader call | the read's result is kept (pre-write: the `AuditPersistenceError` is dropped; after a write: anything non-interrupt is dropped) |
+| `after_write` | normally unreachable (no unbind); no `_one_read` protection applies | the `WriteReply` is kept |
+| `final` | normally unreachable (no unbind); no `_one_read` protection applies | the `ExecutionResult` is kept |
+
+Correct-lifecycle reachability makes an unbound `after_write` or `final` impossible. The defensive barriers exist so that an impossible late audit defect can't break the possible-write and result-evidence invariant.
+
+**10. The audit sink (D§11.8).**
+- **Root.** `EXECUTOR_AUDIT_DIR = REPO_ROOT/data/executor_audit`. `JsonlExecutorAudit(audit_root=None, *, clock, fs)` resolves the default at construction; tests inject `tmp_path`.
+- **File.** `<root>/<run_id>.jsonl`, one canonical JSON object per line. Every event carries `event`, `run_id` and `at` (UTC, microseconds):
+  - `before_write`: operation, kind, namespace, name, patch type, the rendered patch, and the identity (`system:serviceaccount:safeops-system:safeops-executor`);
+  - `after_write`: the response class and its bounded diagnostic;
+  - `read`: purpose (`rollback_history`, `container_check`, `reconciliation`), attempt, kind, namespace, name, outcome and diagnostic; reconciliation reads add the compared fields only (outcome confirmed/absent/unavailable, identity, check, the observed value, or a `sha256:` digest of the template), never the object;
+  - `final`: the result's `to_record()`.
+
+  Nothing holds a token, an Authorization header or a Secret value.
+- **Binding.** `bind_run(run_id)` accepts only a canonical UUID (`str(uuid.UUID(x)) == x`) and touches no filesystem state. There is no unbind. Every append reads the current binding, nothing caches a run id, and the writer holds the sink, never an id. One sink is shared: `build_runner` passes the same object to the writer and the executor, and `ActionExecutor` refuses a writer whose `.audit` is another object. Rebinding A → B keeps each run's events in its own file.
+- **Binding before the filesystem.** The guard is `_append`'s first statement, before any path is built or any filesystem call is made. An unbound sink over an unwritable root is `HarnessMisuse`, not a persistence failure.
+- **Durability.**
+  - Directories: each missing component, from the root up to the first ancestor that already exists, is created outermost-first. Then each new directory's entry is fsynced (its parent), innermost-first, ending at that first existing ancestor and going no further.
+  - Run file: `O_CREAT|O_EXCL|O_APPEND|O_NOFOLLOW` (else an append-only open of the existing file), write the line, `fsync` the file, close, and for a new file `fsync` its directory.
+  - Every event takes this path. Only `before_write` waits on it before a send.
+  - Any `OSError` or serialization failure on a bound sink is `AuditPersistenceError`.
+- **Hygiene.** `data/executor_audit/` is in `.gitignore` and in the repository policy's forbidden roots, so a force-added audit file fails `check_repo_policy.py`. An autouse fixture redirects the default root to `tmp_path` and checks that the real root's existence and contents are unchanged, so even an empty leftover directory is caught.
+
+**11. RBAC (D§14).**
+- `manifests/system/safeops-executor.yaml` holds only namespaced objects:
+  - the ServiceAccount `safeops-executor` (`safeops-system`);
+  - a Role and a RoleBinding in the testbed, with exactly three rules, each `verbs: [patch]` by `resourceNames`: `apps/deployments` gateway, inventory, orders, payment; `services` gateway-svc, inventory-svc, orders-svc, payment-svc, postgres-svc; `configmaps` db-pool-config, orders-config.
+- A test asserts exact three-family equality with the D§11.1 whitelist, and with `executor_whitelist(topology)`. A separate test asserts that StatefulSets, PVCs, Secrets, Pods, ReplicaSets, subresources, wildcards and every other verb are absent.
+- `config/bootstrap_scope.yaml` is unchanged: a test pins that the executor manifest contributes no cluster-scoped object. The reset inventory's RBAC allowlist derives from the system manifests, so the new Role and RoleBinding in the testbed are expected objects.
+- **`can_i_answer`** reads a `kubectl auth can-i` result strictly: exit 0 and exactly `yes` is allowed, exit 1 and exactly `no` is denied, anything else raises. The admin-impersonation checks of all three identities (bootstrap's `rbac_checks`, the reader's existing matrix included) and the live tests use it. Before, a failed check read as a denial.
+- **Three proof layers, kept separate:**
+  - the production client guard (offline tests, plus a live check);
+  - admin impersonation of the Role and RoleBinding (`rbac_checks`, `--as`; `executor_rbac_expectations`);
+  - the executor's own token against the API server, with server-side dry runs, which bypasses the production guard in test code only.
+- `cluster-up` issues the executor credential after the reader's and fails on any expectation mismatch.
+
+**12. Production wiring.** `build_runner()` creates one `JsonlExecutorAudit` and passes it to `KubernetesWriterTransport(cluster, audit)` and to `ActionExecutor(..., audit=audit)`, with `KubernetesReaderTransport(cluster)`. The runner calls `executor.bind_run(run_id)` immediately before `apply`, at stage `execute`; test doubles that aren't `ActionExecutor`s are not bound. `UnwiredReader` and `UnwiredWriter` are no longer production wiring, and offline tests keep them as loud placeholders. `ActionExecutor` now requires `audit`.
+
+**13. Information wall.** `safeops.executor.audit` and `safeops.executor.kubernetes` are protected through `safeops.executor`. Both reach only `safeops.cluster`, `safeops.domain`, `safeops.enums`, `safeops.executor.*`, `safeops.actions`, `safeops.policy` and `safeops.topology`, and nothing forbidden. Only `safeops/cluster.py` and `safeops/executor/kubernetes.py` name `Phase.EXECUTOR`, which a static test pins.
+
+**Mutants:** 31, source "0025 M8B-2 executor boundary":
+
+| Mutants | What they pin |
+|---|---|
+| `M8B2-C1`–`C7` | no credential fallback; no bootstrap fallthrough; the read guard; `patch`'s `check_object`; the writer's preflight scope check; preflighted-only writes; the executor refusing the reader's kubeconfig |
+| `M8B2-L1`–`L3` | the eager client; the writer collapsing credential classes; a missing credential not being `CredentialUnavailable` |
+| `M8B2-W1`–`W3` | 422 → `INVALID_ACTION`; 5xx → `AMBIGUOUS`; an expired credential → `NOT_ATTEMPTED` |
+| `M8B2-A1`–`A12` | `before_write` after the process; a `before_write` failure still sending; directory durability; **A4** pre-send `HarnessMisuse` propagation (`HarnessMisuse` in `HARNESS_BUGS`); the shared sink; a stale run id; **A7** filesystem work before the binding check; **A8** the bound-run guard removed; **A9** a late audit failure erasing write or result evidence (the shared `keep_evidence` seam used by `after_write`, `final` and reconciliation-read entries, killed on both the `after_write` and `final` paths); the final event dropped; the entry binding check; a pre-write read entry gating |
+| `M8B2-D1` | the `HarnessMisuse` diagnostic (status-equivalent; pins `execution.error`) |
+| `M8B2-R1`, `R2` | the reader's phase; an incomplete list accepted |
+| `M8B2-B1` | canonical run ids |
+| `M8B2-K1` | a failed `can-i` read as a denial |
+| `M8B2-P1` | the audit root in the repository policy |
+
+`M8B1-H12` now targets the three-member tuple, and `M8B2-A4` targets the same line. The table holds 287.
+
+**Unchanged:** schema version 2 and `RECORD_FIELDS`; every `ExecutionStatus` producer shape; the M8A read path; `config/bootstrap_scope.yaml`; the design document. Milestone 8 is not closed by this amendment.
