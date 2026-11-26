@@ -17,8 +17,9 @@ executes what the gate approved, including actions the harm checker will score h
 4. **Plan.** Every request the action will send is built (the composite's restart value
    included) and preflighted together, before the first write. A preflight refusal raises.
 5. **Write and classify.** One write at a time; each semantic reply is classified, and an
-   ambiguous one is reconciled with a bounded read. Nothing raises after a possible send
-   except a harness bug (HARNESS_BUGS), which D§11.3 confines to before the first write.
+   ambiguous one is reconciled with a bounded read. Once any write may have been sent,
+   nothing but an interrupt escapes: every outcome, a harness bug included, becomes a
+   truthful ExecutionResult that keeps the execution evidence.
 
 Every object a transport returns (a write's response, a read-back, a pre-write read, each
 listed ReplicaSet) must be the object asked about: its kind, metadata.name and
@@ -80,9 +81,23 @@ POD_TEMPLATE_HASH = "pod-template-hash"
 RESOURCE_UNITS = {"cpu_millis": ("cpu", "m"), "memory_mib": ("memory", "Mi")}
 
 # Harness bugs a transport may raise (D§11.3, D§11.6): a stage not implemented yet, and a
-# context-guard refusal. They propagate from every transport call, before or after a write;
-# never classified as an ambiguous write or an unavailable read. M8B-2's writer enforces
-# every such refusal in preflight, so none can happen after a known write (D§11.3).
+# context-guard refusal.
+#
+# PREMISE: every member is guaranteed pre-send. NotImplementedStage is raised by a stub
+# before it does anything; GuardError by the context guard before any command runs. So a
+# write that raised one was never sent.
+#
+# - Before any write may have been sent, a member stays loud: it propagates out of apply()
+#   (preflight, a pre-write read, or the plan's first write).
+# - After a write may have been sent, execution evidence must survive:
+#   - at a later write, a member means that write was not attempted. The composite's step 2
+#     is then `skipped` (PARTIALLY_APPLIED), and that mapping is truthful ONLY because of
+#     the premise;
+#   - in a reconciliation read, a member is one unavailable attempt inside the bounded
+#     retry loop, like any other reader error.
+#
+# Adding a member requires re-evaluating the `skipped` mapping. An exception that can be
+# raised after a request was sent MUST NOT be added here without changing those semantics.
 HARNESS_BUGS = (NotImplementedStage, GuardError)
 
 
@@ -235,11 +250,11 @@ class ActionExecutor:
     def apply(self, action) -> ExecutionResult:
         """Apply a gate-approved action within the hard envelope; return an ExecutionResult.
 
-        Raises only for harness bugs: a structurally invalid action (ValueError), a
-        configuration defect (ExecutorConfigurationError), a preflight refusal from the
-        writer, all before the first write; and a HARNESS_BUGS exception from any transport
-        call, which D§11.3 confines to before the first write as well. Every other outcome
-        after a possible send is classified.
+        Raises only for harness bugs, and only before any write may have been sent: a
+        structurally invalid action (ValueError), a configuration defect
+        (ExecutorConfigurationError), a preflight refusal from the writer, a pre-write
+        reader error, and a HARNESS_BUGS exception from the first write. After a possible
+        send nothing but an interrupt escapes; every outcome is classified.
         """
         if not isinstance(action, RecommendedAction):
             raise TypeError(f"apply takes a RecommendedAction, not {type(action)}")
@@ -512,7 +527,9 @@ class ActionExecutor:
     def _read(self, call: Callable[[], ReadReply], *, after_write: bool = False) -> ReadReply:
         """At most READ_ATTEMPTS attempts, READ_RETRY_SLEEP_S apart; the first FOUND or
         ABSENT decides. Before any write a reader error propagates (a harness bug, nothing
-        sent); after a possible write it counts as an unavailable attempt (never a raise)."""
+        sent). After a possible write any non-interrupt reader error, a HARNESS_BUGS one
+        included, makes THAT attempt unavailable and the loop goes on: it never ends
+        reconciliation early and never escapes."""
         reply = ReadReply(ReadOutcome.UNAVAILABLE, diagnostic="no read was attempted")
         for attempt in range(READ_ATTEMPTS):
             if attempt:
@@ -531,8 +548,6 @@ class ActionExecutor:
             return reply
         try:
             reply = call()
-        except HARNESS_BUGS:
-            raise
         except Exception as exc:
             return ReadReply(ReadOutcome.UNAVAILABLE, diagnostic=f"{type(exc).__name__}: {exc}")
         if not isinstance(reply, ReadReply):
@@ -545,8 +560,10 @@ class ActionExecutor:
         """Send the planned writes in order and classify (D§11.5, D§11.6). An earlier step
         known applied dominates: whatever happens next, the result is partially_applied."""
         done: list[ExecutionStepResult] = []
-        for request in plan:
-            outcome, error = self._attempt(request)
+        for index, request in enumerate(plan):
+            # Every earlier request was sent or may have been: past the first, a write may
+            # already have reached the cluster.
+            outcome, error = self._attempt(request, after_possible_write=index > 0)
             if outcome is _Outcome.CONFIRMED:
                 done.append(ExecutionStepResult(request.operation, APPLIED))
                 continue
@@ -563,20 +580,31 @@ class ActionExecutor:
             return ExecutionResult(ExecutionStatus.INFRASTRUCTURE_FAILURE, error, failed)
         return ExecutionResult(ExecutionStatus.APPLIED, None, tuple(done))
 
-    def _attempt(self, request: PreparedWrite) -> tuple[_Outcome, str | None]:
+    def _attempt(
+        self, request: PreparedWrite, *, after_possible_write: bool
+    ) -> tuple[_Outcome, str | None]:
         """One write, classified from its semantic reply. Never raises for what happened
         after the request may have been sent: a writer error or a reply of the wrong type is
-        ambiguous, and reconciled like any other. A HARNESS_BUGS exception is not such an
-        outcome (nothing was sent) and propagates."""
+        ambiguous, and reconciled like any other.
+
+        A HARNESS_BUGS exception is an adapter contract violation (preflight owns those
+        refusals), and by the HARNESS_BUGS premise this request was never sent. Before any
+        possible write it propagates. After one it must not erase the evidence, so it is
+        NOT_ATTEMPTED: the composite's step 2 becomes `skipped`."""
+        what = f"{request.operation.value} {request.kind}/{request.name}"
         try:
             reply = self.writer.write(request)
-        except HARNESS_BUGS:
-            raise
+        except HARNESS_BUGS as exc:
+            if not after_possible_write:
+                raise
+            return _Outcome.NOT_ATTEMPTED, bounded(
+                f"{what}: not attempted: the writer refused before sending, an adapter"
+                f" contract violation (preflight owns it): {type(exc).__name__}: {exc}"
+            )
         except Exception as exc:
             reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"{type(exc).__name__}: {exc}")
         if not isinstance(reply, WriteReply):
             reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic="the writer returned no reply")
-        what = f"{request.operation.value} {request.kind}/{request.name}"
         detail = reply.diagnostic or "no diagnostic"
         cls = reply.semantic_class
         if cls is WriteClass.SUCCESS:

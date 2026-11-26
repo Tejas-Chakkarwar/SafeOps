@@ -12,11 +12,13 @@ from __future__ import annotations
 import copy
 from datetime import UTC, datetime, timedelta
 
+from safeops.cluster import GuardError
 from safeops.domain import ActionTarget, RecommendedAction
 from safeops.enums import ActionType
 from safeops.executor.executor import ActionExecutor
 from safeops.executor.transport import PatchType, ReadOutcome, ReadReply, WriteClass, WriteReply
 from safeops.policy import load_action_semantics
+from safeops.stubs import NotImplementedStage
 from tests.m8_fixtures import TOPOLOGY
 
 SEMANTICS = load_action_semantics()
@@ -183,6 +185,8 @@ class FakeWriter:
     lost             not applied, and the response was lost
     raise            applied, then the transport raised
     junk             applied; returns something that isn't a WriteReply
+    guard            never sent; raises GuardError (an adapter contract violation)
+    stub             never sent; raises NotImplementedStage (a half-wired adapter)
     """
 
     def __init__(self, cluster: FakeCluster, script=(), preflight_raises=None, clock=None):
@@ -203,6 +207,10 @@ class FakeWriter:
         if self._clock is not None:
             self.clock_calls_at_write.append(len(self._clock.calls))
         how = self.script.pop(0) if self.script else "success"
+        if how == "guard":
+            raise GuardError("the context guard refused: outside the executor phase's scope")
+        if how == "stub":
+            raise NotImplementedStage("HalfWiredWriter.write", 8)
         before = self.cluster.get(request.kind, request.name)
         if how in ("success", "stale", "ambiguous", "raise", "junk"):
             self.cluster.apply(request)
@@ -227,7 +235,8 @@ class FakeWriter:
 
 class FakeReader:
     """Reads the cluster. `unavailable` is how many attempts fail before reads succeed
-    (an int), or a list of booleans, one per call (True = unavailable)."""
+    (an int), or a list with one entry per call: True = unavailable, False = a normal read,
+    an exception instance = raise it (after the call is recorded)."""
 
     def __init__(self, cluster: FakeCluster, unavailable=0) -> None:
         self.cluster = cluster
@@ -237,7 +246,10 @@ class FakeReader:
 
     def _down(self) -> bool:
         if isinstance(self.unavailable, list):
-            return self.unavailable.pop(0) if self.unavailable else False
+            down = self.unavailable.pop(0) if self.unavailable else False
+            if isinstance(down, Exception):
+                raise down
+            return down
         if self.unavailable > 0:
             self.unavailable -= 1
             return True

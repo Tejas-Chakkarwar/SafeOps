@@ -20,6 +20,7 @@ import pytest
 
 from safeops.agent.output import AgentOutput, Termination
 from safeops.agent.parser import ProposalParser
+from safeops.cluster import GuardError
 from safeops.domain import FeatureVector, ShadowGates
 from safeops.enums import ActionType, ExecutionStatus
 from safeops.executor.executor import ActionExecutor
@@ -962,7 +963,9 @@ class _HalfWiredWriter:
 
 
 def test_a_half_wired_writer_is_a_loud_not_implemented_discard(tmp_path) -> None:
-    """A stub at write is a harness bug (D§11.3): it propagates to the runner as
+    """Defense against an adapter contract violation before any possible mutation:
+    preflight owns stage refusals (the transitional UnwiredWriter refuses there), but a
+    half-wired writer whose first write is still a stub sent nothing, so it stays loud:
     not_implemented at execute, never a quiet classified infrastructure_failure."""
     executor = unwired_executor()
     executor.writer = _HalfWiredWriter()
@@ -974,3 +977,42 @@ def test_a_half_wired_writer_is_a_loud_not_implemented_discard(tmp_path) -> None
     assert rec["discard_reason"]["stage"] == "execute"
     assert rec["discard_reason"]["cause"] == "not_implemented"
     assert rec["execution"] is None
+
+
+@pytest.mark.parametrize("script", ["guard", "stub"])
+def test_a_step2_harness_refusal_keeps_the_partial_execution_and_measures(tmp_path, script) -> None:
+    """Step 1 really mutated the ConfigMap; step 2's writer refused before sending. The
+    record keeps the partial execution (never execution: null), the executed action is
+    the original one, and stabilization, effectiveness and harm run."""
+    r, rig = _routed_runner(tmp_path, POOL, ["success", script])
+    r.run(UNIT)
+    (rec,) = _written(tmp_path)
+    assert rec["discarded"] is False and rec["action_attempted"] is True
+    assert rec["execution"]["status"] == "partially_applied"
+    assert [(s["operation"], s["status"]) for s in rec["execution"]["steps"]] == [
+        ("patch_configmap", "applied"),
+        ("restart_deployment", "skipped"),
+    ]
+    assert rig.cluster.objects[("ConfigMap", "db-pool-config")]["data"]["max_pool_size"] == "20"
+    assert rec["stabilization_timed_out"] is False and rec["postaction_snapshot_hash"]
+    assert [c[0] for c in r.effectiveness.calls] == ["verify"]
+    ((_, args, _),) = r.harm.calls
+    assert args[0].model_dump(mode="json") == POOL
+
+
+def test_step1_ambiguous_with_harness_reconciliation_is_discarded_at_executed_action(
+    tmp_path,
+) -> None:
+    r, rig = _routed_runner(tmp_path, POOL, ["ambiguous"])
+    rig.reader.unavailable = [GuardError("outside scope") for _ in range(3)]
+    with pytest.raises(PostAgentDiscard) as exc:
+        r.run(UNIT)
+    assert isinstance(exc.value.__cause__, ExecutionInfrastructureFailure)
+    (rec,) = _written(tmp_path)
+    assert rec["execution"]["status"] == "infrastructure_failure"
+    assert [(s["operation"], s["status"]) for s in rec["execution"]["steps"]] == [
+        ("patch_configmap", "failed")
+    ]
+    assert rec["discard_reason"]["stage"] == "executed_action"
+    assert rec["discard_reason"]["cause"] == "infrastructure_failure"
+    assert r.harm.calls == [] and r.effectiveness.calls == []

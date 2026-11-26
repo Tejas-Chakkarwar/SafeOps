@@ -1703,3 +1703,61 @@ An adversarial review of the M8B-1 commit found six defects or gaps, each reprod
 - Of the new tests, 70 fail against `20d3e80`. The rest pin behavior that didn't change: complete lists, `CredentialError` reconciled, and the E3 reason.
 
 **Unchanged:** every `ExecutionStatus` producer shape; the read bounds; the provisional rollback template equality (`M8B1-O7`); the schema; the information-wall roots; `config/*.yaml`, `manifests/`, `safeops/bootstrap.py` and the design document. M8B-2 is not started.
+
+## Amendment, 2026-11-25: Milestone 8B-1 execution evidence after a possible write
+
+**The defect.** The review hardening above (`c4ff01a`, finding 3) let `NotImplementedStage` and `GuardError` escape `apply()` after a write could already have reached the cluster. The run record then got `execution: null` while the cluster held a mutation. The defect was reproduced offline on three paths, for both exceptions:
+
+| Path | Then | Cluster |
+|---|---|---|
+| composite step 1 confirmed applied; step 2's `write` raises | raised out of `apply()` | ConfigMap patched |
+| composite step 1 `AMBIGUOUS`; a reconciliation read raises | raised before any classification | ConfigMap patched (the write had landed) |
+| single-step `AMBIGUOUS` (scale); a reconciliation read raises | raised; `execution: null` | replicas changed |
+
+The governing question is whether a write could already have reached the cluster, not whether a step is known to have applied.
+
+**Frozen.**
+1. **`preflight` owns every raise-class pre-send refusal:** phase, context guard, safety boundary, an unimplemented stage. A locally detected credential problem stays the classified cause D§11.3 makes it, which `write` reports as `NOT_ATTEMPTED`. After a successful preflight, every normal `write` outcome is a `WriteReply` in one of the five frozen `WriteClass` values. A `NotImplementedStage` or `GuardError` from `write` is an adapter contract violation.
+2. **Every `HARNESS_BUGS` member is guaranteed pre-send.** `HARNESS_BUGS = (NotImplementedStage, GuardError)`. A stub raises before doing anything, and the context guard raises before any command runs. The code comment on `HARNESS_BUGS` states this premise.
+3. **Adding a member requires re-evaluating the `skipped` mapping** in item 6. An exception that can be raised after a request was sent must not join `HARNESS_BUGS` without changing these semantics.
+4. **Before any write may have been sent, harness errors stay loud:**
+   - preflight refusals, `ExecutorConfigurationError` and pre-write reader errors still raise;
+   - so does a `HARNESS_BUGS` exception at the plan's first write.
+5. **After any write may have been sent, no non-interrupt failure erases execution evidence.** `apply()` returns a truthful `ExecutionResult`. `KeyboardInterrupt` and `SystemExit` still propagate, because nothing catches `BaseException`. When an earlier step is confirmed applied, the result keeps that applied step.
+6. **Step 1 confirmed, then step 2's writer raises a `HARNESS_BUGS` member:** `PARTIALLY_APPLIED`, `[patch_configmap applied, restart_deployment skipped]`.
+   - The skipped step carries no error. The bounded execution error names the contract violation.
+   - The executor maps the refusal to its existing `NOT_ATTEMPTED` outcome, which the composite table already turns into `skipped`.
+   - `skipped` is truthful only because of the premise in item 2.
+7. **Step 1 `AMBIGUOUS`, reconciliation unavailable:** `INFRASTRUCTURE_FAILURE`, `[patch_configmap failed]`, with no restart. This is the existing frozen composite step-1 ambiguous/unavailable rule (D§11.6), reached through the existing path; no new classification is added.
+8. **Step 1 applied, step 2 `AMBIGUOUS`, reconciliation unavailable:** `PARTIALLY_APPLIED`, `[patch_configmap applied, restart_deployment failed]`. Step 2 may have been sent, so it can't be `skipped`.
+9. **Single-step `AMBIGUOUS`, reconciliation unavailable:** `INFRASTRUCTURE_FAILURE`, `[<step> failed]`. Never `[]`, because the write was attempted.
+10. **A `HARNESS_BUGS` error from a reconciliation read is `UNAVAILABLE` for that read attempt only.**
+    - The after-write read path no longer re-raises it; it takes the same path as any other non-interrupt reader error.
+    - The existing bounded loop (3 attempts, 2 s apart) continues. There is no second reconciliation implementation, and the error never ends reconciliation early.
+11. **Example:** attempt 1 raises `GuardError` and attempt 2 confirms. The result is confirmed on attempt 2, after 2 reads and 1 sleep.
+
+**M8B-2** must still enforce phase, context and guard refusals in `preflight`. B1 does not rely on that alone: the core keeps the evidence even if a broken adapter raises at `write`.
+
+**Supersedes** item 3 of the review-hardening amendment above, which said `HARNESS_BUGS` "propagates from `writer.write` and from reconciliation reads". Propagation now happens only before any possible write. Finding 3's purpose stands: a stub or guard refusal is never classified as an ambiguous write.
+
+**Tests:**
+- `tests/test_m8_executor.py` §14 covers:
+  - T1 and T2 (step 2 stub or guard refusal gives `[applied, skipped]`);
+  - T5 and T6 (step 1, 3 reads, 2 sleeps, no restart);
+  - T7 and T8 (step 2, `[applied, failed]`, 3 reads, 2 sleeps);
+  - T9 and T10 (single step, `[failed]`);
+  - T11 (a harness error then confirmation gives `APPLIED`, 2 reads, 1 sleep, for each exception);
+  - the step-2 equivalent of T11, and an interrupt that still propagates.
+- The loud pins are first write (T3, T4), preflight, and pre-write reader errors for resources and rollback.
+- `tests/test_m8_integration.py` adds:
+  - a real-runner run where step 1 mutated and step 2's writer refused (`guard` and `stub`). The record is `partially_applied` `[applied, skipped]`, the executed action is the original, and stabilization, effectiveness and harm all run;
+  - a step-1 ambiguous run with three `GuardError` reconciliation reads. It is discarded at `executed_action` with `[patch_configmap failed]`.
+- The half-wired-writer test is kept, relabeled as defense against an adapter contract violation before any possible mutation.
+
+**Mutants:**
+- `M8B1-H17` restores the raise at a later write. It is killed by T1, T2 and the runner partial-preservation test, which asserts that the execution exists and step 1 is applied.
+- `M8B1-H18` restores the re-raise in the after-write read path. It is killed by T11 (`GuardError` on attempt 1 and confirmation on attempt 2 give `APPLIED`, 2 reads, 1 sleep), T9, T5 and T7.
+- `M8B1-H10` and `M8B1-H12` now target the first-write loudness.
+- `M8B1-H11` (reconciliation errors propagate) is retired: this amendment reverses its guard, and `H18` pins the new behavior. The table holds 256.
+
+**Unchanged:** every `ExecutionStatus` shape; `WriteReply`; object identity; ReplicaSet completeness; quantity totality; huge-integer handling; the schema; the information wall; and the provisional rollback template equality (`M8B1-O7`).

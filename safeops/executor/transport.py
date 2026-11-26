@@ -161,18 +161,34 @@ def prepared(
 @runtime_checkable
 class WriterTransport(Protocol):
     def preflight(self, requests: tuple[PreparedWrite, ...]) -> None:
-        """Check every request the action will send, before the first is sent. Raises for a
-        request the executor must never make (a harness bug, never a classification)."""
+        """Check every request the action will send, before the first is sent. This owns
+        every pre-send refusal that stays loud: phase, context guard, safety boundary, an
+        unimplemented stage (NotImplementedStage, GuardError, ...). It raises for a request
+        the executor must never make: a harness bug, never a classification. Nothing has
+        been written when it raises. A locally detected credential problem is not one of
+        these: D§11.3 classifies it, and write reports it as NOT_ATTEMPTED."""
 
     def write(self, request: PreparedWrite) -> WriteReply:
-        """Send one request (or not) and say what happened, semantically. A returned object
-        is the API server's object as returned, with its kind, metadata.name and
-        metadata.namespace. Raises only a harness bug (NotImplementedStage, GuardError);
-        every refusal of that kind belongs in preflight (D§11.3)."""
+        """Send one request (or not) and say what happened, semantically. After a successful
+        preflight every normal outcome is a WriteReply in one of the five WriteClass values.
+        A returned object is the API server's object as returned, with its kind,
+        metadata.name and metadata.namespace.
+
+        A NotImplementedStage or GuardError raised here is an adapter contract violation (a
+        harness bug), not a transport outcome. The core still keeps the execution evidence
+        if a broken adapter raises one: loud before any write may have been sent; after
+        one, that request counts as not attempted."""
 
 
 @runtime_checkable
 class ReaderTransport(Protocol):
+    """Pre-write reads (rollback history, the container check): a harness error raised by
+    the reader stays loud (nothing has been sent). Post-write reconciliation must not let
+    a harness error erase a write that may already have happened: a GuardError,
+    NotImplementedStage or any other non-interrupt reader error makes THAT INDIVIDUAL
+    ATTEMPT unavailable, inside the bounded retry loop. It is never a terminal
+    reconciliation failure."""
+
     def get(self, kind: str, name: str, namespace: str, timeout_s: float) -> ReadReply:
         """One attempt to read one object. FOUND carries it as the server returned it, with
         its kind, metadata.name and metadata.namespace."""

@@ -1382,7 +1382,10 @@ def _stub_error():
 
 
 @pytest.mark.parametrize("make", [_stub_error, _guard_error], ids=["stub", "guard"])
-def test_a_harness_bug_at_write_propagates_instead_of_becoming_ambiguous(make) -> None:
+def test_a_harness_bug_at_the_first_write_stays_loud(make) -> None:
+    """T3/T4. Defense against an adapter contract violation BEFORE any possible mutation:
+    preflight owns these refusals, but a writer that raises one at its first write has sent
+    nothing (the HARNESS_BUGS premise), so it propagates like a preflight refusal."""
     rig = Rig()
     exc = make()
 
@@ -1398,19 +1401,22 @@ def test_a_harness_bug_at_write_propagates_instead_of_becoming_ambiguous(make) -
 
 
 @pytest.mark.parametrize("make", [_stub_error, _guard_error], ids=["stub", "guard"])
-def test_a_harness_bug_in_reconciliation_propagates_instead_of_becoming_unavailable(
-    make,
-) -> None:
-    rig = Rig(["ambiguous"])
-    exc = make()
+def test_a_harness_bug_in_preflight_stays_loud(make) -> None:
+    rig = Rig(preflight_raises=make())
+    with pytest.raises(type(rig.writer.preflight_raises)):
+        rig.apply(patch_configmap({"max_pool_size": 20}))
+    assert not rig.writer.writes
 
-    def get(*args):
-        raise exc
 
-    rig.reader.get = get
-    with pytest.raises(type(exc)):
-        rig.apply(scale(3))
-    assert not rig.sleeps  # not retried as an unavailable read
+@pytest.mark.parametrize("make", [_stub_error, _guard_error], ids=["stub", "guard"])
+@pytest.mark.parametrize(
+    "act", [resources(requests={"cpu_millis": 200}), rollback(1)], ids=["resources", "rollback"]
+)
+def test_a_harness_bug_in_a_pre_write_read_stays_loud(make, act) -> None:
+    rig = Rig(unavailable=[make()])
+    with pytest.raises(type(make())):
+        rig.apply(act)
+    assert not rig.writer.preflights and not rig.writer.writes
 
 
 def test_a_credential_error_at_write_is_not_a_harness_bug() -> None:
@@ -1475,3 +1481,89 @@ def test_an_unprintable_revision_never_matches_an_unannotated_replicaset() -> No
     result = rig.apply(rollback(10**5000))
     assert _shape(result) == (S.REFUSED_BY_ENVELOPE, [])
     assert "is not in Deployment/orders's history" in result.error
+
+
+# --- 14. evidence after a possible write (M8B-1 review fix) ---------------------------------
+#
+# Once any write may have been sent, no non-interrupt exception escapes apply(): a
+# HARNESS_BUGS refusal at a later write is that write not attempted (`skipped`), and one in
+# a reconciliation read is ONE unavailable attempt inside the bounded loop.
+
+HARNESS = {"guard": _guard_error, "stub": _stub_error}
+
+
+@pytest.mark.parametrize("script", ["stub", "guard"], ids=["T1-stub", "T2-guard"])
+def test_a_step2_harness_refusal_keeps_the_applied_step1(script) -> None:
+    rig = Rig(["success", script])
+    result = rig.apply(patch_configmap({"max_pool_size": 20}))
+    assert _shape(result) == (
+        S.PARTIALLY_APPLIED,
+        [("patch_configmap", "applied"), ("restart_deployment", "skipped")],
+    )
+    assert result.steps[1].error is None  # skipped carries no error; the execution does
+    assert "not attempted" in result.error and "contract violation" in result.error
+    assert rig.cluster.objects[("ConfigMap", "db-pool-config")]["data"]["max_pool_size"] == "20"
+    assert len(rig.writer.writes) == 2 and not rig.reader.calls
+
+
+@pytest.mark.parametrize("name", HARNESS, ids=["T6-stub", "T5-guard"])
+def test_step1_ambiguous_with_harness_reconciliation_is_the_frozen_step1_failure(name) -> None:
+    rig = Rig(["ambiguous"], unavailable=[HARNESS[name]() for _ in range(READ_ATTEMPTS)])
+    result = rig.apply(patch_configmap({"max_pool_size": 20}))
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [("patch_configmap", "failed")])
+    assert "unresolved" in result.error
+    assert len(rig.reader.calls) == 3 and rig.sleeps == [2, 2]
+    assert [w.operation.value for w in rig.writer.writes] == ["patch_configmap"]  # no restart
+
+
+@pytest.mark.parametrize("name", HARNESS, ids=["T8-stub", "T7-guard"])
+def test_step2_ambiguous_with_harness_reconciliation_is_partial_failed(name) -> None:
+    rig = Rig(["success", "ambiguous"], unavailable=[HARNESS[name]() for _ in range(3)])
+    result = rig.apply(patch_configmap({"max_pool_size": 20}))
+    assert _shape(result) == (
+        S.PARTIALLY_APPLIED,
+        [("patch_configmap", "applied"), ("restart_deployment", "failed")],
+    )
+    assert "unresolved" in result.error and result.steps[1].error == result.error
+    assert len(rig.reader.calls) == 3 and rig.sleeps == [2, 2]
+
+
+@pytest.mark.parametrize("name", HARNESS, ids=["T10-stub", "T9-guard"])
+def test_single_step_ambiguous_with_harness_reconciliation_is_a_failed_step(name) -> None:
+    rig = Rig(["ambiguous"], unavailable=[HARNESS[name]() for _ in range(3)])
+    result = rig.apply(scale(5))
+    assert _shape(result) == (S.INFRASTRUCTURE_FAILURE, [("scale_deployment", "failed")])
+    assert "unresolved" in result.error
+    assert len(rig.reader.calls) == 3 and rig.sleeps == [2, 2]
+
+
+@pytest.mark.parametrize("name", HARNESS, ids=["T11-stub", "T11-guard"])
+def test_a_harness_reconciliation_error_is_one_unavailable_attempt_then_confirmed(name) -> None:
+    """T11: a harness error in reconciliation is UNAVAILABLE for that attempt only; the
+    bounded loop goes on, and the next read confirms."""
+    rig = Rig(["ambiguous"], unavailable=[HARNESS[name](), False])
+    result = rig.apply(scale(5))
+    assert _shape(result) == (S.APPLIED, [("scale_deployment", "applied")])
+    assert len(rig.reader.calls) == 2 and rig.sleeps == [2]
+
+
+@pytest.mark.parametrize("name", HARNESS, ids=["stub", "guard"])
+def test_step2_harness_reconciliation_error_then_confirmed_is_applied(name) -> None:
+    rig = Rig(["success", "ambiguous"], unavailable=[HARNESS[name](), False])
+    result = rig.apply(patch_configmap({"max_pool_size": 20}))
+    assert _shape(result) == (
+        S.APPLIED,
+        [("patch_configmap", "applied"), ("restart_deployment", "applied")],
+    )
+    assert len(rig.reader.calls) == 2 and rig.sleeps == [2]
+
+
+def test_an_interrupt_in_reconciliation_still_propagates() -> None:
+    rig = Rig(["ambiguous"])
+
+    def get(*args):
+        raise KeyboardInterrupt
+
+    rig.reader.get = get
+    with pytest.raises(KeyboardInterrupt):
+        rig.apply(scale(5))

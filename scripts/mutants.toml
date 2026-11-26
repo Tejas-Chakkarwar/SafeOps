@@ -3637,36 +3637,17 @@ new = '''
 id = "M8B1-H10"
 source = "0025 M8B-1 review hardening"
 target = "safeops/executor/executor.py"
-guard = "a harness bug at write propagates, never an ambiguous write (finding 3)"
+guard = "a harness bug at the first write (nothing possibly sent) stays loud, never an ambiguous write (finding 3)"
 kills = [
-    "tests/test_m8_executor.py::test_a_harness_bug_at_write_propagates_instead_of_becoming_ambiguous[stub]",
+    "tests/test_m8_executor.py::test_a_harness_bug_at_the_first_write_stays_loud[stub]",
     "tests/test_m8_integration.py::test_a_half_wired_writer_is_a_loud_not_implemented_discard",
 ]
 old = '''
             reply = self.writer.write(request)
-        except HARNESS_BUGS:
-            raise'''
+        except HARNESS_BUGS as exc:'''
 new = '''
             reply = self.writer.write(request)
-        except ZeroDivisionError:
-            raise'''
-
-[[mutant]]
-id = "M8B1-H11"
-source = "0025 M8B-1 review hardening"
-target = "safeops/executor/executor.py"
-guard = "a harness bug in a reconciliation read propagates, never an unavailable read (finding 3)"
-kills = [
-    "tests/test_m8_executor.py::test_a_harness_bug_in_reconciliation_propagates_instead_of_becoming_unavailable[stub]",
-]
-old = '''
-            reply = call()
-        except HARNESS_BUGS:
-            raise'''
-new = '''
-            reply = call()
-        except ZeroDivisionError:
-            raise'''
+        except ZeroDivisionError as exc:'''
 
 [[mutant]]
 id = "M8B1-H12"
@@ -3674,7 +3655,7 @@ source = "0025 M8B-1 review hardening"
 target = "safeops/executor/executor.py"
 guard = "a context-guard refusal is a harness bug, like a stub (finding 3; D§11.3)"
 kills = [
-    "tests/test_m8_executor.py::test_a_harness_bug_at_write_propagates_instead_of_becoming_ambiguous[guard]",
+    "tests/test_m8_executor.py::test_a_harness_bug_at_the_first_write_stays_loud[guard]",
 ]
 old = '''
 HARNESS_BUGS = (NotImplementedStage, GuardError)'''
@@ -3738,3 +3719,42 @@ old = '''
                     f"{section}.{field} {_show(value)} is outside'''
 new = '''
                     f"{section}.{field} {value} is outside'''
+
+[[mutant]]
+id = "M8B1-H17"
+source = "0025 M8B-1 possible-write evidence"
+target = "safeops/executor/executor.py"
+guard = "after a possible write, a later write's HARNESS_BUGS refusal is that write not attempted (skipped); the known-applied step 1 and the execution survive"
+kills = [
+    "tests/test_m8_executor.py::test_a_step2_harness_refusal_keeps_the_applied_step1[T1-stub]",
+    "tests/test_m8_executor.py::test_a_step2_harness_refusal_keeps_the_applied_step1[T2-guard]",
+    "tests/test_m8_integration.py::test_a_step2_harness_refusal_keeps_the_partial_execution_and_measures[guard]",
+]
+old = '''
+            if not after_possible_write:
+                raise'''
+new = '''
+            if True:
+                raise'''
+
+[[mutant]]
+id = "M8B1-H18"
+source = "0025 M8B-1 possible-write evidence"
+target = "safeops/executor/executor.py"
+guard = "a post-write HARNESS_BUGS reader error is one unavailable attempt inside the bounded loop, never an escaping or terminal event"
+kills = [
+    "tests/test_m8_executor.py::test_a_harness_reconciliation_error_is_one_unavailable_attempt_then_confirmed[T11-guard]",
+    "tests/test_m8_executor.py::test_single_step_ambiguous_with_harness_reconciliation_is_a_failed_step[T9-guard]",
+    "tests/test_m8_executor.py::test_step1_ambiguous_with_harness_reconciliation_is_the_frozen_step1_failure[T5-guard]",
+    "tests/test_m8_executor.py::test_step2_ambiguous_with_harness_reconciliation_is_partial_failed[T7-guard]",
+]
+old = '''
+            reply = call()
+        except Exception as exc:
+            return ReadReply(ReadOutcome.UNAVAILABLE'''
+new = '''
+            reply = call()
+        except HARNESS_BUGS:
+            raise
+        except Exception as exc:
+            return ReadReply(ReadOutcome.UNAVAILABLE'''
