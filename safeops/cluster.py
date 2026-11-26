@@ -12,10 +12,12 @@ kubectl (decisions 0002, 0006, 0009).
   the agent's tools and the executor's pre-write reads and reconciliation (decision 0025
   D§11.7).
 - Executor is SafeOps' write identity, safeops-executor (design §4, Milestone 8; decision
-  0025 D§14): its own token, never another identity's credential, and exactly one capability,
-  `Kubectl.patch` on a Deployment, Service or ConfigMap in the testbed namespace. It makes no
-  read of its own (no get, list, watch, api-resources, auth or raw call), and no other
-  mutation (no apply, create, replace, delete, token or subresource).
+  0025 D§14): its own token, never another identity's credential. On `Kubectl` the phase is a
+  refusal-only ceiling: every read (get, list, watch, logs, api-resources, auth, raw) and every
+  mutation method refuses it. Its one capability, a PATCH of a Deployment, Service or
+  ConfigMap in the testbed namespace, is the direct HTTPS request in safeops.kube_patch
+  (0025, M8B-2 STOP resolution: kubectl patch GETs the object first, and the executor may
+  not read).
 - Kubernetes-object mutations go through `check_object`. Runtime allows the testbed
   namespace only; executor the testbed namespace and its three kinds only; bootstrap allows
   its namespaces plus an exactly recorded set of cluster-scoped objects
@@ -369,17 +371,28 @@ def decode_raw(data: bytes | str | None) -> str:
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
-@dataclass(frozen=True)
-class ProcessResult:
-    """What one guarded kubectl process did, uninterpreted (the executor's adapter reads it).
-    Exactly one of: it never started (spawn_error), it timed out (timed_out), or it exited
-    (returncode). Output is decoded text; it never holds a credential (kubectl prints none)."""
-
-    returncode: int | None
-    stdout: str = ""
-    stderr: str = ""
-    timed_out: bool = False
-    spawn_error: str | None = None
+def verify_api_server(cfg: ClusterConfig, server: str, runner: Runner) -> None:
+    """`server` must be the loopback API server Docker publishes for this cluster's kind node
+    (review C3): a context name alone proves nothing. GuardError otherwise. Shared by the
+    kubectl client and the executor's direct PATCH (decision 0025, M8B-2 STOP resolution)."""
+    node = f"{cfg.cluster_name}-control-plane"
+    proc = runner(
+        ["docker", "port", node, "6443/tcp"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    published = {
+        f"https://{line.strip()}"
+        for line in (proc.stdout or "").splitlines()
+        if line.strip().startswith("127.0.0.1:")
+    }
+    if proc.returncode != 0 or server not in published:
+        raise GuardError(
+            f"context {cfg.kube_context!r} points at {server}, which is not the API"
+            f" server Docker publishes for kind node {node!r}; refusing to run anything"
+        )
 
 
 class Kubectl:
@@ -444,24 +457,7 @@ class Kubectl:
             raise CredentialError(
                 f"{Path(self.kubeconfig).name} has no usable {self.cfg.kube_context!r} context"
             ) from exc
-        node = f"{self.cfg.cluster_name}-control-plane"
-        proc = self._run(
-            ["docker", "port", node, "6443/tcp"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        published = {
-            f"https://{line.strip()}"
-            for line in (proc.stdout or "").splitlines()
-            if line.strip().startswith("127.0.0.1:")
-        }
-        if proc.returncode != 0 or server not in published:
-            raise GuardError(
-                f"context {self.cfg.kube_context!r} points at {server}, which is not the API"
-                f" server Docker publishes for kind node {node!r}; refusing to run anything"
-            )
+        verify_api_server(self.cfg, server, self._run)
         self._identity_verified = True
 
     def _exec(
@@ -497,10 +493,13 @@ class Kubectl:
         return stdout
 
     def _refuse_executor(self, what: str) -> None:
-        """The executor phase has one capability, `patch`; everything else is refused here,
-        before any command runs."""
+        """On Kubectl the executor phase is refusal-only: everything is refused here, before
+        any command runs. Its one capability, the PATCH, is safeops.kube_patch."""
         if self.phase is Phase.EXECUTOR:
-            raise GuardError(f"the executor identity may only patch; {what} is refused")
+            raise GuardError(
+                f"the executor identity may only patch, and only through its direct API"
+                f" request; {what} is refused"
+            )
 
     def read(self, *args: str, timeout: float = 120) -> str:
         """Run a read-only kubectl command. Caller arguments can't override the identity."""
@@ -691,79 +690,6 @@ class Kubectl:
                 ["replace", "--raw", path, "-f", "-"], stdin=json.dumps(body or {}), timeout=timeout
             )
         raise GuardError(f"raw {method} is not supported")
-
-    def patch(
-        self,
-        *,
-        kind: str,
-        name: str,
-        namespace: str,
-        patch_type: str,
-        body_json: str,
-        timeout_s: float,
-    ) -> ProcessResult:
-        """The executor's one capability (decision 0025 D§14): `kubectl patch` of one object,
-        returning the patched object as JSON, with kubectl's request log (-v=6: method, URL and
-        HTTP status of each request; never a header or a token) on stderr for the adapter.
-
-        Guarded before anything runs: the executor phase only; a structured kind, name,
-        namespace, patch type and JSON body, never caller argv; the object checked with
-        `check_object` directly. Never `_check_objects`: that asks the API server for its
-        cluster-scoped kinds (`kubectl api-resources`), a read the executor must never make, and
-        the executor's three kinds are fixed and namespaced.
-
-        Never raises for a process outcome: exit status, timeout and a failure to start are
-        returned as a ProcessResult. A guard refusal or an unusable identity raises (nothing
-        was sent)."""
-        import re
-
-        if self.phase is not Phase.EXECUTOR:
-            raise GuardError("only the executor identity patches through Kubectl.patch")
-        resource = EXECUTOR_RESOURCES.get(kind)
-        if resource is None:
-            raise GuardError(f"the executor may not patch kind {kind!r}")
-        if type(name) is not str or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", name):
-            raise GuardError(f"invalid object name {name!r}")
-        if patch_type not in EXECUTOR_PATCH_TYPES:
-            raise GuardError(f"patch type {patch_type!r} is not json, merge or strategic")
-        try:
-            parsed = json.loads(body_json)
-        except (TypeError, ValueError) as exc:
-            raise GuardError("the patch body is not JSON") from exc
-        if type(parsed) is not (list if patch_type == "json" else dict):
-            raise GuardError(f"a {patch_type} patch body has the wrong JSON shape")
-        check_object(self.cfg, self.phase, kind=kind, name=name, namespace=namespace)
-        self._verify_identity()
-        args = [
-            "patch",
-            resource,
-            name,
-            "-n",
-            namespace,
-            "--type",
-            patch_type,
-            "-p",
-            body_json,
-            "-o",
-            "json",
-            "-v=6",
-            f"--request-timeout={int(timeout_s)}s",
-        ]
-        try:
-            proc = self._run(
-                self.base_args() + args,
-                capture_output=True,
-                text=False,
-                timeout=timeout_s + 5,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return ProcessResult(
-                None, decode_raw(exc.stdout), decode_raw(exc.stderr), timed_out=True
-            )
-        except OSError as exc:  # kubectl never started: nothing was sent
-            return ProcessResult(None, spawn_error=f"{type(exc).__name__}: {exc}")
-        return ProcessResult(proc.returncode, decode_raw(proc.stdout), decode_raw(proc.stderr))
 
 
 # --- workload generator proxy --------------------------------------------------------

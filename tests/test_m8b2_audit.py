@@ -226,7 +226,7 @@ def _wired(tmp_path, script=(), cluster=None):
         topology=TOPOLOGY,
         namespace=NS,
         reader=KubernetesReaderTransport(cfg, runner=run),
-        writer=KubernetesWriterTransport(cfg, sink, runner=run),
+        writer=KubernetesWriterTransport(cfg, sink, runner=run, connect=run.connect),
         audit=sink,
         sleep=lambda s: None,
     )
@@ -497,7 +497,7 @@ def test_an_after_write_failure_after_a_sent_patch_is_still_applied(tmp_path, fa
         topology=TOPOLOGY,
         namespace=NS,
         reader=KubernetesReaderTransport(cfg, runner=run),
-        writer=KubernetesWriterTransport(cfg, sink, runner=run),
+        writer=KubernetesWriterTransport(cfg, sink, runner=run, connect=run.connect),
         audit=sink,
     )
     result = executor.apply(scale(7))
@@ -527,7 +527,7 @@ def test_a_missing_executor_credential_through_apply_is_an_unsent_infra_failure(
         topology=TOPOLOGY,
         namespace=NS,
         reader=KubernetesReaderTransport(cfg, runner=run),
-        writer=KubernetesWriterTransport(cfg, sink, runner=run),
+        writer=KubernetesWriterTransport(cfg, sink, runner=run, connect=run.connect),
         audit=sink,
     )
     result = executor.apply(POOL)
@@ -599,7 +599,7 @@ def test_build_runner_is_free_of_credentials_clients_and_files(tmp_path, monkeyp
 
     monkeypatch.setattr(subprocess, "run", no_process)
     r = runner_module.build_runner()
-    assert r.executor.writer._kubectl is None and r.executor.reader._kubectl is None
+    assert r.executor.writer._client is None and r.executor.reader._kubectl is None
     assert not Path(r.executor.audit.root).exists()
     with pytest.raises(HarnessMisuse):
         r.executor.audit.require_bound()

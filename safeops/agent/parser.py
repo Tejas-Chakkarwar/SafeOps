@@ -18,7 +18,6 @@ valid_action and no_action, a Proposal.
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 
@@ -26,6 +25,7 @@ from safeops.actions import ACTION_KEYS, exact_int, params_problem, target_probl
 from safeops.agent.output import AgentOutput, Termination
 from safeops.domain import ActionTarget, Proposal, RecommendedAction
 from safeops.enums import ActionType, ProposalStatus
+from safeops.jsonutil import MalformedJSON, strict_json_object
 
 PROPOSAL_KEYS = frozenset(
     {"diagnosis", "recommended_action", "confidence", "evidence", "prerequisites_claimed"}
@@ -62,46 +62,9 @@ class ParsedProposal:
         return {"proposal_status": self.status.value, "proposal": proposal}
 
 
-class _Malformed(ValueError):
-    """Model-written content the strict JSON boundary refuses."""
-
-
-def _no_duplicates(pairs: list[tuple[str, object]]) -> dict:
-    keys = [k for k, _ in pairs]
-    if len(keys) != len(set(keys)):
-        raise _Malformed("duplicate key")
-    return dict(pairs)
-
-
-def _refuse_constant(token: str) -> float:
-    raise _Malformed(f"non-finite token {token}")
-
-
-def _finite_float(text: str) -> float:
-    value = float(text)
-    if not math.isfinite(value):
-        raise _Malformed(f"number {text} is not finite")
-    return value
-
-
-def strict_json_object(text: str) -> dict:
-    """The whole (trimmed) text as exactly one JSON object, or _Malformed."""
-    try:
-        value = json.loads(
-            text.strip(),
-            object_pairs_hook=_no_duplicates,
-            parse_constant=_refuse_constant,
-            parse_float=_finite_float,
-        )
-    except _Malformed:
-        raise
-    except (ValueError, RecursionError) as exc:
-        # JSONDecodeError is a ValueError; so is Python's int-digit limit on a huge integer
-        # literal. Both, and absurd nesting, are model content, never a harness failure.
-        raise _Malformed(f"not one JSON value: {exc}") from None
-    if type(value) is not dict:
-        raise _Malformed("the answer is not a JSON object")
-    return value
+# The strict JSON boundary is the neutral hardened parser (safeops.jsonutil), re-exported here
+# so `safeops.agent.parser.strict_json_object` keeps working; _Malformed is its exception.
+_Malformed = MalformedJSON
 
 
 def _proposal(obj: dict, steps: int) -> Proposal | None:

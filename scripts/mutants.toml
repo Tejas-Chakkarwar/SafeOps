@@ -1618,7 +1618,7 @@ new = '''
 [[mutant]]
 id = "M8A1-P1"
 source = "0025 M8A-1 parser/routing"
-target = "safeops/agent/parser.py"
+target = "safeops/jsonutil.py"
 guard = "duplicate JSON keys are refused while parsing, at every level"
 kills = [
     "tests/test_m8_parser.py::test_duplicate_top_level_key",
@@ -1628,11 +1628,10 @@ old = '''
             object_pairs_hook=_no_duplicates,'''
 new = '''
             object_pairs_hook=dict,'''
-
 [[mutant]]
 id = "M8A1-P2"
 source = "0025 M8A-1 parser/routing"
-target = "safeops/agent/parser.py"
+target = "safeops/jsonutil.py"
 guard = "the JSON boundary refuses NaN, Infinity and -Infinity"
 kills = [
     "tests/test_m8_parser.py::test_the_json_boundary_refuses_non_finite_values_itself",
@@ -1641,22 +1640,22 @@ old = '''
             parse_constant=_refuse_constant,'''
 new = '''
 '''
-
 [[mutant]]
 id = "M8A1-P3"
 source = "0025 M8A-1 parser/routing"
-target = "safeops/agent/parser.py"
+target = "safeops/jsonutil.py"
 guard = "the JSON boundary refuses numbers that overflow to infinity"
 kills = [
     "tests/test_m8_parser.py::test_the_json_boundary_refuses_numbers_that_overflow_to_infinity",
 ]
 old = '''
-    if not math.isfinite(value):
-        raise _Malformed(f"number {text} is not finite")'''
-new = '''
-    if False:
-        raise _Malformed(f"number {text} is not finite")'''
 
+    if not math.isfinite(value):
+        raise MalformedJSON(f"number {text} is not finite")'''
+new = '''
+
+    if False:
+        raise MalformedJSON(f"number {text} is not finite")'''
 [[mutant]]
 id = "M8A1-P4"
 source = "0025 M8A-1 parser/routing"
@@ -3810,30 +3809,27 @@ source = "0025 M8B-2 executor boundary"
 target = "safeops/cluster.py"
 guard = "the executor client refuses every read verb"
 kills = [
-    "tests/test_m8b2_client.py::test_the_executor_client_refuses_everything_but_patch[get]",
+    "tests/test_m8b2_client.py::test_the_executor_kubectl_client_refuses_everything[get]",
 ]
 old = '''
         """Run a read-only kubectl command. Caller arguments can't override the identity."""
         self._refuse_executor("a read")'''
 new = '''
         """Run a read-only kubectl command. Caller arguments can't override the identity."""'''
-
 [[mutant]]
 id = "M8B2-C4"
 source = "0025 M8B-2 executor boundary"
-target = "safeops/cluster.py"
-guard = "Kubectl.patch checks its object with check_object before any process runs"
+target = "safeops/kube_patch.py"
+guard = "the direct PATCH checks its object with check_object before any connection"
 kills = [
-    "tests/test_m8b2_client.py::test_the_patch_guard_refuses_before_any_process[Deployment-orders-safeops-system-merge-{}]",
+    "tests/test_m8b2_http.py::test_the_patch_guard_refuses_before_any_process[overrides3]",
+    "tests/test_m8b2_http.py::test_the_request_is_checked_with_check_object_directly",
 ]
 old = '''
-
-        check_object(self.cfg, self.phase, kind=kind, name=name, namespace=namespace)
-        self._verify_identity()'''
+        check_object(self.cfg, Phase.EXECUTOR, kind=kind, name=name, namespace=namespace)
+'''
 new = '''
-
-        self._verify_identity()'''
-
+'''
 [[mutant]]
 id = "M8B2-C5"
 source = "0025 M8B-2 executor boundary"
@@ -3888,12 +3884,13 @@ kills = [
     "tests/test_m8b2_audit.py::test_build_runner_is_free_of_credentials_clients_and_files",
 ]
 old = '''
-        self._kubectl: Kubectl | None = None
+        self._client: ExecutorPatchClient | None = None
         self._preflighted'''
 new = '''
-        self._kubectl: Kubectl | None = Kubectl(cfg, Phase.EXECUTOR, runner=runner)
+        self._client: ExecutorPatchClient | None = ExecutorPatchClient(
+            cfg, runner=runner, connect=connect, now=now
+        )
         self._preflighted'''
-
 [[mutant]]
 id = "M8B2-L2"
 source = "0025 M8B-2 executor boundary"
@@ -3930,27 +3927,26 @@ source = "0025 M8B-2 executor boundary"
 target = "safeops/executor/kubernetes.py"
 guard = "a 422 from the PATCH is INVALID_ACTION"
 kills = [
-    "tests/test_m8b2_client.py::test_a_422_is_invalid_action_with_kubectl_s_own_text",
+    "tests/test_m8b2_http.py::test_a_422_invalid_status_is_invalid_action_with_the_server_s_message",
     "tests/test_m8b2_audit.py::test_a_real_422_through_the_writer_is_rejected_and_unchanged",
 ]
 old = '''
     if status == 422:'''
 new = '''
     if status == 4220:'''
-
 [[mutant]]
 id = "M8B2-W2"
 source = "0025 M8B-2 executor boundary"
 target = "safeops/executor/kubernetes.py"
 guard = "a 5xx from the PATCH is AMBIGUOUS (may have applied), never a definite failure"
 kills = [
+    "tests/test_m8b2_http.py::test_the_http_outcome_decides_the_class[500--False-ambiguous]",
     "tests/test_m8b2_client.py::test_every_process_outcome_is_a_reply_with_an_after_entry[server-ambiguous]",
 ]
 old = '''
     if 400 <= status < 500:'''
 new = '''
     if 400 <= status < 600:'''
-
 [[mutant]]
 id = "M8B2-W3"
 source = "0025 M8B-2 executor boundary"
@@ -3968,7 +3964,7 @@ new = '''
 id = "M8B2-A1"
 source = "0025 M8B-2 executor boundary"
 target = "safeops/executor/kubernetes.py"
-guard = "the before_write entry is made durable before the patch process runs"
+guard = "the before_write entry is made durable before the PATCH is sent"
 kills = [
     "tests/test_m8b2_client.py::test_the_before_write_entry_is_durable_before_the_patch_runs",
 ]
@@ -3987,7 +3983,7 @@ old = '''
             executor_credential(self.cfg, self._now)
         except CredentialUnavailable as exc:
             return self._after(request, WriteReply(WriteClass.NOT_ATTEMPTED, diagnostic=str(exc)))
-        if self._kubectl is None:
+        if self._client is None:
             return self._after(
                 request,
                 WriteReply(
@@ -3997,7 +3993,7 @@ old = '''
                 ),
             )
         try:
-            process = self._kubectl.patch(
+            exchange = self._client.patch(
                 kind=request.kind,
                 name=request.name,
                 namespace=request.namespace,
@@ -4006,18 +4002,18 @@ old = '''
                 timeout_s=WRITE_TIMEOUT_S,
             )
         except GuardError:
-            raise  # the client guard refused before running anything: a harness bug
-        except Exception as exc:  # the patch process may have run
+            raise  # the request guard refused before anything was sent: a harness bug
+        except Exception as exc:  # unexpected: the PATCH may have been sent
             reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"{type(exc).__name__}: {exc}")
         else:
-            reply = classify_patch(process, request)
+            reply = classify_exchange(exchange)  # one PATCH, never retried
 '''
 new = '''
         try:
             executor_credential(self.cfg, self._now)
         except CredentialUnavailable as exc:
             return self._after(request, WriteReply(WriteClass.NOT_ATTEMPTED, diagnostic=str(exc)))
-        if self._kubectl is None:
+        if self._client is None:
             return self._after(
                 request,
                 WriteReply(
@@ -4027,7 +4023,7 @@ new = '''
                 ),
             )
         try:
-            process = self._kubectl.patch(
+            exchange = self._client.patch(
                 kind=request.kind,
                 name=request.name,
                 namespace=request.namespace,
@@ -4036,14 +4032,13 @@ new = '''
                 timeout_s=WRITE_TIMEOUT_S,
             )
         except GuardError:
-            raise  # the client guard refused before running anything: a harness bug
-        except Exception as exc:  # the patch process may have run
+            raise  # the request guard refused before anything was sent: a harness bug
+        except Exception as exc:  # unexpected: the PATCH may have been sent
             reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"{type(exc).__name__}: {exc}")
         else:
             self.audit.before_write(request, self.identity)
-            reply = classify_patch(process, request)
+            reply = classify_exchange(exchange)  # one PATCH, never retried
 '''
-
 [[mutant]]
 id = "M8B2-A2"
 source = "0025 M8B-2 executor boundary"
@@ -4308,3 +4303,291 @@ old = '''
 _FORBIDDEN_ROOT_DIRS = ("data/runs/", "data/executor_audit/", ".safeops/", "reference/")'''
 new = '''
 _FORBIDDEN_ROOT_DIRS = ("data/runs/", ".safeops/", "reference/")'''
+
+# --- Milestone 8B-2 STOP resolution: the executor's direct HTTPS PATCH (decision 0025) ------
+
+[[mutant]]
+id = "M8B2-HTTP1"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "the executor's one request is a PATCH: never a GET (patch-only RBAC)"
+kills = [
+    "tests/test_m8b2_http.py::test_each_kind_is_one_patch_to_its_exact_path[Deployment-orders-/apis/apps/v1/namespaces/testbed/deployments/orders]",
+]
+old = '''
+            conn.putrequest("PATCH", path, skip_accept_encoding=True)'''
+new = '''
+            conn.putrequest("GET", path, skip_accept_encoding=True)'''
+
+[[mutant]]
+id = "M8B2-HTTP2"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "a Deployment is patched at /apis/apps/v1/namespaces/{ns}/deployments/{name}"
+kills = [
+    "tests/test_m8b2_http.py::test_each_kind_is_one_patch_to_its_exact_path[Deployment-orders-/apis/apps/v1/namespaces/testbed/deployments/orders]",
+]
+old = '''
+    "Deployment": ("/apis/apps/v1", "deployments"),'''
+new = '''
+    "Deployment": ("/api/v1", "deployments"),'''
+
+[[mutant]]
+id = "M8B2-HTTP3"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "a Service (and ConfigMap) is patched at the core /api/v1 path"
+kills = [
+    "tests/test_m8b2_http.py::test_each_kind_is_one_patch_to_its_exact_path[Service-orders-svc-/api/v1/namespaces/testbed/services/orders-svc]",
+]
+old = '''
+    "Service": ("/api/v1", "services"),'''
+new = '''
+    "Service": ("/apis/v1", "services"),'''
+
+[[mutant]]
+id = "M8B2-HTTP4"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "a merge patch is sent as application/merge-patch+json"
+kills = [
+    "tests/test_m8b2_http.py::test_the_media_type_is_exact_per_patch_type[merge-application/merge-patch+json-{\"spec\":{\"replicas\":4}}]",
+]
+old = '''
+    "merge": "application/merge-patch+json",'''
+new = '''
+    "merge": "application/json",'''
+
+[[mutant]]
+id = "M8B2-HTTP5"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "TLS verification stays on: CERT_REQUIRED and hostname checking"
+kills = [
+    "tests/test_m8b2_http.py::test_the_tls_context_trusts_only_the_pinned_ca_and_checks_the_hostname",
+]
+old = '''
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True'''
+new = '''
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE'''
+
+[[mutant]]
+id = "M8B2-HTTP6"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "an error message is scrubbed of the bearer token before it becomes evidence"
+kills = [
+    "tests/test_m8b2_http.py::test_an_error_message_holding_the_token_is_scrubbed",
+]
+old = '''
+        text = text.replace(self.__token, "<redacted>")
+'''
+new = '''
+'''
+
+[[mutant]]
+id = "M8B2-HTTP7"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/executor/kubernetes.py"
+guard = "a 422 is INVALID_ACTION only for a complete Status whose reason is Invalid"
+kills = [
+    "tests/test_m8b2_http.py::test_the_http_outcome_decides_the_class[422-body11-False-definite_failure]",
+    "tests/test_m8b2_http.py::test_the_http_outcome_decides_the_class[422-{\"kind\": \"Deployment\", \"reason\": \"Invalid\"}-False-definite_failure]",
+]
+old = '''
+    return obj.get("kind") == "Status" and obj.get("reason") == "Invalid"'''
+new = '''
+    return True'''
+
+[[mutant]]
+id = "M8B2-HTTP8"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/executor/kubernetes.py"
+guard = "a 5xx (or any unknown status) is AMBIGUOUS, never a definite failure"
+kills = [
+    "tests/test_m8b2_http.py::test_the_http_outcome_decides_the_class[500--False-ambiguous]",
+    "tests/test_m8b2_client.py::test_every_process_outcome_is_a_reply_with_an_after_entry[server-ambiguous]",
+]
+old = '''
+    return WriteReply(WriteClass.AMBIGUOUS, diagnostic=detail)  # 5xx, or anything else'''
+new = '''
+    return WriteReply(WriteClass.DEFINITE_FAILURE, diagnostic=detail)  # 5xx, or anything else'''
+
+[[mutant]]
+id = "M8B2-HTTP9"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/executor/kubernetes.py"
+guard = "an ambiguous write is never retried: one PATCH per request"
+kills = [
+    "tests/test_m8b2_http.py::test_an_ambiguous_write_is_never_retried[server]",
+]
+old = '''
+            reply = classify_exchange(exchange)  # one PATCH, never retried
+'''
+new = '''
+            reply = classify_exchange(exchange)  # one PATCH, never retried
+            if reply.semantic_class is WriteClass.AMBIGUOUS:
+                reply = classify_exchange(
+                    self._client.patch(
+                        kind=request.kind,
+                        name=request.name,
+                        namespace=request.namespace,
+                        patch_type=request.patch_type.value,
+                        body_json=request.body_json,
+                        timeout_s=WRITE_TIMEOUT_S,
+                    )
+                )
+'''
+
+[[mutant]]
+id = "M8B2-HTTP10"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/executor/kubernetes.py"
+guard = "no kubectl fallback: the writer never runs kubectl patch"
+kills = [
+    "tests/test_m8b2_http.py::test_a_credential_that_appears_after_preflight_is_not_attempted_without_kubectl",
+    "tests/test_m8b2_http.py::test_no_kubectl_fallback_exists[missing]",
+]
+old = '''
+        if self._client is None:
+            return self._after('''
+new = '''
+        if self._client is None:
+            self._runner(
+                [
+                    "kubectl",
+                    "--kubeconfig",
+                    str(self.cfg.executor_kubeconfig_path),
+                    "--context",
+                    self.cfg.kube_context,
+                    "patch",
+                    request.kind.lower(),
+                    request.name,
+                    "-n",
+                    request.namespace,
+                    "--type",
+                    request.patch_type.value,
+                    "-p",
+                    request.body_json,
+                ],
+                capture_output=True,
+                check=False,
+            )
+            return self._after('''
+
+[[mutant]]
+id = "M8B2-HTTP11B"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/executor/kubernetes.py"
+guard = "a received 3xx is AMBIGUOUS (the PATCH was sent), never NOT_ATTEMPTED or SUCCESS"
+kills = [
+    "tests/test_m8b2_http.py::test_a_redirect_is_never_followed_and_never_success_or_unsent[same-host-307]",
+    "tests/test_m8b2_http.py::test_a_redirect_is_never_followed_and_never_success_or_unsent[cross-host-307]",
+]
+old = '''
+        return WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"redirect not followed; {detail}")'''
+new = '''
+        return WriteReply(WriteClass.NOT_ATTEMPTED, diagnostic=f"redirect not followed; {detail}")'''
+
+[[mutant]]
+id = "M8B2-HTTP11C"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "the server is checked against the API server Docker publishes for this cluster"
+kills = [
+    "tests/test_m8b2_http.py::test_another_cluster_s_api_server_is_a_guard_error_before_any_connection",
+]
+old = '''
+        verify_api_server(cfg, server, runner)  # another cluster's API server: GuardError'''
+new = '''
+        pass  # another cluster's API server: GuardError'''
+
+[[mutant]]
+id = "M8B2-HTTP12"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "the send boundary moves to SEND_STARTED before the request goes out"
+kills = [
+    "tests/test_m8b2_http.py::test_a_failure_after_send_started_is_ambiguous_never_not_attempted[drop]",
+    "tests/test_m8b2_http.py::test_a_failure_after_send_started_is_ambiguous_never_not_attempted[timeout]",
+]
+old = '''
+            state = SendState.SEND_STARTED
+            conn.endheaders(payload)
+            response = conn.getresponse()
+'''
+new = '''
+            conn.endheaders(payload)
+            response = conn.getresponse()
+            state = SendState.SEND_STARTED
+'''
+
+[[mutant]]
+id = "M8B2-HTTP13"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "a missing kubeconfig CA is a CredentialError, never system trust"
+kills = [
+    "tests/test_m8b2_http.py::test_the_kubeconfig_ca_is_mandatory_and_must_be_usable[absent]",
+]
+old = '''
+    if type(ca_data) is not str or not ca_data.strip():
+        raise CredentialError(
+            f"{name} has no certificate-authority-data; the executor never falls back to"
+            " system trust"
+        )
+'''
+new = '''
+    if type(ca_data) is not str or not ca_data.strip():
+        context.load_default_certs()
+        return context
+'''
+
+[[mutant]]
+id = "M8B2-HTTP14"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/kube_patch.py"
+guard = "the connection is built with the explicit finite timeout"
+kills = [
+    "tests/test_m8b2_http.py::test_the_real_connection_factory_passes_the_explicit_timeout",
+]
+old = '''
+    return http.client.HTTPSConnection(host, port, context=context, timeout=timeout)'''
+new = '''
+    return http.client.HTTPSConnection(host, port, context=context)'''
+
+[[mutant]]
+id = "M8B2-HTTP15"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/bounded.py"
+guard = "every response read is bounded: never read() without a size"
+kills = [
+    "tests/test_m8b2_http.py::test_read_bounded_bytes_reads_at_most_limit_plus_one[11-True]",
+    "tests/test_m8b2_http.py::test_a_huge_2xx_body_is_truncated_never_read_whole_and_ambiguous",
+]
+old = '''
+        chunk = stream.read(want - got)'''
+new = '''
+        chunk = stream.read()'''
+
+[[mutant]]
+id = "M8B2-HTTP16"
+source = "0025 M8B-2 STOP resolution: direct PATCH"
+target = "safeops/executor/kubernetes.py"
+guard = "a 2xx body is parsed with the hardened parser: unsafe JSON is never SUCCESS"
+kills = [
+    "tests/test_m8b2_http.py::test_an_unsafe_2xx_object_is_ambiguous_never_success[dup-top]",
+    "tests/test_m8b2_http.py::test_an_unsafe_2xx_object_is_ambiguous_never_success[nan]",
+]
+old = '''
+        obj = strict_json_object(exchange.body_prefix.decode("utf-8"))
+    except (UnicodeDecodeError, MalformedJSON):
+        return None
+    if type(obj.get("kind")) is not str'''
+new = '''
+        obj = json.loads(exchange.body_prefix.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if type(obj.get("kind")) is not str'''

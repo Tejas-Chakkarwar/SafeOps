@@ -96,7 +96,7 @@ class ReadReply:
 
 
 class PatchType(StrEnum):
-    """kubectl patch --type values."""
+    """Patch types (sent as the PATCH request's media type; see safeops.kube_patch)."""
 
     JSON = "json"  # RFC 6902
     MERGE = "merge"  # RFC 7386

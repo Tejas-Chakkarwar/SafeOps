@@ -48,6 +48,9 @@ PROTECTED = (
     "safeops.policy",  # strict policy loading + action semantics: features now, executor at M8B
     "safeops.executor",  # receives only the action (0025 D§15); its transports are M8B-2
     "safeops.stubs",  # the loud-stub marker the executor's unwired transports use
+    "safeops.kube_patch",  # the executor's direct HTTPS PATCH (0025 M8B-2 STOP resolution)
+    "safeops.jsonutil",  # neutral hardened JSON parser: agent parser and the PATCH classifier
+    "safeops.bounded",  # neutral bounded byte reads: the PATCH response body
 )
 FORBIDDEN = (
     "safeops.faults",
@@ -409,8 +412,25 @@ def test_the_read_path_reaches_neither_the_cluster_nor_any_tool() -> None:
         "safeops.policy",
         "safeops.actions",
         "safeops.topology",
+        "safeops.jsonutil",  # the neutral parser the agent parser re-exports
     } <= reach  # the traversal really walks the read path
     assert not _leaks(reach, NO_CLUSTER), sorted(_leaks(reach, NO_CLUSTER))
+    assert "safeops.kube_patch" not in reach and "safeops.bounded" not in reach
+
+
+def test_the_shared_helpers_are_standard_library_leaves() -> None:
+    """safeops.jsonutil and safeops.bounded are shared by the agent side and the cluster side,
+    so they import nothing of SafeOps: neither can carry one subsystem into the other."""
+    for name in ("jsonutil", "bounded"):
+        tree = ast.parse((REPO_ROOT / "safeops" / f"{name}.py").read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0] if node.level == 0 else ".")
+        assert imported <= {"__future__", "json", "math"}, (name, imported)
+        assert reachable_modules(REPO_ROOT, "safeops", (f"safeops.{name}",)) == {f"safeops.{name}"}
 
 
 def _read_path_tree(tmp_path: Path, files: dict[str, str]) -> Path:
@@ -484,6 +504,9 @@ def test_the_executor_is_walked_and_reaches_nothing_forbidden() -> None:
         "safeops.executor.unwired",
         "safeops.executor.audit",  # M8B-2: the audit trail, and HarnessMisuse
         "safeops.executor.kubernetes",  # M8B-2: the concrete transports
+        "safeops.kube_patch",  # M8B-2 STOP resolution: the direct PATCH
+        "safeops.jsonutil",  # neutral leaf
+        "safeops.bounded",  # neutral leaf
         "safeops.cluster",  # the guarded client they run (protected, neutral)
         "safeops.actions",
         "safeops.policy",

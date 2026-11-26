@@ -1,6 +1,7 @@
-"""Milestone 8B-2, offline: the safeops-executor client phase, its credential, the patch-only
-guard, and the concrete writer and reader transports (decision 0025 D§11.3, D§11.7, D§14,
-M8B-2 amendment). Nothing here touches a cluster: kubectl and docker are ProcessCluster.
+"""Milestone 8B-2, offline: the safeops-executor client phase, its credential, the Kubectl
+refusal ceiling, and the concrete writer and reader transports (decision 0025 D§11.3, D§11.7,
+D§14, M8B-2 amendment and STOP resolution). Nothing here touches a cluster: docker, kubectl and
+the API server are ProcessCluster. The direct PATCH itself is tests/test_m8b2_http.py.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from safeops.cluster import (
     GuardError,
     Kubectl,
     Phase,
-    ProcessResult,
     check_object,
     executor_credential,
     kubeconfig_for,
@@ -27,12 +27,7 @@ from safeops.cluster import (
 )
 from safeops.enums import ActionType
 from safeops.executor.audit import AuditPersistenceError, HarnessMisuse, JsonlExecutorAudit
-from safeops.executor.kubernetes import (
-    KubernetesReaderTransport,
-    KubernetesWriterTransport,
-    classify_patch,
-    patch_status,
-)
+from safeops.executor.kubernetes import KubernetesReaderTransport, KubernetesWriterTransport
 from safeops.executor.transport import (
     Check,
     PatchType,
@@ -42,7 +37,7 @@ from safeops.executor.transport import (
     prepared,
 )
 from tests.m8_executor_fakes import RUN_A, RecordingAudit
-from tests.m8b2_fakes import SERVER, ProcessCluster, credentials, response_line, scratch_cfg
+from tests.m8b2_fakes import TOKEN, ProcessCluster, credentials, scratch_cfg
 
 CFG = load_cluster_config()
 
@@ -157,7 +152,7 @@ def test_cluster_yaml_names_the_executor_credential_under_the_state_dir() -> Non
     assert CFG.executor_token_meta_path.name == "safeops-executor.token.json"
 
 
-# --- the patch-only client guard ------------------------------------------------------------
+# --- Phase.EXECUTOR on Kubectl: a refusal-only ceiling ----------------------------------------
 
 
 def _obj(kind="ConfigMap"):
@@ -201,116 +196,24 @@ def _obj(kind="ConfigMap"):
         "token",
     ],
 )
-def test_the_executor_client_refuses_everything_but_patch(tmp_path, call) -> None:
+def test_the_executor_kubectl_client_refuses_everything(tmp_path, call) -> None:
     k = _executor(credentials(scratch_cfg(tmp_path)))
     with pytest.raises(GuardError):
         call(k)
 
 
-@pytest.mark.parametrize("phase", [Phase.RUNTIME, Phase.READER, Phase.BOOTSTRAP])
-def test_only_the_executor_phase_patches(tmp_path, phase) -> None:
-    k = Kubectl(
-        scratch_cfg(tmp_path),
-        phase,
-        runner=_never,
-        kubeconfig=tmp_path / "kc",
-        verify_identity=False,
-    )
-    with pytest.raises(GuardError, match="only the executor"):
-        k.patch(
-            kind="Deployment",
-            name="orders",
-            namespace="testbed",
-            patch_type="merge",
-            body_json="{}",
-            timeout_s=5,
-        )
-
-
-@pytest.mark.parametrize(
-    "kind, name, ns, patch_type, body",
-    [
-        ("StatefulSet", "postgres", "testbed", "merge", "{}"),
-        ("Secret", "postgres-credentials", "testbed", "merge", "{}"),
-        ("Deployment", "orders", "safeops-system", "merge", "{}"),
-        ("Deployment", "--all", "testbed", "merge", "{}"),
-        ("Deployment", "orders", "testbed", "apply", "{}"),
-        ("Deployment", "orders", "testbed", "merge", "not json"),
-        ("Deployment", "orders", "testbed", "json", "{}"),
-        ("Deployment", "orders", "testbed", "merge", "[]"),
-    ],
-)
-def test_the_patch_guard_refuses_before_any_process(tmp_path, kind, name, ns, patch_type, body):
-    k = _executor(credentials(scratch_cfg(tmp_path)))
-    with pytest.raises(GuardError):
-        k.patch(
-            kind=kind, name=name, namespace=ns, patch_type=patch_type, body_json=body, timeout_s=5
-        )
-
-
-def test_the_patch_is_one_structured_command_with_no_discovery_helper(tmp_path, monkeypatch):
-    """check_object directly: never _check_objects, cluster_scoped_kinds or api-resources."""
-    cfg = credentials(scratch_cfg(tmp_path))
-    run = ProcessCluster()
-    k = _executor(cfg, run)
-    for helper in ("_check_objects", "cluster_scoped_kinds"):
-        monkeypatch.setattr(Kubectl, helper, _never)
-    out = k.patch(
-        kind="Deployment",
-        name="orders",
-        namespace="testbed",
-        patch_type="merge",
-        body_json='{"spec":{"replicas":4}}',
-        timeout_s=20,
-    )
-    assert isinstance(out, ProcessResult) and out.returncode == 0
-    assert run.calls == [
-        [
-            "kubectl",
-            "--kubeconfig",
-            str(cfg.executor_kubeconfig_path),
-            "--context",
-            "kind-safeops",
-            "patch",
-            "deployments.apps",
-            "orders",
-            "-n",
-            "testbed",
-            "--type",
-            "merge",
-            "-p",
-            '{"spec":{"replicas":4}}',
-            "-o",
-            "json",
-            "-v=6",
-            "--request-timeout=20s",
-        ]
-    ]
-    assert not any("api-resources" in a for c in run.calls for a in c)
-
-
-def test_a_patch_process_outcome_is_returned_never_raised(tmp_path) -> None:
-    cfg = credentials(scratch_cfg(tmp_path))
-    args = dict(
-        kind="Deployment",
-        name="orders",
-        namespace="testbed",
-        patch_type="merge",
-        body_json="{}",
-        timeout_s=5,
-    )
-    timed = _executor(cfg, ProcessCluster(script=["timeout"])).patch(**args)
-    assert timed.timed_out and timed.returncode is None
-    spawned = _executor(cfg, ProcessCluster(script=["spawn"])).patch(**args)
-    assert spawned.spawn_error and spawned.returncode is None
-    refused = _executor(cfg, ProcessCluster(script=["forbidden"])).patch(**args)
-    assert refused.returncode == 1 and "403" in refused.stderr
+def test_kubectl_has_no_patch_capability_at_all() -> None:
+    """The B2-A `Kubectl.patch` is gone (0025 M8B-2 STOP resolution): kubectl patch GETs the
+    object first, and the executor may not read. No dormant second write path remains."""
+    assert not hasattr(Kubectl, "patch")
+    assert "patch" not in {n for n in dir(Kubectl) if not n.startswith("__")}
 
 
 def test_the_executor_phase_is_built_only_by_its_transport() -> None:
-    """Static: Phase.EXECUTOR appears only in the client (cluster.py) and the executor's
-    transport (executor/kubernetes.py), never in tools, the agent, the runner or bootstrap."""
-    allowed = {"safeops/cluster.py", "safeops/executor/kubernetes.py"}
+    """Static: Phase.EXECUTOR appears only in the client (cluster.py), the direct PATCH
+    (kube_patch.py) and the executor's transport (executor/kubernetes.py), never in tools, the
+    agent, the runner or bootstrap."""
+    allowed = {"safeops/cluster.py", "safeops/kube_patch.py", "safeops/executor/kubernetes.py"}
     users = set()
     for path in (REPO_ROOT / "safeops").rglob("*.py"):
         tree = ast.parse(path.read_text())
@@ -321,86 +224,6 @@ def test_the_executor_phase_is_built_only_by_its_transport() -> None:
     assert users == allowed
 
 
-# --- the semantic classification of one patch ---------------------------------------------------
-
-URL = f"{SERVER}/apis/apps/v1/namespaces/testbed/deployments/orders?fieldManager=kubectl-patch"
-OBJ = {"kind": "Deployment", "metadata": {"name": "orders", "namespace": "testbed"}}
-
-
-def _proc(status=None, rc=0, stdout="", extra="", structured=True, url=URL):
-    lines = [response_line("GET", f"{SERVER}/api?timeout=32s", 200, structured=structured)]
-    if status is not None:
-        lines.append(response_line("PATCH", url, status, structured=structured))
-    return ProcessResult(rc, stdout, "\n".join(lines) + "\n" + extra)
-
-
-@pytest.mark.parametrize("structured", [True, False], ids=["structured", "legacy"])
-@pytest.mark.parametrize(
-    "status, rc, stdout, cls",
-    [
-        (200, 0, json.dumps(OBJ), WriteClass.SUCCESS),
-        (200, 0, "not json", WriteClass.AMBIGUOUS),
-        (200, 0, "[]", WriteClass.AMBIGUOUS),
-        (200, 1, json.dumps(OBJ), WriteClass.AMBIGUOUS),
-        (422, 1, "", WriteClass.INVALID_ACTION),
-        (400, 1, "", WriteClass.DEFINITE_FAILURE),
-        (401, 1, "", WriteClass.DEFINITE_FAILURE),
-        (403, 1, "", WriteClass.DEFINITE_FAILURE),
-        (404, 1, "", WriteClass.DEFINITE_FAILURE),
-        (409, 1, "", WriteClass.DEFINITE_FAILURE),
-        (429, 1, "", WriteClass.DEFINITE_FAILURE),
-        (500, 1, "", WriteClass.AMBIGUOUS),
-        (503, 1, "", WriteClass.AMBIGUOUS),
-        (504, 1, "", WriteClass.AMBIGUOUS),
-    ],
-)
-def test_the_patch_status_decides_the_class(structured, status, rc, stdout, cls) -> None:
-    reply = classify_patch(_proc(status, rc, stdout, structured=structured), _scale())
-    assert reply.semantic_class is cls
-    if cls is WriteClass.SUCCESS:
-        assert reply.returned_object == OBJ
-
-
-def test_a_422_is_invalid_action_with_kubectl_s_own_text() -> None:
-    proc = _proc(422, 1, extra='The Deployment "orders" is invalid: spec.template: Invalid value')
-    reply = classify_patch(proc, _scale())
-    assert reply.semantic_class is WriteClass.INVALID_ACTION
-    assert "HTTP 422" in reply.diagnostic and "is invalid" in reply.diagnostic
-
-
-def test_outcomes_without_a_patch_response() -> None:
-    assert (
-        classify_patch(ProcessResult(None, timed_out=True), _scale()).semantic_class
-        is WriteClass.AMBIGUOUS
-    )
-    assert (
-        classify_patch(
-            ProcessResult(None, spawn_error="FileNotFoundError"), _scale()
-        ).semantic_class
-        is WriteClass.NOT_ATTEMPTED
-    )
-    refused = ProcessResult(1, "", response_line("GET", f"{SERVER}/api", 401) + "\nUnauthorized")
-    assert classify_patch(refused, _scale()).semantic_class is WriteClass.DEFINITE_FAILURE
-    lost = ProcessResult(1, "", "The connection to the server was refused")
-    assert classify_patch(lost, _scale()).semantic_class is WriteClass.AMBIGUOUS
-    quiet = ProcessResult(0, json.dumps(OBJ), "")
-    assert classify_patch(quiet, _scale()).semantic_class is WriteClass.SUCCESS
-
-
-def test_only_this_object_s_patch_response_counts() -> None:
-    other = URL.replace("/orders?", "/gateway?")
-    assert patch_status(_proc(422, url=other).stderr, _scale()) is None
-    assert patch_status(_proc(422).stderr, _scale()) == 422
-    assert patch_status(_proc(422).stderr, _scale(name="gateway")) is None
-
-
-def test_classification_is_total() -> None:
-    weird = ProcessResult(0, json.dumps(OBJ), f'verb="PATCH" url="{URL}" status="999 Odd"')
-    assert classify_patch(weird, _scale()).semantic_class is WriteClass.AMBIGUOUS
-    elsewhere = ProcessResult(0, json.dumps(OBJ), 'verb="PATCH" url="x" status="422 No"')
-    assert classify_patch(elsewhere, _scale()).semantic_class is WriteClass.SUCCESS  # not ours
-
-
 # --- the concrete writer ---------------------------------------------------------------------
 
 
@@ -408,14 +231,14 @@ def _writer(tmp_path, *, executor="valid", script=(), audit=None, docker_port=No
     cfg = credentials(scratch_cfg(tmp_path), executor=executor)
     run = ProcessCluster(script=script, **({"docker_port": docker_port} if docker_port else {}))
     audit = audit if audit is not None else RecordingAudit()
-    return KubernetesWriterTransport(cfg, audit, runner=run), run, audit
+    return KubernetesWriterTransport(cfg, audit, runner=run, connect=run.connect), run, audit
 
 
 def test_constructing_the_transports_resolves_no_credential_and_runs_nothing(tmp_path) -> None:
     cfg = scratch_cfg(tmp_path)  # no credential file exists at all
     writer = KubernetesWriterTransport(cfg, RecordingAudit(run_id=None), runner=_never)
     reader = KubernetesReaderTransport(cfg, runner=_never)
-    assert writer._kubectl is None and reader._kubectl is None
+    assert writer._client is None and reader._kubectl is None
 
 
 def test_a_preflighted_write_sends_one_patch_and_returns_the_object(tmp_path) -> None:
@@ -425,7 +248,8 @@ def test_a_preflighted_write_sends_one_patch_and_returns_the_object(tmp_path) ->
     reply = writer.write(request)
     assert reply.semantic_class is WriteClass.SUCCESS
     assert reply.returned_object["spec"]["replicas"] == 4
-    assert len(run.patches) == 1
+    assert len(run.patches) == 1 and len(run.requests) == 1  # one PATCH; no GET, no retry
+    assert run.gets == []  # the executor makes no read of its own
     assert audit.kinds() == ["before_write", "after_write"]
     assert audit.events[0][2]["identity"] == "system:serviceaccount:safeops-system:safeops-executor"
 
@@ -437,7 +261,7 @@ def test_a_missing_or_expired_credential_is_not_attempted(tmp_path, executor) ->
     writer.preflight((request,))  # not raised: a classified cause (D§11.3)
     reply = writer.write(request)
     assert reply.semantic_class is WriteClass.NOT_ATTEMPTED
-    assert run.calls == [] and writer._kubectl is None
+    assert run.calls == [] and run.requests == [] and writer._client is None
     assert audit.kinds() == ["before_write", "after_write"]
 
 
@@ -471,7 +295,7 @@ def test_a_context_pointing_at_another_cluster_is_a_guard_error_in_preflight(tmp
     writer, run, _ = _writer(tmp_path, docker_port=55555)
     with pytest.raises(GuardError, match="not the API server"):
         writer.preflight((_scale(),))
-    assert run.patches == [] and writer._kubectl is None
+    assert run.patches == [] and writer._client is None
 
 
 @pytest.mark.parametrize(
@@ -498,7 +322,7 @@ def test_the_before_write_entry_is_durable_before_the_patch_runs(tmp_path) -> No
     audit.bind_run(RUN_A)
     writer, run, _ = _writer(tmp_path, audit=audit)
     seen = []
-    run.on_patch = lambda argv: seen.append(audit.path_for(RUN_A).read_text().splitlines())
+    run.on_patch = lambda request: seen.append(audit.path_for(RUN_A).read_text().splitlines())
     request = _scale()
     writer.preflight((request,))
     writer.write(request)
@@ -506,7 +330,8 @@ def test_the_before_write_entry_is_durable_before_the_patch_runs(tmp_path) -> No
     lines = [json.loads(x) for x in audit.path_for(RUN_A).read_text().splitlines()]
     assert [x["event"] for x in lines] == ["before_write", "after_write"]
     assert lines[0]["patch"] == {"spec": {"replicas": 4}}
-    assert "token" not in audit.path_for(RUN_A).read_text()
+    text = audit.path_for(RUN_A).read_text()
+    assert TOKEN not in text and "Bearer" not in text and "Authorization" not in text
 
 
 def test_a_before_write_that_cannot_persist_is_not_attempted_and_nothing_is_sent(tmp_path):
@@ -562,7 +387,7 @@ def test_an_interrupt_in_after_write_still_propagates(tmp_path) -> None:
         ("forbidden", WriteClass.DEFINITE_FAILURE),
         ("server", WriteClass.AMBIGUOUS),
         ("timeout", WriteClass.AMBIGUOUS),
-        ("spawn", WriteClass.NOT_ATTEMPTED),
+        ("refused", WriteClass.NOT_ATTEMPTED),
         ("raise", WriteClass.AMBIGUOUS),
     ],
 )
@@ -573,6 +398,8 @@ def test_every_process_outcome_is_a_reply_with_an_after_entry(tmp_path, script, 
     reply = writer.write(request)
     assert isinstance(reply, WriteReply) and reply.semantic_class is cls
     assert audit.kinds() == ["before_write", "after_write"]
+    assert len(run.connections) == 1  # one attempt, never retried
+    assert TOKEN not in (reply.diagnostic or "")
 
 
 # --- the concrete reader ---------------------------------------------------------------------

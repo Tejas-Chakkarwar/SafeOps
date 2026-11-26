@@ -1931,3 +1931,182 @@ Correct-lifecycle reachability makes an unbound `after_write` or `final` impossi
 `M8B1-H12` now targets the three-member tuple, and `M8B2-A4` targets the same line. The table holds 287.
 
 **Unchanged:** schema version 2 and `RECORD_FIELDS`; every `ExecutionStatus` producer shape; the M8A read path; `config/bootstrap_scope.yaml`; the design document. Milestone 8 is not closed by this amendment.
+
+## Amendment, 2026-11-26: Milestone 8B-2 STOP resolution (the executor's write transport)
+
+**What the first live proof found.** kubectl v1.37.2 reads the workload with a GET before it issues `kubectl patch`, whether the patch is real or `--dry-run=server`. safeops-executor correctly has no `get` permission. So that GET receives 403 and the PATCH is never issued.
+
+- The B2-A classifier read this correctly: there was no PATCH line and the 403 came before the PATCH, so the result was `DEFINITE_FAILURE`.
+- The production `scale_deployment` became `INFRASTRUCTURE_FAILURE`.
+- The testbed stayed CLEAN.
+
+This is a transport incompatibility with the frozen patch-only executor boundary. It is not evidence that the privilege ceiling should expand.
+
+**Resolution.**
+- **RBAC.** Executor RBAC is NOT widened: no `get`, `list` or `watch`, and no ClusterRole, wildcard or read fallback.
+- **The production write.** The writer issues the HTTPS PATCH directly to the Kubernetes API server using:
+  - the existing safeops-executor credential;
+  - the exact verified API-server authority;
+  - the kubeconfig-pinned CA.
+- **`Kubectl.patch` is removed.** `Phase.EXECUTOR` stays on `Kubectl` as a refusal-only ceiling, and the first RBAC proof layer keeps it.
+- **The direct HTTPS primitive is executor-write-only.** `KubernetesReaderTransport` stays on the existing `Kubectl(cfg, Phase.READER)` path, unchanged.
+
+The split between the two identities is deliberately asymmetric:
+
+| Identity | Transport |
+|---|---|
+| safeops-reader | the existing guarded kubectl reads |
+| safeops-executor | direct HTTPS PATCH only, no read of any kind |
+
+**Scope.** This is an implementation correction underneath `PreparedWrite` → `WriterTransport` → `WriteReply`. None of the following change:
+- `ActionExecutor` semantics;
+- reader semantics;
+- hard-envelope semantics;
+- the `ExecutionStatus` and `WriteClass` sets;
+- the schema (version 2);
+- reconciliation rules;
+- action planners;
+- topology semantics.
+
+**1. Module and primitive.** `safeops/kube_patch.py` (cluster layer; it imports no `WriteClass`) holds `ExecutorPatchClient`.
+- Construction is `ExecutorPatchClient(cfg, *, runner, connect, now)`. `runner` is used only for `docker port`; `connect` is the connection factory, `https_connection` in production.
+- The call is `patch(*, kind, name, namespace, patch_type, body_json, timeout_s) -> PatchExchange`. Every parameter is keyword-only and has no default.
+- No parameter names a server, URL, scheme, host, port, authority, token, header, kubeconfig, CA, TLS-verification switch, `tls_server_name`, proxy, redirect policy or raw path, not even an optional test-only one. A signature test pins this.
+- Tests substitute only the narrow connection factory.
+- The writer (`KubernetesWriterTransport`) builds the client lazily at preflight. It calls `patch` once per request and classifies the `PatchExchange` with `classify_exchange`.
+
+**2. Credential and authority.** The client reads only the configured executor credential (`executor_credential(cfg)`). Its credential semantics are the B2-A ones, unchanged:
+
+| Condition | Result |
+|---|---|
+| missing or expired | `CredentialUnavailable`; the writer reports `NOT_ATTEMPTED`, with zero network |
+| no usable context, or a token that is not safeops-executor's | `CredentialError`, loud |
+| user name ≠ `safeops-executor`, or a token that is not a JWT whose `sub` is `system:serviceaccount:safeops-system:safeops-executor` | `CredentialError`, loud |
+| another cluster's API server | `GuardError`, before any connection |
+
+- The API-server check is `cluster.verify_api_server`, extracted unchanged from `Kubectl._verify_identity` and shared with it: the server must be the loopback port Docker publishes for the kind node.
+- The server must be exactly `https://host:port`: no other scheme, no missing port, no path, user info, query or fragment. The connection goes to that (host, port) and nowhere else.
+- A YAML error never chains into the exception (`from None`), because the file holds the token.
+
+**3. TLS.**
+- The kubeconfig cluster entry may hold exactly what bootstrap writes: `server` and `certificate-authority-data`. The user entry may hold exactly `token`.
+- These are `CredentialError`, with zero network:
+  - `certificate-authority-data` missing, empty, not base64, or not a certificate;
+  - `insecure-skip-tls-verify`;
+  - `tls-server-name`, which bootstrap never writes (kind's admin kubeconfig has none);
+  - a file `certificate-authority`, `proxy-url` or any other key.
+- The `SSLContext` is `PROTOCOL_TLS_CLIENT`, `CERT_REQUIRED`, with `check_hostname=True`. It is loaded only from the kubeconfig CA. System trust is never loaded, and there is no fallback to it.
+
+**4. No proxy, no redirect.**
+- `http.client.HTTPSConnection` consults no proxy environment or system proxy configuration, and `set_tunnel` is never called.
+- There is no urllib opener, `urlopen`, `ProxyHandler` or redirect handler. A structural test pins this, along with a test showing a hostile `HTTP(S)_PROXY`/`ALL_PROXY` environment has no effect. Proxy absence is a property of the code, not a mutant.
+- http.client follows no redirect and the client never reads `Location`. A received 3xx means the PATCH was sent, so it is `AMBIGUOUS`: never `SUCCESS`, never `NOT_ATTEMPTED`, never re-sent, same host or not.
+
+**5. The request.**
+- **Method:** `PATCH`, only. The module has no other method string.
+- **Paths:** fixed per kind, with no discovery and no subresource:
+  - `/apis/apps/v1/namespaces/{ns}/deployments/{name}`
+  - `/api/v1/namespaces/{ns}/services/{name}`
+  - `/api/v1/namespaces/{ns}/configmaps/{name}`
+- **Media types:**
+
+  | Patch type | Content-Type |
+  |---|---|
+  | strategic | `application/strategic-merge-patch+json` |
+  | merge | `application/merge-patch+json` |
+  | json | `application/json-patch+json` |
+
+- **Headers:**
+  - `Authorization: Bearer <token>`, in that header only;
+  - `Accept: application/json`;
+  - `Content-Length`;
+  - `User-Agent: safeops-executor`.
+- **Guards before anything is sent (`GuardError`):** the kind; the name and namespace as DNS labels; `check_object(cfg, Phase.EXECUTOR, ...)` called directly, never `_check_objects` or `cluster_scoped_kinds`; the patch type; the body's JSON shape; a finite positive timeout.
+- **Token:** never in a URL, diagnostic, audit entry, repr or exception. An error message containing it is scrubbed to `<redacted>`.
+
+**6. Timeout.** `WRITE_TIMEOUT_S = 20` (B2-A's write timeout) is passed explicitly to `HTTPSConnection(..., timeout=)`. It bounds connect, the TLS handshake and every send and receive. `None`, 0, negatives, NaN, infinity, booleans and strings are refused.
+
+**7. The send boundary.**
+- `connect()` performs TCP and the TLS handshake, and `putrequest`/`putheader` only buffer, so all of that is `PRE_SEND`.
+- The state becomes `SEND_STARTED` immediately before `endheaders(body)`.
+- A failure in `PRE_SEND` proves nothing was sent: connection refused, a socket failure, or a TLS or certificate failure at connect with otherwise valid credential material. Its class is `NOT_ATTEMPTED`.
+- Any failure after `SEND_STARTED` is `AMBIGUOUS`, with no write retry. That covers a send or body failure, a drop, `RemoteDisconnected`, an incomplete read, a timeout, or a TLS error.
+
+**8. Bounded response body.**
+- `MAX_EXECUTOR_HTTP_BODY_BYTES = 1_048_576`.
+- `safeops.bounded.read_bounded_bytes(response, limit)` reads with a finite size on every call, never more than `limit + 1` bytes in total, and never sized from Content-Length. It returns `(body_prefix: bytes, body_truncated: bool)`, where `body_truncated` is True exactly when more than the cap was there. The response is closed after the read.
+- `PatchExchange` carries only `send_state`, `status`, `body_prefix`, `body_truncated`, `response_received`, `timed_out` and a scrubbed, bounded `error`. It holds no token, header, CA or kubeconfig content, and its repr omits the body.
+
+**9. Classification (`classify_exchange`, total; the five `WriteClass` values unchanged).**
+
+| Outcome | Class |
+|---|---|
+| `PRE_SEND` | `NOT_ATTEMPTED` |
+| `SEND_STARTED`, no response | `AMBIGUOUS` |
+| 2xx, complete, UTF-8, `strict_json_object`, with `kind` (str) and `metadata` (object) | `SUCCESS`, with the object; the returned identity then goes to the B1 checks |
+| any other 2xx: truncated, unsafe or malformed, a read error | `AMBIGUOUS` |
+| 3xx | `AMBIGUOUS` |
+| 422, complete, `strict_json_object`, a `Status` with `reason == "Invalid"` | `INVALID_ACTION` |
+| any other 422 (truncated, malformed, unsafe, another reason) | `DEFINITE_FAILURE`: the server definitely rejected it, but invalid-action semantics were not proven |
+| other 4xx (400, 401, 403, 404, 409, 429, ...) | `DEFINITE_FAILURE`, whether or not the body was truncated or its read failed; only the diagnostic is cut |
+| 5xx and every other status | `AMBIGUOUS` |
+
+- Diagnostics quote at most 300 characters of the response: the Status `message` when the body is a complete strict Status object, else a decoded prefix. `WriteReply` bounds them again to `MAX_DISCARD_ERROR`.
+- The audit records the patch body (`before_write`) and the bounded diagnostic (`after_write`), never a response body.
+
+**10. Neutral helpers and the information wall.**
+- **`safeops/jsonutil.py`** holds the hardened parser, moved verbatim from `safeops.agent.parser`. It refuses:
+  - duplicate keys at any level;
+  - `NaN`, `Infinity` and `-Infinity`;
+  - numbers that overflow to infinity;
+  - huge integer literals (the integer-digit `ValueError`);
+  - `RecursionError` nesting;
+  - any non-object top level.
+
+  Its exception is `MalformedJSON(ValueError)`. `safeops.agent.parser` imports and re-exports `strict_json_object`, with `_Malformed = MalformedJSON`, and its tests ran unchanged.
+- **`safeops/bounded.py`** holds the byte-bounded read.
+- Both modules are standard-library-only leaves, which a test pins.
+- Dependencies:
+  - `agent.parser` → `jsonutil`;
+  - `executor.kubernetes` → `jsonutil` and `kube_patch`;
+  - `kube_patch` → `bounded` and `cluster`.
+
+  There is no cluster → agent, cluster → tools, cluster → executor, or agent → cluster import.
+- `safeops.kube_patch`, `safeops.jsonutil` and `safeops.bounded` are in the wall's protected set. The read path reaches `jsonutil` but neither `kube_patch` nor `bounded`.
+
+**11. `Kubectl.patch` and `ProcessResult` are removed.**
+- `Phase.EXECUTOR` on `Kubectl` is refusal-only. Every read and mutation method refuses it, and the B2-A refusal tests are kept.
+- No production consumer of `Kubectl.patch` existed besides the writer. No kubectl fallback exists, and a test pins that the writer never runs kubectl.
+- `Phase.EXECUTOR` is named only in `cluster.py`, `kube_patch.py` and `executor/kubernetes.py`, which a static test pins.
+
+**12. Reader preserved.** `KubernetesReaderTransport` is byte-for-byte the B2-A reader: `Kubectl(cfg, Phase.READER)`; `get` with `--ignore-not-found`; the unpaginated ReplicaSet list and its completeness check; `FOUND`/`ABSENT`/`UNAVAILABLE`. A structural test pins that it references none of the direct-PATCH names, and that its reads open no HTTPS connection.
+
+**Mutants.** The STOP resolution retargets six existing mutants and adds seventeen, under source "0025 M8B-2 STOP resolution: direct PATCH":
+
+| Mutant | What it does now |
+|---|---|
+| `M8A1-P1`, `P2`, `P3` | target `safeops/jsonutil.py` (the parser moved there) |
+| `M8B2-C4` | targets the direct PATCH's `check_object` call |
+| `M8B2-L1` | targets an eager `ExecutorPatchClient` |
+| `M8B2-A1` | puts `before_write` after the PATCH |
+| `M8B2-C3`, `W1`, `W2` | name the renamed or new killing tests |
+| `M8B2-HTTP1` | GET instead of PATCH |
+| `M8B2-HTTP2`, `HTTP3` | wrong Deployment or core path |
+| `M8B2-HTTP4` | wrong Content-Type |
+| `M8B2-HTTP5` | TLS verification disabled |
+| `M8B2-HTTP6` | token not scrubbed from errors |
+| `M8B2-HTTP7` | 422 → `INVALID_ACTION` without the reason proof |
+| `M8B2-HTTP8` | 5xx made definite |
+| `M8B2-HTTP9` | an ambiguous write retried |
+| `M8B2-HTTP10` | kubectl fallback reintroduced |
+| `M8B2-HTTP11B` | 3xx → `NOT_ATTEMPTED` |
+| `M8B2-HTTP11C` | authority check bypassed |
+| `M8B2-HTTP12` | `SEND_STARTED` moved after the send (post-send failure → `NOT_ATTEMPTED`) |
+| `M8B2-HTTP13` | a missing CA falls back to system trust |
+| `M8B2-HTTP14` | the explicit timeout omitted |
+| `M8B2-HTTP15` | unbounded response read |
+| `M8B2-HTTP16` | the hardened parser bypassed with `json.loads` |
+
+The table holds 304.
+
+**Unchanged:** schema version 2 and `RECORD_FIELDS`; the `ExecutionStatus` and `WriteClass` sets; `safeops/actions.py`; features and gate; `action_semantics.yaml`; `topology.yaml`; the hard envelope; reader semantics and reader RBAC; quantity semantics; `config/bootstrap_scope.yaml`; the executor manifest (patch-only, exact resourceNames). The live evidence follows in the B2-B live-proof section.

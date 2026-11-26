@@ -1,12 +1,14 @@
 """The executor's concrete Kubernetes transports (design §4, §11.6; decision 0025 D§11.3,
 D§11.6, D§11.7, D§14, M8B-2 amendment).
 
-- **KubernetesWriterTransport**: the safeops-executor identity (Phase.EXECUTOR), patch only.
-  It owns everything between a PreparedWrite and its semantic WriteReply: preflight, the
-  credential, the durable `before_write` audit entry, the one guarded `kubectl patch`, the
-  reading of what kubectl did, and the `after_write` entry.
+- **KubernetesWriterTransport**: the safeops-executor identity, patch only. It owns
+  everything between a PreparedWrite and its semantic WriteReply: preflight, the credential,
+  the durable `before_write` audit entry, the one direct HTTPS PATCH (safeops.kube_patch; not
+  kubectl, which GETs the object first: M8B-2 STOP resolution), the classification of what
+  came back, and the `after_write` entry.
 - **KubernetesReaderTransport**: the executor's reads through safeops-reader (Phase.READER):
-  one kubectl process per call, FOUND / ABSENT / UNAVAILABLE.
+  one kubectl process per call, FOUND / ABSENT / UNAVAILABLE. Unchanged by the STOP
+  resolution, and never routed through the direct PATCH.
 
 Neither builds a client or resolves a credential when constructed: build_runner stays free
 of credentials and of the cluster. The client is built on first use.
@@ -42,7 +44,6 @@ from safeops.cluster import (
     GuardError,
     Kubectl,
     Phase,
-    ProcessResult,
     Runner,
     check_object,
     executor_credential,
@@ -55,63 +56,20 @@ from safeops.executor.transport import (
     WriteClass,
     WriteReply,
 )
+from safeops.jsonutil import MalformedJSON, strict_json_object
+from safeops.kube_patch import (
+    EXECUTOR_SERVICE_ACCOUNT,
+    ExecutorPatchClient,
+    PatchExchange,
+    SendState,
+    https_connection,
+)
 
-# One write: kubectl's own request timeout, and the process bound a little above it.
+# One write: the PATCH's socket timeout (connect, TLS handshake, each send and receive).
 WRITE_TIMEOUT_S = 20
-EXECUTOR_SERVICE_ACCOUNT = "safeops-executor"
 _NAME = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
-
-# kubectl -v=6 logs one line per HTTP response: the method, URL and status, never a header
-# or a token. Both the legacy and the structured (klog) forms are read.
-_LEGACY_RESPONSE = re.compile(r"\b(GET|PATCH|PUT|POST|DELETE) (https?://\S+) (\d{3})\b")
-_STRUCTURED_VERB = re.compile(r'\bverb="([A-Z]+)"')
-_STRUCTURED_URL = re.compile(r'\burl="([^"]+)"')
-_STRUCTURED_STATUS = re.compile(r'\bstatus="(\d{3})\b')
-_KLOG_LINE = re.compile(r"^[IWEF]\d{4} ")
-
-
-def _responses(stderr: str) -> list[tuple[str, str, int]]:
-    """(method, url, HTTP status) for every response kubectl logged, in order."""
-    out = []
-    for line in stderr.splitlines():
-        verb, url, status = (
-            _STRUCTURED_VERB.search(line),
-            _STRUCTURED_URL.search(line),
-            _STRUCTURED_STATUS.search(line),
-        )
-        if verb and url and status:
-            out.append((verb.group(1), url.group(1), int(status.group(1))))
-            continue
-        legacy = _LEGACY_RESPONSE.search(line)
-        if legacy:
-            out.append((legacy.group(1), legacy.group(2), int(legacy.group(3))))
-    return out
-
-
-def _object_path(request: PreparedWrite) -> str:
-    plural = EXECUTOR_RESOURCES[request.kind].split(".", 1)[0]
-    return f"/namespaces/{request.namespace}/{plural}/{request.name}"
-
-
-def patch_status(stderr: str, request: PreparedWrite) -> int | None:
-    """The HTTP status of the PATCH of this object, from kubectl's request log, or None if
-    no such response was logged (the PATCH was never answered, or never sent)."""
-    path = _object_path(request)
-    found = None
-    for method, url, status in _responses(stderr):
-        if method == "PATCH" and url.split("?", 1)[0].endswith(path):
-            found = status
-    return found
-
-
-def _message(process: ProcessResult) -> str:
-    """kubectl's own error text (its last non-log stderr line), for the diagnostic."""
-    lines = [
-        ln.strip()
-        for ln in process.stderr.splitlines()
-        if ln.strip() and not _KLOG_LINE.match(ln.strip())
-    ]
-    return lines[-1] if lines else f"exit {process.returncode}"
+# How much of a response body a diagnostic quotes (WriteReply bounds it again).
+_SNIPPET = 300
 
 
 def _returned_object(stdout: str) -> dict | None:
@@ -122,51 +80,88 @@ def _returned_object(stdout: str) -> dict | None:
     return obj if type(obj) is dict else None
 
 
-def classify_patch(process: ProcessResult, request: PreparedWrite) -> WriteReply:
-    """What one `kubectl patch` did, as one of the five WriteClass values (D§11.3). Total."""
+def _response_text(exchange: PatchExchange) -> str:
+    """A short, safe snippet of the response for a diagnostic: the Kubernetes Status message
+    when the body is a complete strict Status object, else the first bytes as text."""
+    if not exchange.body_truncated:
+        try:
+            obj = strict_json_object(exchange.body_prefix.decode("utf-8"))
+        except (UnicodeDecodeError, MalformedJSON):
+            obj = None
+        if obj is not None and type(obj.get("message")) is str:
+            return obj["message"][:_SNIPPET]
+    text = exchange.body_prefix[:_SNIPPET].decode("utf-8", errors="replace").strip()
+    return text + (" [truncated]" if exchange.body_truncated else "")
+
+
+def _complete_object(exchange: PatchExchange) -> dict | None:
+    """The response body as one complete, strictly parsed Kubernetes object, or None."""
+    if exchange.body_truncated or exchange.error is not None:
+        return None
     try:
-        return _classify(process, request)
-    except Exception as exc:  # a bug in reading the output: the write may have landed
+        obj = strict_json_object(exchange.body_prefix.decode("utf-8"))
+    except (UnicodeDecodeError, MalformedJSON):
+        return None
+    if type(obj.get("kind")) is not str or type(obj.get("metadata")) is not dict:
+        return None
+    return obj
+
+
+def classify_exchange(exchange: PatchExchange) -> WriteReply:
+    """What one direct PATCH did, as one of the five WriteClass values (D§11.3; M8B-2 STOP
+    resolution). Total: a reading bug is AMBIGUOUS (the write may have landed)."""
+    try:
+        return _classify(exchange)
+    except Exception as exc:
         return WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"unreadable outcome: {exc}")
 
 
-def _classify(process: ProcessResult, request: PreparedWrite) -> WriteReply:
-    if process.spawn_error is not None:  # kubectl never started: nothing was sent
+def _classify(exchange: PatchExchange) -> WriteReply:
+    if exchange.send_state is SendState.PRE_SEND:  # proven unsent: nothing reached the server
         return WriteReply(
-            WriteClass.NOT_ATTEMPTED, diagnostic=f"kubectl did not start: {process.spawn_error}"
+            WriteClass.NOT_ATTEMPTED, diagnostic=f"not sent: {exchange.error or 'no request'}"
         )
-    if process.timed_out:
-        return WriteReply(WriteClass.AMBIGUOUS, diagnostic="kubectl patch timed out")
-    status = patch_status(process.stderr, request)
-    if status is None:
-        if process.returncode == 0:
-            obj = _returned_object(process.stdout)
-            if obj is not None:
-                return WriteReply(WriteClass.SUCCESS, obj, "exit 0 (no response status logged)")
-            return WriteReply(WriteClass.AMBIGUOUS, diagnostic="exit 0, output not an object")
-        refused = [s for _, _, s in _responses(process.stderr) if s in (401, 403)]
-        if refused:  # discovery refused the identity: the PATCH was never sent
-            return WriteReply(
-                WriteClass.DEFINITE_FAILURE,
-                diagnostic=f"HTTP {refused[-1]} before the PATCH was sent: {_message(process)}",
-            )
-        return WriteReply(
-            WriteClass.AMBIGUOUS, diagnostic=f"no PATCH response: {_message(process)}"
-        )
-    if 200 <= status < 300:
-        obj = _returned_object(process.stdout) if process.returncode == 0 else None
-        if obj is not None:
-            return WriteReply(WriteClass.SUCCESS, obj, f"HTTP {status}")
+    status = exchange.status
+    if status is None:  # sent, or partly sent, and no response: it may have landed
+        how = "timed out" if exchange.timed_out else "lost"
         return WriteReply(
             WriteClass.AMBIGUOUS,
-            diagnostic=f"HTTP {status}, but exit {process.returncode} or no returned object",
+            diagnostic=f"the PATCH {how} after sending began: {exchange.error}",
         )
-    detail = f"HTTP {status}: {_message(process)}"
+    if 200 <= status < 300:
+        obj = _complete_object(exchange)
+        if obj is not None:
+            return WriteReply(WriteClass.SUCCESS, obj, f"HTTP {status}")
+        why = (
+            "the response body was over the cap"
+            if exchange.body_truncated
+            else f"the response is not one complete strict object ({exchange.error or 'body'})"
+        )
+        return WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"HTTP {status}, but {why}")
+    detail = f"HTTP {status}: {_response_text(exchange)}"
+    if 300 <= status < 400:  # never followed, and the PATCH was sent: it may have landed
+        return WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"redirect not followed; {detail}")
     if status == 422:
-        return WriteReply(WriteClass.INVALID_ACTION, diagnostic=detail)
+        if _invalid_status(exchange):
+            return WriteReply(WriteClass.INVALID_ACTION, diagnostic=detail)
+        return WriteReply(
+            WriteClass.DEFINITE_FAILURE, diagnostic=f"{detail} (not a complete Invalid Status)"
+        )
     if 400 <= status < 500:
         return WriteReply(WriteClass.DEFINITE_FAILURE, diagnostic=detail)
-    return WriteReply(WriteClass.AMBIGUOUS, diagnostic=detail)
+    return WriteReply(WriteClass.AMBIGUOUS, diagnostic=detail)  # 5xx, or anything else
+
+
+def _invalid_status(exchange: PatchExchange) -> bool:
+    """A 422 is INVALID_ACTION only with proof: a complete, strictly parsed Status object
+    whose reason is "Invalid"."""
+    if exchange.body_truncated or exchange.error is not None:
+        return False
+    try:
+        obj = strict_json_object(exchange.body_prefix.decode("utf-8"))
+    except (UnicodeDecodeError, MalformedJSON):
+        return False
+    return obj.get("kind") == "Status" and obj.get("reason") == "Invalid"
 
 
 def _check_request(cfg: ClusterConfig, request: object) -> PreparedWrite:
@@ -200,6 +195,7 @@ class KubernetesWriterTransport:
         audit: ExecutorAudit,
         *,
         runner: Runner = subprocess.run,
+        connect: Callable = https_connection,
         now: Callable[[], float] = time.time,
     ) -> None:
         if not isinstance(cfg, ClusterConfig):
@@ -209,8 +205,9 @@ class KubernetesWriterTransport:
         self.cfg = cfg
         self.audit = audit
         self._runner = runner
+        self._connect = connect
         self._now = now
-        self._kubectl: Kubectl | None = None
+        self._client: ExecutorPatchClient | None = None
         self._preflighted: frozenset[PreparedWrite] = frozenset()
 
     @property
@@ -229,10 +226,11 @@ class KubernetesWriterTransport:
             path = executor_credential(self.cfg, self._now)
         except CredentialUnavailable:
             path = None
-        if path is not None and self._kubectl is None:
-            client = Kubectl(self.cfg, Phase.EXECUTOR, runner=self._runner, kubeconfig=path)
-            client.verify_identity()
-            self._kubectl = client  # only a verified client is kept
+        if path is not None and self._client is None:
+            # Loads and checks the credential, the pinned CA and the API server's identity.
+            self._client = ExecutorPatchClient(
+                self.cfg, runner=self._runner, connect=self._connect, now=self._now
+            )  # only a verified client is kept
         self._preflighted = checked
 
     def write(self, request: PreparedWrite) -> WriteReply:
@@ -252,7 +250,7 @@ class KubernetesWriterTransport:
             executor_credential(self.cfg, self._now)
         except CredentialUnavailable as exc:
             return self._after(request, WriteReply(WriteClass.NOT_ATTEMPTED, diagnostic=str(exc)))
-        if self._kubectl is None:
+        if self._client is None:
             return self._after(
                 request,
                 WriteReply(
@@ -262,7 +260,7 @@ class KubernetesWriterTransport:
                 ),
             )
         try:
-            process = self._kubectl.patch(
+            exchange = self._client.patch(
                 kind=request.kind,
                 name=request.name,
                 namespace=request.namespace,
@@ -271,11 +269,11 @@ class KubernetesWriterTransport:
                 timeout_s=WRITE_TIMEOUT_S,
             )
         except GuardError:
-            raise  # the client guard refused before running anything: a harness bug
-        except Exception as exc:  # the patch process may have run
+            raise  # the request guard refused before anything was sent: a harness bug
+        except Exception as exc:  # unexpected: the PATCH may have been sent
             reply = WriteReply(WriteClass.AMBIGUOUS, diagnostic=f"{type(exc).__name__}: {exc}")
         else:
-            reply = classify_patch(process, request)
+            reply = classify_exchange(exchange)  # one PATCH, never retried
         return self._after(request, reply)
 
     def _after(self, request: PreparedWrite, reply: WriteReply) -> WriteReply:
