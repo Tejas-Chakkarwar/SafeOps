@@ -123,17 +123,28 @@ def _reply():
     return WriteReply(WriteClass.SUCCESS)
 
 
-def test_an_unbound_sink_over_an_unwritable_root_is_misuse_not_a_persistence_failure(
-    tmp_path,
-) -> None:
-    root = tmp_path / "ro"
-    root.mkdir(mode=0o500)
-    sink = JsonlExecutorAudit(root / "audit")
+def test_an_unbound_sink_is_misuse_even_when_persistence_would_fail(tmp_path) -> None:
+    """Sink level, the same read append twice over a filesystem whose directory creation
+    always fails (injected through the sink's filesystem seam, so it fails under any uid).
+    Unbound: the binding guard wins, and persistence is never reached. Bound: persistence is
+    reached, and its failure is an AuditPersistenceError."""
+    fs = RecordingFs(fail="mkdir")
+    root = tmp_path / "audit"
+    sink = JsonlExecutorAudit(root, fs=fs)
+
+    def failing_calls() -> int:
+        return sum(op == "mkdir" for op, _ in fs.calls)
+
     with pytest.raises(HarnessMisuse):
         sink.read(purpose="container_check", attempt=1)
+    assert fs.calls == [] and failing_calls() == 0  # no filesystem work before the guard
+    assert not root.exists()
+
     sink.bind_run(RUN_A)
-    with pytest.raises(AuditPersistenceError):  # bound: now it is the filesystem
+    with pytest.raises(AuditPersistenceError, match="injected mkdir failure"):
         sink.read(purpose="container_check", attempt=1)
+    assert failing_calls() >= 1  # the persistence path really ran
+    assert not root.exists()
 
 
 @pytest.mark.parametrize(

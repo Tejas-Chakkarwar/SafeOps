@@ -16,9 +16,19 @@ Events, each one canonical JSON object per line with `event`, `run_id` and `at`:
   fields (never a whole object).
 - `final`: the ExecutionResult's status, error and steps; exactly one per returned result.
 
-Nothing here ever holds a token, an Authorization header or a Secret value: the patches are
-built from action params (approved ConfigMap keys, selectors, quantities, a template the
-reader returned), and diagnostics come from kubectl, which prints none.
+Nothing here ever holds a token, an Authorization header or a Secret value:
+- patches are built from action params (approved ConfigMap keys, selectors, quantities, a
+  template the reader returned);
+- transport exception text (connect, TLS, send and receive failures of the direct PATCH) is
+  scrubbed of the executor bearer token by `ExecutorPatchClient._safe` (safeops.kube_patch)
+  before it leaves the cluster layer;
+- response diagnostics (safeops.executor.kubernetes `_response_text`) are excerpts of the
+  Kubernetes API server's response body (`PatchExchange.body_prefix`: a Status `message`,
+  or a decoded prefix). They are not passed through `_safe`, and SafeOps never copies the
+  request's Authorization header into that path: it is built from the response body alone.
+
+Diagnostics are also bounded (MAX_DISCARD_ERROR). That limits how much is stored; it is not
+the bearer-token argument, which is the two points above.
 
 **Binding.** The sink is shared by the writer and the executor, and bound to the current run
 with `bind_run(run_id)` before the action starts. Every append begins by checking that binding

@@ -4125,7 +4125,7 @@ target = "safeops/executor/audit.py"
 guard = "every append checks the binding before any path or filesystem call"
 kills = [
     "tests/test_m8b2_audit.py::test_an_unbound_append_is_harness_misuse_before_any_filesystem_call[read]",
-    "tests/test_m8b2_audit.py::test_an_unbound_sink_over_an_unwritable_root_is_misuse_not_a_persistence_failure",
+    "tests/test_m8b2_audit.py::test_an_unbound_sink_is_misuse_even_when_persistence_would_fail",
 ]
 old = '''
         run_id = self._bound_run_id()  # first: no path, no filesystem call before it
